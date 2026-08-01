@@ -1,16 +1,9 @@
-From 12345c133eba57251c6b6066099f697c3395104b Mon Sep 17 00:00:00 2001
+From b6f18fbbb6cc8d1d703021ace934df7b542f2a6f Mon Sep 17 00:00:00 2001
 From: lij768423-svg <265844445+lij768423-svg@users.noreply.github.com>
-Date: Sat, 1 Aug 2026 06:59:25 +0000
-Subject: [PATCH] feat: add egress recovery and quality guard (hard passive
- quarantine)
+Date: Sat, 1 Aug 2026 14:19:26 +0000
+Subject: [PATCH] feat: add egress recovery and quality guard node management
 
-Add fixed-proxy immediate recovery probes and the egress quality-guard
-sidecar with admin UI, hybrid active/passive detection, min-healthy
-protection, and recovery probes.
-
-Passive hard-threshold hits quarantine immediately; soft hits still
-require active confirmation. Docs and tests match the production
-closed-loop behavior.
+Add fixed-proxy immediate recovery, hybrid quality detection, hard-threshold quarantine, automatic node discovery, and complete node management in the quality-guard UI.
 ---
  .dockerignore                                 |   4 +
  .gitignore                                    |   5 +
@@ -39,9 +32,9 @@ closed-loop behavior.
  frontend/src/app/deferred-pages.tsx           |   5 +
  frontend/src/app/router.tsx                   |   3 +-
  .../quality-guard/quality-guard-api.ts        | 152 +++
- .../quality-guard/quality-guard-page.tsx      | 324 ++++++
+ .../quality-guard/quality-guard-page.tsx      | 507 ++++++++++
  .../src/features/settings/egress-nodes.tsx    |   2 +
- frontend/src/shared/i18n/index.ts             |  17 +-
+ frontend/src/shared/i18n/index.ts             |  19 +-
  tools/egress-quality-guard/Dockerfile         |  13 +
  tools/egress-quality-guard/README.md          | 209 ++++
  tools/egress-quality-guard/README.zh-CN.md    | 138 +++
@@ -49,9 +42,9 @@ closed-loop behavior.
  .../compose.override.example.yml              |  25 +
  .../egress-quality-guard.env.example          |  33 +
  .../grok2api-egress-quality-guard.service     |  27 +
- tools/egress-quality-guard/quality_guard.py   | 921 ++++++++++++++++++
- .../quality_guard_test.py                     | 313 ++++++
- 39 files changed, 3656 insertions(+), 63 deletions(-)
+ tools/egress-quality-guard/quality_guard.py   | 924 ++++++++++++++++++
+ .../quality_guard_test.py                     | 324 ++++++
+ 39 files changed, 3855 insertions(+), 63 deletions(-)
  create mode 100644 backend/internal/application/egress/quality_probe_test.go
  create mode 100644 backend/internal/application/gateway/quality_probe.go
  create mode 100644 backend/internal/application/gateway/quality_probe_test.go
@@ -2252,35 +2245,45 @@ index 0000000..a3d7273
 +}
 diff --git a/frontend/src/features/quality-guard/quality-guard-page.tsx b/frontend/src/features/quality-guard/quality-guard-page.tsx
 new file mode 100644
-index 0000000..b404e72
+index 0000000..1d1e6d4
 --- /dev/null
 +++ b/frontend/src/features/quality-guard/quality-guard-page.tsx
-@@ -0,0 +1,324 @@
+@@ -0,0 +1,507 @@
 +import { zodResolver } from "@hookform/resolvers/zod";
 +import { useMutation, useQuery, useQueryClient, type UseMutationResult } from "@tanstack/react-query";
-+import { Activity, AlertTriangle, BarChart3, Bot, Coins, Eye, Gauge, Pencil, RefreshCw, RotateCcw, RotateCw, Shield, ShieldCheck, ShieldX, TimerReset, Zap } from "lucide-react";
++import { Activity, AlertTriangle, BarChart3, Bot, Coins, Eye, Gauge, MoreHorizontal, Pencil, Plus, Power, PowerOff, RefreshCw, RotateCcw, RotateCw, Shield, ShieldCheck, ShieldX, TimerReset, Trash2, Zap } from "lucide-react";
 +import { useState, type ReactNode } from "react";
 +import { useForm, useWatch } from "react-hook-form";
 +import { useTranslation } from "react-i18next";
 +import { toast } from "sonner";
 +import { z } from "zod";
 +
++import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "@/components/ui/alert-dialog";
 +import { Badge } from "@/components/ui/badge";
 +import { Button } from "@/components/ui/button";
++import { Checkbox } from "@/components/ui/checkbox";
 +import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
++import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 +import { Input } from "@/components/ui/input";
 +import { Label } from "@/components/ui/label";
++import { Spinner } from "@/components/ui/spinner";
++import { Switch } from "@/components/ui/switch";
 +import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 +import { getQualityGuardStatus, runQualityTest, updateQualityGuardPolicy, type QualityGuardEvent, type QualityGuardNodeState, type QualityGuardPolicy, type QualityGuardStatistics, type QualityGuardStatus, type QualityTestResult } from "@/features/quality-guard/quality-guard-api";
-+import { listAllEgressNodes, type EgressNodeDTO } from "@/features/settings/settings-api";
++import { createEgressNode, deleteEgressNodes, listAllEgressNodes, updateEgressNode, updateEgressNodesEnabled, type EgressNodeDTO, type EgressNodeInput } from "@/features/settings/settings-api";
 +import { ErrorState } from "@/shared/components/data-state";
 +import { PageHeader } from "@/shared/components/page-header";
 +import { cn } from "@/shared/lib/cn";
 +
 +export function QualityGuardPage() {
 +  const { t, i18n } = useTranslation();
++  const queryClient = useQueryClient();
 +  const [manualResults, setManualResults] = useState<Record<string, QualityGuardNodeState>>({});
 +  const [policyOpen, setPolicyOpen] = useState(false);
++  const [editingNode, setEditingNode] = useState<EgressNodeDTO | null | undefined>(undefined);
++  const [nodeForm, setNodeForm] = useState<EgressNodeInput>(emptyNodeInput());
++  const [deletingNodes, setDeletingNodes] = useState<EgressNodeDTO[]>([]);
++  const [selectedNodeIDs, setSelectedNodeIDs] = useState<Set<string>>(() => new Set());
 +  const statusQuery = useQuery({
 +    queryKey: ["quality-guard"],
 +    queryFn: getQualityGuardStatus,
@@ -2300,12 +2303,90 @@ index 0000000..b404e72
 +    onError: (error) => toast.error(error instanceof Error ? error.message : t("errors.generic")),
 +  });
 +
++  const refreshNodeQueries = () => Promise.all([
++    queryClient.invalidateQueries({ queryKey: ["quality-guard"] }),
++    queryClient.invalidateQueries({ queryKey: ["quality-guard-egress-nodes"] }),
++    queryClient.invalidateQueries({ queryKey: ["egress-nodes"] }),
++  ]);
++  const saveNodeMutation = useMutation({
++    mutationFn: () => {
++      const input: EgressNodeInput = {
++        ...nodeForm,
++        name: nodeForm.name.trim(),
++        scope: "grok_build",
++        proxyURL: nodeForm.proxyURL?.trim() || undefined,
++        userAgent: "",
++        cloudflareCookies: undefined,
++      };
++      return editingNode ? updateEgressNode(editingNode.id, input) : createEgressNode(input);
++    },
++    onSuccess: () => {
++      setEditingNode(undefined);
++      void refreshNodeQueries();
++      toast.success(t("settings.egress.saved"));
++    },
++    onError: (error) => toast.error(error instanceof Error ? error.message : t("settings.egress.operationFailed")),
++  });
++  const toggleNodeMutation = useMutation({
++    mutationFn: ({ node, enabled }: { node: EgressNodeDTO; enabled: boolean }) => updateEgressNodesEnabled([node.id], enabled),
++    onSuccess: (_, { enabled }) => {
++      void refreshNodeQueries();
++      toast.success(t(enabled ? "qualityGuard.nodeEnabled" : "qualityGuard.nodeDisabled"));
++    },
++    onError: (error) => toast.error(error instanceof Error ? error.message : t("settings.egress.operationFailed")),
++  });
++  const batchToggleMutation = useMutation({
++    mutationFn: ({ nodes, enabled }: { nodes: EgressNodeDTO[]; enabled: boolean }) => updateEgressNodesEnabled(nodes.map((node) => node.id), enabled),
++    onSuccess: (_, { enabled }) => {
++      setSelectedNodeIDs(new Set());
++      void refreshNodeQueries();
++      toast.success(t(enabled ? "qualityGuard.nodesEnabled" : "qualityGuard.nodesDisabled"));
++    },
++    onError: (error) => toast.error(error instanceof Error ? error.message : t("settings.egress.operationFailed")),
++  });
++  const deleteNodeMutation = useMutation({
++    mutationFn: (nodes: EgressNodeDTO[]) => deleteEgressNodes(nodes.map((node) => node.id)),
++    onSuccess: () => {
++      setDeletingNodes([]);
++      setSelectedNodeIDs(new Set());
++      void refreshNodeQueries();
++      toast.success(t("settings.egress.deleted"));
++    },
++    onError: (error) => toast.error(error instanceof Error ? error.message : t("settings.egress.operationFailed")),
++  });
++
++  const openCreateNode = () => {
++    setNodeForm(emptyNodeInput());
++    setEditingNode(null);
++  };
++  const openEditNode = (node: EgressNodeDTO) => {
++    setNodeForm({
++      name: node.name,
++      scope: "grok_build",
++      enabled: node.enabled,
++      proxyPool: node.proxyPool,
++      accountCapacity: node.accountCapacity,
++      proxyURL: "",
++      userAgent: "",
++      cloudflareCookies: "",
++    });
++    setEditingNode(node);
++  };
++
 +  const refresh = () => void Promise.all([statusQuery.refetch(), nodesQuery.refetch()]);
 +  if (statusQuery.isError && !statusQuery.data) return <ErrorState message={statusQuery.error.message} onRetry={refresh} />;
 +
 +  const status = statusQuery.data;
-+  const configuredNodeIDs = new Set(status?.config?.node_ids ?? []);
-+  const nodes = (nodesQuery.data?.items ?? []).filter((node) => !status?.config || configuredNodeIDs.has(node.id));
++  const nodes = nodesQuery.data?.items ?? [];
++  const selectedNodes = nodes.filter((node) => selectedNodeIDs.has(node.id));
++  const allNodesSelected = nodes.length > 0 && selectedNodes.length === nodes.length;
++  const toggleAllNodes = (checked: boolean) => setSelectedNodeIDs(checked ? new Set(nodes.map((node) => node.id)) : new Set());
++  const toggleSelectedNode = (node: EgressNodeDTO, checked: boolean) => setSelectedNodeIDs((current) => {
++    const next = new Set(current);
++    if (checked) next.add(node.id);
++    else next.delete(node.id);
++    return next;
++  });
 +  const fresh = isFresh(status);
 +  const guardedNodes = status?.nodes ?? {};
 +  const quarantined = Object.values(guardedNodes).filter((node) => node.disabled_by_guard).length;
@@ -2341,18 +2422,29 @@ index 0000000..b404e72
 +                <h2 id="guard-nodes-title" className="text-sm font-medium">{t("qualityGuard.nodes")}</h2>
 +                <p className="mt-1 text-xs text-muted-foreground">{t("qualityGuard.nodesHelp")}</p>
 +              </div>
-+              <span className="text-xs text-muted-foreground">{t("qualityGuard.updatedAt", { time: formatTime(status.updatedAt, i18n.language) })}</span>
++              <div className="flex flex-wrap items-center gap-1.5 self-start sm:self-auto sm:justify-end">
++                <span className="mr-1 hidden text-xs text-muted-foreground lg:inline">{t("qualityGuard.updatedAt", { time: formatTime(status.updatedAt, i18n.language) })}</span>
++                {selectedNodes.length > 0 ? <>
++                  <span className="mr-1 text-xs text-muted-foreground">{t("common.selectedCount", { count: selectedNodes.length })}</span>
++                  <Button type="button" variant="secondary" size="sm" disabled={batchToggleMutation.isPending || selectedNodes.every((node) => node.enabled)} onClick={() => batchToggleMutation.mutate({ nodes: selectedNodes, enabled: true })}><Power />{t("common.enable")}</Button>
++                  <Button type="button" variant="secondary" size="sm" disabled={batchToggleMutation.isPending || selectedNodes.every((node) => !node.enabled)} onClick={() => batchToggleMutation.mutate({ nodes: selectedNodes, enabled: false })}><PowerOff />{t("common.disable")}</Button>
++                  <Button type="button" variant="secondary" size="sm" className="bg-destructive/10 text-destructive hover:bg-destructive/15 hover:text-destructive" disabled={deleteNodeMutation.isPending} onClick={() => setDeletingNodes(selectedNodes)}><Trash2 />{t("common.delete")}</Button>
++                </> : null}
++                <Button type="button" variant="ghost" size="icon" className="size-8" onClick={() => void nodesQuery.refetch()} disabled={nodesQuery.isFetching} aria-label={t("qualityGuard.refreshNodes")} title={t("qualityGuard.refreshNodes")}><RefreshCw className={cn("size-4", nodesQuery.isFetching && "animate-spin")} /></Button>
++                <Button type="button" size="sm" onClick={openCreateNode}><Plus />{t("settings.egress.add")}</Button>
++              </div>
 +            </div>
 +            <div className="overflow-x-auto">
-+              <Table className="min-w-[900px]">
++              <Table className="min-w-[960px]">
 +                <TableHeader><TableRow>
++                  <TableHead className="w-10 px-3"><Checkbox checked={allNodesSelected ? true : selectedNodes.length > 0 ? "indeterminate" : false} disabled={nodes.length === 0} onCheckedChange={(checked) => toggleAllNodes(checked === true)} aria-label={t("common.selectPage")} /></TableHead>
 +                  <TableHead>{t("qualityGuard.node")}</TableHead><TableHead>{t("qualityGuard.state")}</TableHead>
 +                  <TableHead className="text-right">{t("qualityGuard.outputTPS")}</TableHead><TableHead className="text-right">{t("qualityGuard.firstToken")}</TableHead>
 +                  <TableHead>{t("qualityGuard.source")}</TableHead><TableHead>{t("qualityGuard.strikes")}</TableHead>
-+                  <TableHead>{t("qualityGuard.lastObserved")}</TableHead><TableHead className="w-28 text-right">{t("common.actions")}</TableHead>
++                  <TableHead>{t("qualityGuard.lastObserved")}</TableHead><TableHead className="w-48 text-right">{t("common.actions")}</TableHead>
 +                </TableRow></TableHeader>
 +                <TableBody>
-+                  {nodes.map((node) => <NodeRow key={node.id} node={node} state={manualResults[node.id] ?? guardedNodes[node.id]} locale={i18n.language} status={status} mutation={testMutation} />)}
++                  {nodes.map((node) => <NodeRow key={node.id} node={node} selected={selectedNodeIDs.has(node.id)} onSelect={(checked) => toggleSelectedNode(node, checked)} state={manualResults[node.id] ?? guardedNodes[node.id]} locale={i18n.language} status={status} testMutation={testMutation} toggleMutation={toggleNodeMutation} onEdit={openEditNode} onDelete={(value) => setDeletingNodes([value])} />)}
 +                </TableBody>
 +              </Table>
 +            </div>
@@ -2363,6 +2455,19 @@ index 0000000..b404e72
 +            <Policy status={status} onEdit={() => setPolicyOpen(true)} />
 +          </div>
 +          {policyOpen ? <PolicyEditor open onOpenChange={setPolicyOpen} status={status} /> : null}
++          <NodeEditor open={editingNode !== undefined} editingNode={editingNode} form={nodeForm} onFormChange={setNodeForm} onOpenChange={(open) => { if (!open && !saveNodeMutation.isPending) setEditingNode(undefined); }} onSave={() => saveNodeMutation.mutate()} saving={saveNodeMutation.isPending} />
++          <AlertDialog open={deletingNodes.length > 0} onOpenChange={(open) => { if (!open && !deleteNodeMutation.isPending) setDeletingNodes([]); }}>
++            <AlertDialogContent>
++              <AlertDialogHeader>
++                <AlertDialogTitle>{deletingNodes.length > 1 ? t("qualityGuard.deleteNodesTitle", { count: deletingNodes.length }) : t("qualityGuard.deleteNodeTitle")}</AlertDialogTitle>
++                <AlertDialogDescription>{deletingNodes.length > 1 ? t("qualityGuard.deleteNodesDescription", { count: deletingNodes.length }) : t("qualityGuard.deleteNodeDescription", { name: deletingNodes[0]?.name ?? "" })}</AlertDialogDescription>
++              </AlertDialogHeader>
++              <AlertDialogFooter>
++                <AlertDialogCancel disabled={deleteNodeMutation.isPending}>{t("common.cancel")}</AlertDialogCancel>
++                <AlertDialogAction className="bg-destructive text-white hover:bg-destructive/90" disabled={deleteNodeMutation.isPending || deletingNodes.length === 0} onClick={(event) => { event.preventDefault(); if (deletingNodes.length > 0) deleteNodeMutation.mutate(deletingNodes); }}>{deleteNodeMutation.isPending ? <Spinner /> : null}{t("common.delete")}</AlertDialogAction>
++              </AlertDialogFooter>
++            </AlertDialogContent>
++          </AlertDialog>
 +        </>
 +      )}
 +    </div>
@@ -2402,11 +2507,13 @@ index 0000000..b404e72
 +  </div>;
 +}
 +
-+function NodeRow({ node, state, locale, status, mutation }: { node: EgressNodeDTO; state?: QualityGuardNodeState; locale: string; status: QualityGuardStatus; mutation: UseMutationResult<QualityTestResult, Error, { nodeId: string; status: QualityGuardStatus }> }) {
++function NodeRow({ node, selected, onSelect, state, locale, status, testMutation, toggleMutation, onEdit, onDelete }: { node: EgressNodeDTO; selected: boolean; onSelect: (checked: boolean) => void; state?: QualityGuardNodeState; locale: string; status: QualityGuardStatus; testMutation: UseMutationResult<QualityTestResult, Error, { nodeId: string; status: QualityGuardStatus }>; toggleMutation: UseMutationResult<{ updated: number }, Error, { node: EgressNodeDTO; enabled: boolean }>; onEdit: (node: EgressNodeDTO) => void; onDelete: (node: EgressNodeDTO) => void }) {
 +  const { t } = useTranslation();
-+  const testing = mutation.isPending && mutation.variables?.nodeId === node.id;
++  const testing = testMutation.isPending && testMutation.variables?.nodeId === node.id;
++  const toggling = toggleMutation.isPending && toggleMutation.variables?.node.id === node.id;
 +  const classification = state?.last_classification || "unknown";
 +  return <TableRow>
++    <TableCell className="px-3"><Checkbox checked={selected} onCheckedChange={(checked) => onSelect(checked === true)} aria-label={t("common.selectItem", { name: node.name })} /></TableCell>
 +    <TableCell><div className="font-medium">{node.name}</div><div className="mt-0.5 text-[11px] text-muted-foreground">ID {node.id}</div></TableCell>
 +    <TableCell><StateBadge node={node} state={state} /></TableCell>
 +    <TableCell className={cn("text-right font-mono text-xs tabular-nums", classification === "hard" && "font-medium text-destructive", classification === "soft" && "text-amber-600 dark:text-amber-400")}>{state?.last_observed_at ? formatTPS(state.last_output_tps) : "-"}</TableCell>
@@ -2414,8 +2521,77 @@ index 0000000..b404e72
 +    <TableCell className="text-xs text-muted-foreground">{state?.last_source ? t(`qualityGuard.sources.${state.last_source}`) : "-"}</TableCell>
 +    <TableCell className="text-xs tabular-nums">{state ? `${state.passive_soft_strikes} / ${state.active_soft_strikes} / ${state.error_strikes}` : "-"}</TableCell>
 +    <TableCell className="text-xs text-muted-foreground">{formatTime(state?.last_observed_at, locale)}</TableCell>
-+    <TableCell className="text-right"><Button variant="ghost" size="sm" disabled={testing || !status.config} onClick={() => mutation.mutate({ nodeId: node.id, status })}><RotateCw className={cn(testing && "animate-spin")} />{t("qualityGuard.test")}</Button></TableCell>
++    <TableCell className="text-right"><div className="flex items-center justify-end gap-1">
++      <Switch checked={node.enabled} disabled={toggling} onCheckedChange={(enabled) => toggleMutation.mutate({ node, enabled })} aria-label={t(node.enabled ? "qualityGuard.disableNode" : "qualityGuard.enableNode", { name: node.name })} />
++      <Button variant="ghost" size="sm" disabled={testing || !status.config || !node.enabled} onClick={() => testMutation.mutate({ nodeId: node.id, status })}><RotateCw className={cn(testing && "animate-spin")} />{t("qualityGuard.test")}</Button>
++      <DropdownMenu>
++        <DropdownMenuTrigger asChild><Button type="button" variant="ghost" size="icon" className="size-8" aria-label={t("common.actions")}><MoreHorizontal /></Button></DropdownMenuTrigger>
++        <DropdownMenuContent align="end">
++          <DropdownMenuItem onClick={() => onEdit(node)}><Pencil />{t("common.edit")}</DropdownMenuItem>
++          <DropdownMenuItem disabled={toggling} onClick={() => toggleMutation.mutate({ node, enabled: !node.enabled })}>{node.enabled ? <PowerOff /> : <Power />}{t(node.enabled ? "common.disable" : "common.enable")}</DropdownMenuItem>
++          <DropdownMenuSeparator />
++          <DropdownMenuItem className="text-destructive focus:text-destructive" onClick={() => onDelete(node)}><Trash2 />{t("common.delete")}</DropdownMenuItem>
++        </DropdownMenuContent>
++      </DropdownMenu>
++    </div></TableCell>
 +  </TableRow>;
++}
++
++function NodeEditor({ open, editingNode, form, onFormChange, onOpenChange, onSave, saving }: { open: boolean; editingNode: EgressNodeDTO | null | undefined; form: EgressNodeInput; onFormChange: (form: EgressNodeInput) => void; onOpenChange: (open: boolean) => void; onSave: () => void; saving: boolean }) {
++  const { t } = useTranslation();
++  const proxyConfigured = Boolean(editingNode?.proxyConfigured || form.proxyURL?.trim());
++  return <Dialog open={open} onOpenChange={onOpenChange}>
++    <DialogContent className="max-h-[calc(100svh-2rem)] overflow-y-auto sm:max-w-[520px]">
++      <DialogHeader className="pr-8">
++        <DialogTitle>{editingNode ? t("settings.egress.editTitle") : t("settings.egress.addTitle")}</DialogTitle>
++        <DialogDescription>{t("qualityGuard.nodeEditorDescription")}</DialogDescription>
++      </DialogHeader>
++      <form className="space-y-3.5" onSubmit={(event) => { event.preventDefault(); onSave(); }}>
++        <div className="flex items-center justify-between gap-4 rounded-md bg-muted/45 px-3 py-2.5">
++          <Label htmlFor="quality-node-enabled">{t("settings.egress.enabled")}</Label>
++          <Switch id="quality-node-enabled" checked={form.enabled} onCheckedChange={(enabled) => onFormChange({ ...form, enabled })} />
++        </div>
++        <NodeField label={t("settings.egress.name")} controlId="quality-node-name">
++          <Input id="quality-node-name" autoFocus value={form.name} onChange={(event) => onFormChange({ ...form, name: event.target.value })} />
++        </NodeField>
++        <NodeField label={t("settings.egress.scope")} controlId="quality-node-scope">
++          <div id="quality-node-scope" className="flex h-9 items-center rounded-md border bg-muted/30 px-3 text-sm text-muted-foreground">{t("settings.egress.scopeBuild")}</div>
++        </NodeField>
++        <NodeField label={t("settings.egress.capacity")} controlId="quality-node-capacity" help={t("qualityGuard.nodeCapacityHelp")}>
++          <Input id="quality-node-capacity" type="number" min={0} max={100000} placeholder={t("settings.egress.unlimited")} value={form.accountCapacity || ""} onChange={(event) => onFormChange({ ...form, accountCapacity: Number(event.target.value) })} />
++        </NodeField>
++        <NodeField label={t("settings.egress.proxyURL")} controlId="quality-node-proxy" help={t("settings.egress.proxyProtocols")}>
++          <Input id="quality-node-proxy" type="password" autoComplete="new-password" placeholder={editingNode?.proxyConfigured ? t("settings.egress.keepConfigured") : "socks5h://user:pass@host:port"} value={form.proxyURL ?? ""} onChange={(event) => {
++            const proxyURL = event.target.value;
++            onFormChange({ ...form, proxyURL, proxyPool: editingNode?.proxyConfigured || proxyURL.trim() ? form.proxyPool : false });
++          }} />
++        </NodeField>
++        <div className="flex items-start justify-between gap-4 rounded-md bg-muted/45 px-3 py-2.5">
++          <div className="space-y-1">
++            <Label htmlFor="quality-node-proxy-pool">{t("settings.egress.proxyPool")}</Label>
++            <p className="max-w-[390px] text-xs leading-5 text-muted-foreground">{t("settings.egress.proxyPoolHelp")}</p>
++          </div>
++          <Switch id="quality-node-proxy-pool" className="mt-0.5" checked={form.proxyPool} disabled={!proxyConfigured} onCheckedChange={(proxyPool) => onFormChange({ ...form, proxyPool })} />
++        </div>
++        <DialogFooter>
++          <Button type="button" variant="secondary" size="sm" disabled={saving} onClick={() => onOpenChange(false)}>{t("common.cancel")}</Button>
++          <Button type="submit" size="sm" disabled={!form.name.trim() || saving}>{saving ? <Spinner /> : null}{t("common.save")}</Button>
++        </DialogFooter>
++      </form>
++    </DialogContent>
++  </Dialog>;
++}
++
++function NodeField({ label, controlId, help, children }: { label: string; controlId: string; help?: string; children: ReactNode }) {
++  return <div className="space-y-2">
++    <Label htmlFor={controlId}>{label}</Label>
++    {children}
++    {help ? <p className="whitespace-pre-line text-xs leading-5 text-muted-foreground">{help}</p> : null}
++  </div>;
++}
++
++function emptyNodeInput(): EgressNodeInput {
++  return { name: "", scope: "grok_build", enabled: true, proxyPool: false, accountCapacity: 0, proxyURL: "", userAgent: "", cloudflareCookies: "" };
 +}
 +
 +function StateBadge({ node, state }: { node: EgressNodeDTO; state?: QualityGuardNodeState }) {
@@ -2594,7 +2770,7 @@ index b11a54f..447a5f6 100644
    const save = useMutation({
      mutationFn: () => {
 diff --git a/frontend/src/shared/i18n/index.ts b/frontend/src/shared/i18n/index.ts
-index 7caddbb..1b4a157 100644
+index 7caddbb..1d0dd50 100644
 --- a/frontend/src/shared/i18n/index.ts
 +++ b/frontend/src/shared/i18n/index.ts
 @@ -175,6 +175,7 @@ const resources = {
@@ -2605,7 +2781,7 @@ index 7caddbb..1b4a157 100644
          docs: "文档",
          settings: "设置",
        },
-@@ -428,6 +429,19 @@ const resources = {
+@@ -428,6 +429,21 @@ const resources = {
          batchCompleted: "本批已导出 {{count}} 个账号",
          completed: "导出完成，共 {{count}} 个账号",
        },
@@ -2621,11 +2797,13 @@ index 7caddbb..1b4a157 100644
 +        reasons: { unknown: "未记录原因", hard_tps: "超过硬阈值", soft_tps: "超过软阈值", passive_hard_tps: "请求速度超过硬阈值", passive_soft_tps: "请求速度连续超过软阈值", quality_probe_healthy: "模型质量检测恢复正常", expected_marker_missing: "响应标记缺失", insufficient_output_tokens: "输出 Token 不足", insufficient_visible_tokens: "可见 Token 不足", probe_errors: "主动检测连续失败" },
 +        policy: "当前策略", editPolicy: "编辑策略", editPolicyTitle: "编辑质量守护策略", editPolicyDescription: "保存后由守护进程热加载，无需重启服务。", restoreDefaults: "恢复默认值", policySaved: "策略已保存，正在热加载", invalidPolicyValue: "数值超出允许范围", softThresholdMustBeLower: "软阈值必须低于硬阈值", activeIntervalSeconds: "主动检测间隔（秒）", passiveIntervalSeconds: "被动审计间隔（秒）", consecutiveSoft: "软阈值连续次数", consecutiveErrors: "检测错误连续次数", quarantineSeconds: "隔离时长（秒）", softThreshold: "软阈值", hardThreshold: "硬阈值", activeInterval: "主动间隔", passiveInterval: "审计间隔", quarantineDuration: "隔离时长", minimumNodes: "最少保留节点",
 +        unavailable: "质量守护尚未连接", unavailableHelp: "为主服务挂载 guard 状态卷，并设置 QUALITY_GUARD_STATE_FILE 后，这里会显示实时状态。", testComplete: "检测完成：{{speed}}",
++        refreshNodes: "刷新节点", nodeEnabled: "节点已启用", nodeDisabled: "节点已停用", nodesEnabled: "所选节点已启用", nodesDisabled: "所选节点已停用", enableNode: "启用节点 {{name}}", disableNode: "停用节点 {{name}}",
++        nodeEditorDescription: "管理质量守护使用的 Grok Build 出口。代理地址仅写入；编辑时留空会保留现有配置。", nodeCapacityHelp: "最多可绑定的账号数，0 表示不限制。", deleteNodeTitle: "删除代理节点？", deleteNodeDescription: "将永久删除节点“{{name}}”。此操作无法撤销。", deleteNodesTitle: "删除所选 {{count}} 个节点？", deleteNodesDescription: "所选代理节点将被永久删除，此操作无法撤销。",
 +      },
        accounts: {
          title: "上游账号",
          description: "分别管理 Grok Build OAuth、Grok Web SSO 与 Grok Console SSO 号池、健康状态和额度。",
-@@ -1220,7 +1234,7 @@ const resources = {
+@@ -1220,7 +1236,7 @@ const resources = {
        },
        common: { actions: "Actions", cancel: "Cancel", close: "Close", copy: "Copy", copied: "Copied", copyFailed: "Copy failed", create: "Create", delete: "Delete", disabled: "Disabled", disable: "Disable", edit: "Edit", enabled: "Enabled", enable: "Enable", loading: "Loading", importingProgress: "Importing, completed {{completed}} / {{total}}", syncingProgress: "Syncing initial data, completed {{completed}} / {{total}}", noData: "No data", pageOf: "Page {{page}}/{{pages}}", perPage: "Per page", rows: "rows", firstPage: "First page", lastPage: "Last page", previousPage: "Previous page", nextPage: "Next page", selectedCount: "{{count}} selected", selectPage: "Select this page", selectItem: "Select {{name}}", refresh: "Refresh", retry: "Retry", filter: "Filters", all: "All", clearFilters: "Clear filters", save: "Save", reset: "Reset", sortAscending: "Sort {{column}} ascending", sortDescending: "Sort {{column}} descending" },
        updates: { title: "About & updates", noteTitle: "Note", noteDescription: "This project is intended solely for technical research and educational exchange. You must comply with Grok's official terms of use and applicable local laws; you are solely responsible for any consequences.", currentVersion: "Current version", currentVersionHelp: "Version currently running on this service instance.", latestVersion: "Latest version", latestVersionHelp: "Latest version retrieved from the official GitHub Releases feed.", statusLabel: "Update status", statusLabelHelp: "Comparison between the running version and the latest release.", checkedAt: "Last check", checkedAtHelp: "Most recent successful retrieval of official release information.", checkNow: "Check for updates", viewRelease: "View update", openRelease: "Open Release", releaseNotes: "Release notes", releaseNotesHelp: "Version summary published with the official GitHub Release.", noReleaseNotes: "No release notes are available for this version.", notChecked: "Not fetched", neverChecked: "No successful check yet", available: "New version {{version}} available", currentSummary: "Running {{version}}", status: { unchecked: "Not checked", up_to_date: "Up to date", update_available: "Update available", check_failed: "Check failed" } },
@@ -2634,11 +2812,11 @@ index 7caddbb..1b4a157 100644
        creativeConsole: {
          title: "Creative console",
          description: "Use an existing client key to test chat, image, and video generation directly.",
-@@ -1305,6 +1319,7 @@ const resources = {
+@@ -1305,6 +1321,7 @@ const resources = {
        media: { images: { title: "Gallery", description: "Browse generated image assets", search: "Search ID, type, or hash", empty: "No images", noMatches: "No matching images", totalImages: "Total images", totalBytes: "Storage", pageSummary: "Showing {{count}} / {{total}}", openImage: "Open image {{id}}", deleteTitle: "Delete {{count}} selected images?", deleteDescription: "The image files and gallery records will be permanently removed, and existing image links will stop working. This cannot be undone.", deleted: "Deleted {{count}} images" }, videos: { title: "Video Gallery", description: "View video generation job records", search: "Search prompt or ID", empty: "No video jobs", statusFilter: "Status filter", totalJobs: "Total jobs", queued: "Queued", inProgress: "In progress", completed: "Completed", failed: "Failed", prompt: "Prompt", model: "Model", status: "Status", progress: "Progress", statusProgress: "Status / progress", spec: "Spec", owner: "Owner", createdAt: "Created", completedAt: "Completed", time: "Time", createdShort: "Created", completedShort: "Done", preview: "Preview video", previewTitle: "Video preview", previewUnavailable: "Local video unavailable", deleteTitle: "Delete {{count}} video records?", deleteDescription: "The task records and their local videos will be permanently removed, and existing video links will stop working. This cannot be undone.", deleted: "Deleted {{count}} video records", seconds: "{{count}} sec", pageSummary: "Showing {{count}} / {{total}}" }, videoStatus: { queued: "Queued", in_progress: "In progress", completed: "Completed", failed: "Failed" } },
        auth: { title: "Admin sign in", productTitle: "Lightweight API gateway", subtitle: "Manage upstream accounts, model routes, and client access.", username: "Username", password: "Password", usernameRequired: "Enter your username", passwordRequired: "Enter your password", signIn: "Sign in", signingIn: "Signing in", signOut: "Sign out", changePassword: "Change password", currentPassword: "Current password", newPassword: "New password", passwordUpdated: "Password updated. Sign in again.", sessionUnavailable: "Unable to restore the session", sessionUnavailableDescription: "The service may be temporarily unavailable. Your session was not cleared; please retry shortly.", retrySession: "Retry" },
        shell: { appearance: "Appearance", dark: "Dark", light: "Light", system: "System", language: "Language", navigation: "Navigation", openNavigation: "Open navigation" },
-+      qualityGuard: { title: "Quality guard", description: "Monitor Grok egress quality and quarantine anomalous nodes automatically.", overview: "Quality guard overview", serviceStatus: "Guard service", running: "Running", stale: "Status stale", mode: "Detection mode", availableNodes: "Enabled nodes", quarantinedNodes: "Quarantined", modes: { active: "Active probes", passive: "Passive audits", hybrid: "Hybrid" }, nodes: "Node quality", nodesHelp: "Speed matches the grok2api panel: output tokens include reasoning tokens. Passive anomalies only trigger an active confirmation. Strike counts are passive / active / errors.", updatedAt: "Updated {{time}}", node: "Node", state: "State", outputTPS: "Panel output speed", firstToken: "First token", source: "Source", strikes: "Strikes", lastObserved: "Last observed", test: "Test", sources: { active: "Active probe", passive: "Request audit" }, quarantined: "Quarantined", suspect: "Suspect", healthy: "Healthy", pending: "Pending", probeFailed: "Probe failed", events: "Recent events", noEvents: "No anomaly or recovery events", eventTypes: { node_quarantined: "Node quarantined", node_restored: "Node restored", passive_audit_anomaly: "Anomalous request detected" }, statistics: "Automatic detection statistics", statisticsSince: "Accumulated since {{time}}. Manual tests are excluded.", statisticsChecks: "Valid checks", statisticsChecksHelp: "Active probes and valid passive audits", statisticsActive: "Active probes", statisticsActiveDetail: "Healthy {{healthy}}, errors {{errors}}", statisticsPassive: "Passive audits", statisticsPassiveDetail: "Healthy {{healthy}}, from real requests", statisticsTokens: "Active output tokens", statisticsTokensHelp: "Includes reasoning tokens; not proxy traffic", statisticsAnomalies: "Anomaly hits", statisticsAnomalyDetail: "Soft {{soft}}, hard {{hard}}", statisticsQuarantines: "Quarantines applied", statisticsActionDetail: "Restored {{restored}}, protected {{suppressed}}", reasons: { unknown: "No reason recorded", hard_tps: "Hard threshold exceeded", soft_tps: "Soft threshold exceeded", passive_hard_tps: "Request exceeded hard threshold", passive_soft_tps: "Requests repeatedly exceeded soft threshold", quality_probe_healthy: "Model quality probe recovered", expected_marker_missing: "Expected marker missing", insufficient_output_tokens: "Too few output tokens", insufficient_visible_tokens: "Too few visible tokens", probe_errors: "Repeated probe errors" }, policy: "Current policy", editPolicy: "Edit policy", editPolicyTitle: "Edit quality guard policy", editPolicyDescription: "The guard hot-reloads saved changes without a service restart.", restoreDefaults: "Restore defaults", policySaved: "Policy saved and queued for hot reload", invalidPolicyValue: "Value is outside the allowed range", softThresholdMustBeLower: "The soft threshold must be lower than the hard threshold", activeIntervalSeconds: "Active interval (seconds)", passiveIntervalSeconds: "Passive interval (seconds)", consecutiveSoft: "Consecutive soft strikes", consecutiveErrors: "Consecutive probe errors", quarantineSeconds: "Quarantine (seconds)", softThreshold: "Soft threshold", hardThreshold: "Hard threshold", activeInterval: "Active interval", passiveInterval: "Audit interval", quarantineDuration: "Quarantine", minimumNodes: "Minimum nodes", unavailable: "Quality guard is not connected", unavailableHelp: "Mount the guard state volume into the main service and set QUALITY_GUARD_STATE_FILE to display live status here.", testComplete: "Test complete: {{speed}}" },
++      qualityGuard: { title: "Quality guard", description: "Monitor Grok egress quality and quarantine anomalous nodes automatically.", overview: "Quality guard overview", serviceStatus: "Guard service", running: "Running", stale: "Status stale", mode: "Detection mode", availableNodes: "Enabled nodes", quarantinedNodes: "Quarantined", modes: { active: "Active probes", passive: "Passive audits", hybrid: "Hybrid" }, nodes: "Node quality", nodesHelp: "Speed matches the grok2api panel: output tokens include reasoning tokens. Passive anomalies only trigger an active confirmation. Strike counts are passive / active / errors.", updatedAt: "Updated {{time}}", node: "Node", state: "State", outputTPS: "Panel output speed", firstToken: "First token", source: "Source", strikes: "Strikes", lastObserved: "Last observed", test: "Test", sources: { active: "Active probe", passive: "Request audit" }, quarantined: "Quarantined", suspect: "Suspect", healthy: "Healthy", pending: "Pending", probeFailed: "Probe failed", events: "Recent events", noEvents: "No anomaly or recovery events", eventTypes: { node_quarantined: "Node quarantined", node_restored: "Node restored", passive_audit_anomaly: "Anomalous request detected" }, statistics: "Automatic detection statistics", statisticsSince: "Accumulated since {{time}}. Manual tests are excluded.", statisticsChecks: "Valid checks", statisticsChecksHelp: "Active probes and valid passive audits", statisticsActive: "Active probes", statisticsActiveDetail: "Healthy {{healthy}}, errors {{errors}}", statisticsPassive: "Passive audits", statisticsPassiveDetail: "Healthy {{healthy}}, from real requests", statisticsTokens: "Active output tokens", statisticsTokensHelp: "Includes reasoning tokens; not proxy traffic", statisticsAnomalies: "Anomaly hits", statisticsAnomalyDetail: "Soft {{soft}}, hard {{hard}}", statisticsQuarantines: "Quarantines applied", statisticsActionDetail: "Restored {{restored}}, protected {{suppressed}}", reasons: { unknown: "No reason recorded", hard_tps: "Hard threshold exceeded", soft_tps: "Soft threshold exceeded", passive_hard_tps: "Request exceeded hard threshold", passive_soft_tps: "Requests repeatedly exceeded soft threshold", quality_probe_healthy: "Model quality probe recovered", expected_marker_missing: "Expected marker missing", insufficient_output_tokens: "Too few output tokens", insufficient_visible_tokens: "Too few visible tokens", probe_errors: "Repeated probe errors" }, policy: "Current policy", editPolicy: "Edit policy", editPolicyTitle: "Edit quality guard policy", editPolicyDescription: "The guard hot-reloads saved changes without a service restart.", restoreDefaults: "Restore defaults", policySaved: "Policy saved and queued for hot reload", invalidPolicyValue: "Value is outside the allowed range", softThresholdMustBeLower: "The soft threshold must be lower than the hard threshold", activeIntervalSeconds: "Active interval (seconds)", passiveIntervalSeconds: "Passive interval (seconds)", consecutiveSoft: "Consecutive soft strikes", consecutiveErrors: "Consecutive probe errors", quarantineSeconds: "Quarantine (seconds)", softThreshold: "Soft threshold", hardThreshold: "Hard threshold", activeInterval: "Active interval", passiveInterval: "Audit interval", quarantineDuration: "Quarantine", minimumNodes: "Minimum nodes", unavailable: "Quality guard is not connected", unavailableHelp: "Mount the guard state volume into the main service and set QUALITY_GUARD_STATE_FILE to display live status here.", testComplete: "Test complete: {{speed}}", refreshNodes: "Refresh nodes", nodeEnabled: "Node enabled", nodeDisabled: "Node disabled", nodesEnabled: "Selected nodes enabled", nodesDisabled: "Selected nodes disabled", enableNode: "Enable node {{name}}", disableNode: "Disable node {{name}}", nodeEditorDescription: "Manage Grok Build egress used by the quality guard. Proxy URLs are write-only; leave the field blank while editing to keep the current value.", nodeCapacityHelp: "Maximum number of bound accounts; 0 means unlimited.", deleteNodeTitle: "Delete proxy node?", deleteNodeDescription: "Node “{{name}}” will be permanently deleted. This action cannot be undone.", deleteNodesTitle: "Delete {{count}} selected nodes?", deleteNodesDescription: "The selected proxy nodes will be permanently deleted. This action cannot be undone." },
        accountQuotaReset: { action: "Reset quota", description: "This clears only local waiting-reset and model quota blocks. It does not change upstream Billing or audit history. Accounts that remain exhausted will be marked again by real traffic.", completed: "Reset local quota state for {{reset}} accounts" },
        accountQuotaTask: { title: "Process quota for {{count}} selected accounts", description: "Choose the quota task to run for the selected Grok Build accounts.", allTitle: "Process quota for all accounts", allDescription: "Choose the quota task to run for all enabled Grok Build accounts.", syncDescription: "Request upstream Billing and update local quota snapshots, account tiers, and recovery state.", resetAllDescription: "Clear local waiting-reset and exhausted-quota blocks for all enabled Grok Build accounts without changing upstream Billing or audit history.", execute: "Run task" },
        accountExport: { countDescription: "Exports accounts in stable order, up to 10,000 per batch.", batchProgress: "Exported {{count}} accounts; the next download is batch {{batch}}.", nextBatch: "Export next batch", batchCompleted: "Exported {{count}} accounts in this batch", completed: "Export complete: {{count}} accounts" },
@@ -3153,10 +3331,10 @@ index 0000000..d200d35
 +WantedBy=multi-user.target
 diff --git a/tools/egress-quality-guard/quality_guard.py b/tools/egress-quality-guard/quality_guard.py
 new file mode 100755
-index 0000000..7cbc7ab
+index 0000000..a370c49
 --- /dev/null
 +++ b/tools/egress-quality-guard/quality_guard.py
-@@ -0,0 +1,921 @@
+@@ -0,0 +1,924 @@
 +#!/usr/bin/env python3
 +"""Active and passive quality guard for grok2api egress nodes.
 +
@@ -3626,6 +3804,7 @@ index 0000000..7cbc7ab
 +        self.config = config
 +        self.api = api
 +        self.state = load_state(config.state_file)
++        self._resolved_node_ids = list(config.node_ids)
 +        self.state.setdefault("started_at", time.time())
 +        self.state.setdefault("recent_events", [])
 +        ensure_statistics(self.state)
@@ -3641,7 +3820,7 @@ index 0000000..7cbc7ab
 +            "mode": self.config.mode,
 +            "model": self.config.model,
 +            "client_key_id": self.config.client_key_id,
-+            "node_ids": list(self.config.node_ids),
++            "node_ids": list(self.config.node_ids) if self.config.node_ids else self._resolved_node_ids,
 +            "active_interval_seconds": self.config.active_interval_seconds,
 +            "passive_poll_seconds": self.config.passive_poll_seconds,
 +            "soft_tps": self.config.soft_tps,
@@ -3822,6 +4001,8 @@ index 0000000..7cbc7ab
 +
 +    def _prepare_nodes(self, now: float) -> tuple[list[dict[str, Any]], list[dict[str, Any]], set[str]]:
 +        all_nodes = self.api.list_nodes()
++        if not self.config.node_ids:
++            self._resolved_node_ids = [str(node["id"]) for node in all_nodes if node.get("id") and node.get("proxyConfigured")]
 +        nodes = self._eligible_nodes(all_nodes)
 +        skip_ids: set[str] = set()
 +        if not nodes:
@@ -4080,10 +4261,10 @@ index 0000000..7cbc7ab
 +    raise SystemExit(main())
 diff --git a/tools/egress-quality-guard/quality_guard_test.py b/tools/egress-quality-guard/quality_guard_test.py
 new file mode 100644
-index 0000000..d318721
+index 0000000..406763c
 --- /dev/null
 +++ b/tools/egress-quality-guard/quality_guard_test.py
-@@ -0,0 +1,313 @@
+@@ -0,0 +1,324 @@
 +import importlib.util
 +import stat
 +import sys
@@ -4252,6 +4433,17 @@ index 0000000..d318721
 +            })
 +            self.assertEqual(guard.state["statistics"]["actions"]["quarantined"], 1)
 +            self.assertEqual(guard.state["statistics"]["actions"]["restored"], 1)
++
++    def test_auto_discovery_publishes_resolved_node_ids_for_status_consumers(self):
++        with tempfile.TemporaryDirectory() as directory:
++            cfg = config(state_file=Path(directory) / "state.json", lock_file=Path(directory) / "lock", mode="passive")
++            nodes = self.nodes(3)
++            nodes[1]["enabled"] = False
++            nodes.append({"id": "4", "name": "direct", "enabled": True, "proxyConfigured": False})
++            api = FakeApi(nodes, [], [{"items": [], "hasMore": False, "nextCursor": ""}])
++            guard = quality_guard.Guard(cfg, api)
++            guard.run_passive_cycle()
++            self.assertEqual(guard.state["guard"]["node_ids"], ["1", "2", "3"])
 +
 +    def test_minimum_healthy_nodes_suppresses_quarantine(self):
 +        with tempfile.TemporaryDirectory() as directory:

@@ -20,9 +20,11 @@
 7. 健康探针只能清理 last_error 精确等于 transport error 的冷却，不得清理 anti-bot 或管理员状态。
 8. 质量守护 API 必须保持管理员鉴权，响应和日志不得包含管理员密码、Client Key 密钥、代理 URL、Prompt 或模型响应正文。
 9. 主动和被动质量速度必须保持 grok2api 面板口径：outputTokens / (durationMs - firstTokenMs)，不得减去 reasoningTokens。
-10. 被动软/硬 TPS 只能触发固定 Prompt 主动复测，不得直接隔离；只有主动 hard 或连续主动 soft 才允许隔离，被动触发的复测错误也不得直接隔离。
-11. 不得读取或修改真实 .env、config.yaml、数据库、状态卷或生产代理配置。
-12. 完成后运行 Go 全量测试、sidecar 单测、前端 lint/build，并列出所有语义冲突和处理方式。
+10. 被动 hard TPS 必须立即隔离；被动 soft TPS 仍需固定 Prompt 主动复测确认，主动 hard 立即隔离，主动 soft 连续命中后隔离。被动触发的复测错误不得直接隔离。
+11. 质量守护页必须复用出口节点 API，保持代理 URL 只写，并提供单节点 CRUD、启停、刷新以及批量选择、批量启停和批量删除。
+12. `QUALITY_GUARD_NODE_IDS` 为空时必须自动发现已启用代理 Build 节点，并在状态里发布已解析 ID 以兼容旧版页面；手工停用节点不得被主动探测。
+13. 不得读取或修改真实 .env、config.yaml、数据库、状态卷或生产代理配置。
+14. 完成后运行 Go 全量测试、sidecar 单测、前端 lint/build，并列出所有语义冲突和处理方式。
 ```
 
 ## 手工起点

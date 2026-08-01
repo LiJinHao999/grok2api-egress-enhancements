@@ -6,7 +6,7 @@
 
 - 上游版本：`v3.0.11`
 - 上游提交：`090104504b403d65675a01dab9c92b3a235ee832`
-- 补丁提交：见 `MANIFEST.json` 的 `patch_commit`（闭环 hard 隔离版）
+- 补丁提交：见 `MANIFEST.json` 的 `patch_commit`（节点管理完整版）
 - 上游 Draft PR：[chenyme/grok2api#837](https://github.com/chenyme/grok2api/pull/837)
 - 可运行 Fork：[lij768423-svg/grok2api](https://github.com/lij768423-svg/grok2api/tree/main)
 
@@ -27,6 +27,9 @@
 - **被动硬阈值立即隔离节点**；软阈值触发固定 Prompt 主动复测，连续命中后才隔离。
 - 主动软/硬阈值、连续探测错误、最低健康节点、隔离与自动恢复保护。
 - 管理端质量守护页面、手动诊断、策略热加载和累计统计。
+- 在节点质量表中直接添加、编辑、删除、启用、停用和刷新 Build 代理节点。
+- 支持单选、全选、批量启用、批量停用和批量删除，并为删除操作提供确认。
+- `QUALITY_GUARD_NODE_IDS` 留空时自动发现所有已启用的代理 Build 节点；状态文件同时发布已解析节点，兼容旧版管理页面。
 - 独立 Python sidecar、Docker Compose、systemd、安全说明和中英文文档。
 
 质量守护是启发式熔断器，不是模型能力鉴定器。中间层缓冲、已有文件、长常量或缓存内容可能造成异常高瞬时 Token/s。硬阈值策略偏激进，可按链路调高 `hard_tps`；软阈值仍以固定 Prompt 复测确认。
@@ -47,7 +50,7 @@ git am --3way /path/to/grok2api-egress-enhancements/patches/0001-feat-add-egress
 
 ```sh
 go test ./...
-python3 -m unittest -v tools/egress-quality-guard/quality_guard_test.py
+python3 -m unittest -v tools/egress-quality-guard/quality_guard_test.py  # 18 tests
 cd frontend
 pnpm lint
 pnpm build
