@@ -1,8 +1,16 @@
-From 690a641deb06c5c1a73983677f6b454557727113 Mon Sep 17 00:00:00 2001
+From 12345c133eba57251c6b6066099f697c3395104b Mon Sep 17 00:00:00 2001
 From: lij768423-svg <265844445+lij768423-svg@users.noreply.github.com>
-Date: Sat, 1 Aug 2026 02:24:59 +0000
-Subject: [PATCH] feat: add egress recovery and quality guard
+Date: Sat, 1 Aug 2026 06:59:25 +0000
+Subject: [PATCH] feat: add egress recovery and quality guard (hard passive
+ quarantine)
 
+Add fixed-proxy immediate recovery probes and the egress quality-guard
+sidecar with admin UI, hybrid active/passive detection, min-healthy
+protection, and recovery probes.
+
+Passive hard-threshold hits quarantine immediately; soft hits still
+require active confirmation. Docs and tests match the production
+closed-loop behavior.
 ---
  .dockerignore                                 |   4 +
  .gitignore                                    |   5 +
@@ -31,19 +39,19 @@ Subject: [PATCH] feat: add egress recovery and quality guard
  frontend/src/app/deferred-pages.tsx           |   5 +
  frontend/src/app/router.tsx                   |   3 +-
  .../quality-guard/quality-guard-api.ts        | 152 +++
- .../quality-guard/quality-guard-page.tsx      | 324 +++++++
+ .../quality-guard/quality-guard-page.tsx      | 324 ++++++
  .../src/features/settings/egress-nodes.tsx    |   2 +
  frontend/src/shared/i18n/index.ts             |  17 +-
  tools/egress-quality-guard/Dockerfile         |  13 +
- tools/egress-quality-guard/README.md          | 206 ++++
+ tools/egress-quality-guard/README.md          | 209 ++++
  tools/egress-quality-guard/README.zh-CN.md    | 138 +++
  tools/egress-quality-guard/SECURITY.md        |  22 +
  .../compose.override.example.yml              |  25 +
  .../egress-quality-guard.env.example          |  33 +
  .../grok2api-egress-quality-guard.service     |  27 +
- tools/egress-quality-guard/quality_guard.py   | 918 ++++++++++++++++++
- .../quality_guard_test.py                     | 309 ++++++
- 39 files changed, 3646 insertions(+), 63 deletions(-)
+ tools/egress-quality-guard/quality_guard.py   | 921 ++++++++++++++++++
+ .../quality_guard_test.py                     | 313 ++++++
+ 39 files changed, 3656 insertions(+), 63 deletions(-)
  create mode 100644 backend/internal/application/egress/quality_probe_test.go
  create mode 100644 backend/internal/application/gateway/quality_probe.go
  create mode 100644 backend/internal/application/gateway/quality_probe_test.go
@@ -2655,15 +2663,16 @@ index 0000000..53b30ec
 +ENTRYPOINT ["/usr/local/bin/grok2api-egress-quality-guard"]
 diff --git a/tools/egress-quality-guard/README.md b/tools/egress-quality-guard/README.md
 new file mode 100644
-index 0000000..cf58b5e
+index 0000000..b36bac6
 --- /dev/null
 +++ b/tools/egress-quality-guard/README.md
-@@ -0,0 +1,206 @@
+@@ -0,0 +1,209 @@
 +# Egress Quality Guard
 +
 +Egress Quality Guard combines passive production-audit monitoring with active
-+Grok Build probes through each fixed egress node. Passive anomalies are candidate
-+signals; only a fixed active probe can confirm them and quarantine a node.
++Grok Build probes through each fixed egress node. A passive hard-threshold
++anomaly quarantines the node immediately; a soft anomaly is confirmed by a
++fixed active probe.
 +
 +This is a heuristic circuit breaker, not a model-quality oracle. Very high
 +reported throughput can be caused by upstream or intermediary buffering. Start
@@ -2688,9 +2697,10 @@ index 0000000..cf58b5e
 +   fixed streaming prompt.
 +4. The fixed probe checks output tokens, chunk cadence, first-token time,
 +   instruction-marker compliance, and panel-equivalent output-token throughput.
-+5. A high-TPS production request only triggers an immediate fixed-prompt probe;
-+   it never quarantines a node by itself. An active hard result quarantines
-+   immediately, while active soft results must reach the configured strike count.
++5. A high-TPS production request at the hard threshold quarantines the node
++   immediately. A soft result triggers a fixed-prompt probe; active hard results
++   quarantine immediately, while active soft results must reach the configured
++   strike count.
 +6. Quarantined nodes remain available only to administrator probes. Recovery
 +   records a generic connectivity probe for diagnosis, then uses the real
 +   model-quality probe as the authority before re-enabling the node.
@@ -2703,8 +2713,9 @@ index 0000000..cf58b5e
 +`QUALITY_GUARD_MODE` accepts:
 +
 +- `passive`: inspect ordinary request audits every few seconds. Routine polling
-+  adds no model requests, but a candidate anomaly triggers one active confirmation
-+  probe. Recovery probes still run for nodes quarantined by the guard.
++  adds no model requests. Hard anomalies quarantine immediately; soft anomalies
++  trigger one active confirmation probe. Recovery probes still run for nodes
++  quarantined by the guard.
 +- `active`: run only fixed per-node probes at the configured interval.
 +- `hybrid`: enable both detectors. This is the recommended default.
 +
@@ -2815,7 +2826,7 @@ index 0000000..cf58b5e
 +- HTTPS/SSE audits cannot provide reliable proxy transfer-byte counts. The UI reports active-probe output Tokens and does not label them as network traffic.
 +- Intermediary buffering can produce unusually high instantaneous Token/s, so thresholds require calibration for each route.
 +- Passive monitoring processes only complete successful streaming requests with enough output to calculate speed. Short and failed requests are ignored.
-+- A real request may legitimately return cached content, an existing file, or a long constant. Passive high TPS therefore only starts a fixed-prompt confirmation and cannot directly quarantine the node.
++- A real request may legitimately return cached content, an existing file, or a long constant. Immediate quarantine at the passive hard threshold is therefore intentionally aggressive; raise `hard_tps` when false positives are more costly. Soft anomalies still require a fixed-prompt confirmation.
 +- The first run establishes an audit baseline. Cumulative statistics also begin when this version first writes state.
 +- Manual quality tests are diagnostic. They are excluded from automatic statistics and do not directly change quarantine state.
 +
@@ -2867,14 +2878,14 @@ index 0000000..cf58b5e
 +configuration validation, and private atomic state.
 diff --git a/tools/egress-quality-guard/README.zh-CN.md b/tools/egress-quality-guard/README.zh-CN.md
 new file mode 100644
-index 0000000..02e8b24
+index 0000000..424d720
 --- /dev/null
 +++ b/tools/egress-quality-guard/README.zh-CN.md
 @@ -0,0 +1,138 @@
 +# 出口质量守护程序
 +
-+出口质量守护程序同时支持“真实请求审计被动检测”和“固定 Prompt 主动探测”。被动异常只作为
-+候选信号；只有固定 Prompt 主动复测确认异常后，节点才会被临时隔离。
++出口质量守护程序同时支持“真实请求审计被动检测”和“固定 Prompt 主动探测”。被动检测命中
++硬阈值会立即隔离节点；软阈值仍需固定 Prompt 主动复测确认。
 +
 +它是启发式熔断器，不是模型智力鉴定器。上游或中间层缓冲也可能造成瞬时数千
 +Token/s，因此建议先观察 JSON 日志，再根据实际流量调整阈值。
@@ -2891,7 +2902,7 @@ index 0000000..02e8b24
 +1. 被动检测每 5 秒读取普通成功流式请求的新增审计，并按 grok2api 面板同口径的 `输出 Token / (总耗时 - 首字耗时)` 计算速度；输出 Token 故意包含 Reasoning Token。
 +2. 主动检测调用仅管理员可访问的 `POST /api/admin/v1/egress-nodes/{id}/quality-test`。
 +3. grok2api 只从明确绑定到该节点的账号中选号，并发送固定流式 Prompt。
-+4. 普通真实请求超过 TPS 阈值时只立即触发一次固定 Prompt 主动复测，不能直接隔离节点。
++4. 普通真实请求达到硬阈值时立即隔离；达到软阈值时触发一次固定 Prompt 主动复测。
 +5. 主动复测达到硬阈值会立即隔离；主动软异常必须达到配置的连续次数。
 +6. 隔离节点仍可接受管理员探测，但不会承载普通用户请求。
 +7. 冷却结束后记录一次通用连接探测用于诊断，再以真实模型质量探测作为恢复判据，账号绑定保持不变。
@@ -2900,7 +2911,7 @@ index 0000000..02e8b24
 +
 +## 运行模式
 +
-+- `passive`：轮询普通请求审计本身不消耗模型 Token；发现候选异常时会额外执行一次主动确认探测，守护程序隔离的节点仍会执行恢复探测。
++- `passive`：轮询普通请求审计本身不消耗模型 Token；硬异常立即隔离，软异常会额外执行一次主动确认探测，守护程序隔离的节点仍会执行恢复探测。
 +- `active`：只按固定间隔逐节点主动测试。
 +- `hybrid`：同时开启两套检测器，推荐用于生产环境。
 +
@@ -2986,7 +2997,7 @@ index 0000000..02e8b24
 +- HTTPS/SSE 请求审计无法可靠给出代理上下行字节数，界面只展示主动探测的输出 Token，不把它称为网络流量。
 +- 中间层缓冲可能制造异常高的瞬时 Token/s，阈值需要根据自己的链路校准。
 +- 被动检测只处理完整、成功且可计算速度的流式请求；短回答和失败请求会被忽略。
-+- 真实请求可能在输出已有文件、长常量或缓存内容，因此被动高 TPS 只会触发固定 Prompt 复测，不会直接隔离节点。
++- 真实请求可能在输出已有文件、长常量或缓存内容，因此被动硬阈值策略偏激进；可按业务情况调高 `hard_tps`，软阈值仍会主动复测后再决定是否隔离。
 +- 首次启动只建立被动审计基线，累计统计也从该版本首次写入状态时开始。
 +- 手动质量检测用于诊断，不计入自动检测累计统计，也不会直接改变隔离状态。
 +
@@ -3142,10 +3153,10 @@ index 0000000..d200d35
 +WantedBy=multi-user.target
 diff --git a/tools/egress-quality-guard/quality_guard.py b/tools/egress-quality-guard/quality_guard.py
 new file mode 100755
-index 0000000..4194b8d
+index 0000000..7cbc7ab
 --- /dev/null
 +++ b/tools/egress-quality-guard/quality_guard.py
-@@ -0,0 +1,918 @@
+@@ -0,0 +1,921 @@
 +#!/usr/bin/env python3
 +"""Active and passive quality guard for grok2api egress nodes.
 +
@@ -3940,6 +3951,9 @@ index 0000000..4194b8d
 +            duration_ms=int(audit_value.get("durationMs") or 0),
 +            strikes=int(state.get("passive_soft_strikes", 0)),
 +        )
++        if classification == "hard":
++            self._quarantine(all_nodes, node, reason, now)
++            return
 +        self._probe_active(all_nodes, node, now, trigger="passive_confirmation")
 +
 +    def run_passive_cycle(self) -> None:
@@ -4066,10 +4080,10 @@ index 0000000..4194b8d
 +    raise SystemExit(main())
 diff --git a/tools/egress-quality-guard/quality_guard_test.py b/tools/egress-quality-guard/quality_guard_test.py
 new file mode 100644
-index 0000000..a2dd6f2
+index 0000000..d318721
 --- /dev/null
 +++ b/tools/egress-quality-guard/quality_guard_test.py
-@@ -0,0 +1,309 @@
+@@ -0,0 +1,313 @@
 +import importlib.util
 +import stat
 +import sys
@@ -4280,9 +4294,9 @@ index 0000000..a2dd6f2
 +            self.assertTrue(guard.state["passive_initialized"])
 +            self.assertIn("old", guard.state["seen_audit_ids"])
 +
-+    def test_passive_hard_signal_requires_active_confirmation_and_ignores_guard_key(self):
++    def test_passive_hard_signal_quarantines_immediately_and_ignores_guard_key(self):
 +        with tempfile.TemporaryDirectory() as directory:
-+            cfg = config(state_file=Path(directory) / "state.json", lock_file=Path(directory) / "lock", mode="passive")
++            cfg = config(state_file=Path(directory) / "state.json", lock_file=Path(directory) / "lock", mode="passive", node_ids=("2",))
 +            healthy = {"expectedMatched": True, "outputTokens": 100, "outputTokensPerSecond": 100}
 +            api = FakeApi(self.nodes(), [healthy], [
 +                {"items": [], "hasMore": False, "nextCursor": ""},
@@ -4291,21 +4305,26 @@ index 0000000..a2dd6f2
 +            guard = quality_guard.Guard(cfg, api)
 +            guard.run_passive_cycle()
 +            guard.run_passive_cycle()
-+            self.assertEqual(api.quality_calls, ["2"])
-+            self.assertEqual(api.enabled_calls, [])
++            self.assertEqual(api.quality_calls, [])
++            self.assertEqual(api.enabled_calls, [("2", False)])
 +            self.assertFalse(guard.state["nodes"].get("1", {}).get("disabled_by_guard", False))
-+            self.assertFalse(guard.state["nodes"]["2"]["disabled_by_guard"])
++            self.assertTrue(guard.state["nodes"]["2"]["disabled_by_guard"])
 +            self.assertEqual(guard.state["nodes"]["2"]["passive_soft_strikes"], 0)
 +            self.assertEqual(guard.state["statistics"]["passive"]["total"], 1)
 +            self.assertEqual(guard.state["statistics"]["passive"]["hard"], 1)
++            guard.state["nodes"]["2"]["quarantined_until"] = 0
++            guard.run_active_cycle()
++            self.assertEqual(api.quality_calls, ["2"])
++            self.assertEqual(api.enabled_calls, [("2", False), ("2", True)])
++            self.assertFalse(guard.state["nodes"]["2"]["disabled_by_guard"])
 +
-+    def test_passive_hard_signal_quarantines_after_active_hard_confirmation(self):
++    def test_passive_soft_signal_still_requires_active_confirmation(self):
 +        with tempfile.TemporaryDirectory() as directory:
 +            cfg = config(state_file=Path(directory) / "state.json", lock_file=Path(directory) / "lock", mode="passive")
 +            hard = {"expectedMatched": True, "outputTokens": 100, "outputTokensPerSecond": 1200}
 +            api = FakeApi(self.nodes(), [hard], [
 +                {"items": [], "hasMore": False, "nextCursor": ""},
-+                {"items": [self.audit("user", "2", 1200)], "hasMore": False, "nextCursor": ""},
++                {"items": [self.audit("user", "2", 600)], "hasMore": False, "nextCursor": ""},
 +            ])
 +            guard = quality_guard.Guard(cfg, api)
 +            guard.run_passive_cycle()
@@ -4320,8 +4339,8 @@ index 0000000..a2dd6f2
 +            soft = {"expectedMatched": True, "outputTokens": 100, "outputTokensPerSecond": 600}
 +            api = FakeApi(self.nodes(), [soft, soft], [
 +                {"items": [], "hasMore": False, "nextCursor": ""},
-+                {"items": [self.audit("user-1", "2", 1200)], "hasMore": False, "nextCursor": ""},
-+                {"items": [self.audit("user-2", "2", 1200)], "hasMore": False, "nextCursor": ""},
++                {"items": [self.audit("user-1", "2", 600)], "hasMore": False, "nextCursor": ""},
++                {"items": [self.audit("user-2", "2", 600)], "hasMore": False, "nextCursor": ""},
 +            ])
 +            guard = quality_guard.Guard(cfg, api)
 +            guard.run_passive_cycle()
@@ -4333,19 +4352,18 @@ index 0000000..a2dd6f2
 +            self.assertEqual(api.enabled_calls, [("2", False)])
 +            self.assertTrue(guard.state["nodes"]["2"]["disabled_by_guard"])
 +
-+    def test_multiple_passive_hard_signals_each_require_healthy_active_confirmation(self):
++    def test_multiple_passive_hard_signals_only_quarantine_once(self):
 +        with tempfile.TemporaryDirectory() as directory:
 +            cfg = config(state_file=Path(directory) / "state.json", lock_file=Path(directory) / "lock", mode="passive")
-+            healthy = {"expectedMatched": True, "outputTokens": 100, "outputTokensPerSecond": 100}
-+            api = FakeApi(self.nodes(), [healthy, healthy], [
++            api = FakeApi(self.nodes(), [], [
 +                {"items": [], "hasMore": False, "nextCursor": ""},
 +                {"items": [self.audit("user-1", "2", 1200), self.audit("user-2", "2", 1500)], "hasMore": False, "nextCursor": ""},
 +            ])
 +            guard = quality_guard.Guard(cfg, api)
 +            guard.run_passive_cycle()
 +            guard.run_passive_cycle()
-+            self.assertEqual(api.quality_calls, ["2", "2"])
-+            self.assertEqual(api.enabled_calls, [])
++            self.assertEqual(api.quality_calls, [])
++            self.assertEqual(api.enabled_calls, [("2", False)])
 +            self.assertEqual(guard.state["nodes"]["2"]["passive_soft_strikes"], 0)
 +
 +    def test_passive_confirmation_errors_do_not_quarantine(self):
@@ -4356,7 +4374,7 @@ index 0000000..a2dd6f2
 +            )
 +            api = FakeApi(self.nodes(), [RuntimeError("probe unavailable")], [
 +                {"items": [], "hasMore": False, "nextCursor": ""},
-+                {"items": [self.audit("user", "2", 1200)], "hasMore": False, "nextCursor": ""},
++                {"items": [self.audit("user", "2", 600)], "hasMore": False, "nextCursor": ""},
 +            ])
 +            guard = quality_guard.Guard(cfg, api)
 +            guard.run_passive_cycle()

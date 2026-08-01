@@ -8,7 +8,7 @@ Current baseline:
 - Upstream commit: `090104504b403d65675a01dab9c92b3a235ee832`
 - Patch commit: `690a641deb06c5c1a73983677f6b454557727113`
 - Upstream draft PR: [chenyme/grok2api#837](https://github.com/chenyme/grok2api/pull/837)
-- Runnable fork: [lij768423-svg/grok2api](https://github.com/lij768423-svg/grok2api/tree/agent/egress-resilience-quality-guard)
+- Runnable fork: [lij768423-svg/grok2api](https://github.com/lij768423-svg/grok2api/tree/main)
 
 ## Features
 
@@ -24,12 +24,13 @@ Current baseline:
 ### Egress quality guard
 
 - Passive audits use the grok2api panel formula `output tokens / (duration - first token)`; output tokens include reasoning tokens.
-- Passive high TPS only triggers a fixed-prompt active confirmation. A production request never quarantines a node from one speed observation.
-- Active soft and hard thresholds, consecutive-error handling, minimum healthy-node protection, quarantine, and recovery.
+- **Passive hard-threshold hits quarantine immediately**. Soft hits still trigger a fixed-prompt active confirmation and require consecutive strikes.
+- Active soft and hard thresholds, consecutive probe-error handling, minimum healthy-node protection, quarantine, and recovery.
 - Admin UI, manual diagnostics, hot-reloadable policy, and persistent statistics.
 - Python sidecar, Docker Compose and systemd examples, security notes, and bilingual documentation.
 
-The quality guard is a heuristic circuit breaker, not proof that upstream model capability changed. Buffering, existing files, long constants, and cached content can all make a production request legitimately appear very fast, so the fixed-prompt probe is the authority.
+The quality guard is a heuristic circuit breaker, not proof that upstream model capability changed. Immediate hard quarantine is intentionally aggressive; raise `hard_tps` when false positives are more costly. Soft anomalies still require confirmation probes.
+
 
 ## Apply directly
 
