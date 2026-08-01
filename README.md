@@ -65,6 +65,14 @@ pnpm build
 
 补丁不包含部署配置。不要向 AI 工具提供真实 `.env`、`config.yaml`、数据库、状态卷、代理 URL、账号凭据或生产日志。合并时只需要上游源码、本仓库补丁和测试输出。
 
+## 相关项目
+
+- [Grok Register + Live Panel](https://github.com/lij768423-svg/grok-register-panel)：基于 Camoufox 的 Grok 注册流程与 Web 管理面板，支持多邮箱后端、外部代理池、出口预检、ASN 黑名单、运行统计和账号补录。它是独立项目，不包含在本补丁中。
+
+## 友情链接
+
+- [LINUX DO](https://linux.do) — 新的理想型社区
+
 ## 许可与归属
 
 补丁在上游 MIT 许可框架下发布。保留上游项目的 LICENSE、版权信息和提交历史。本仓库不是 grok2api 官方发行版，也不代表上游维护者认可这些改动。
