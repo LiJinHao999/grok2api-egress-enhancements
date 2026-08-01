@@ -3,10 +3,10 @@
   "upstream_repository": "https://github.com/chenyme/grok2api",
   "upstream_tag": "v3.0.11",
   "upstream_commit": "090104504b403d65675a01dab9c92b3a235ee832",
-  "patch_commit": "b6f18fbbb6cc8d1d703021ace934df7b542f2a6f",
-  "runnable_commit": "08af9a854e3232e6e5f21c6d1839de3ca95882c0",
+  "patch_commit": "8afc0a08582a102529546b8964eb636fc0bffd3e",
+  "runnable_commit": "982e9ba783ffd665fc759751907fdadaefc2d93e",
   "patch_file": "patches/0001-feat-add-egress-recovery-and-quality-guard.patch",
-  "patch_sha256": "d3261b5dd5d5c07882d1b94af9c5ece1a5e1bb8b9a30cb337f49c3bfbfe5e9e3",
+  "patch_sha256": "de060769b4f643dba772745d2b2efdf9448e0bf5d76475be5bd260c8c7529bb7",
   "upstream_pr": "https://github.com/chenyme/grok2api/pull/837",
   "runnable_fork_branch": "https://github.com/lij768423-svg/grok2api/tree/main"
 }

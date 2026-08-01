@@ -6,7 +6,7 @@ Current baseline:
 
 - Upstream release: `v3.0.11`
 - Upstream commit: `090104504b403d65675a01dab9c92b3a235ee832`
-- Patch commit: `b6f18fbbb6cc8d1d703021ace934df7b542f2a6f`
+- Patch commit: `8afc0a08582a102529546b8964eb636fc0bffd3e`
 - Upstream draft PR: [chenyme/grok2api#837](https://github.com/chenyme/grok2api/pull/837)
 - Runnable fork: [lij768423-svg/grok2api](https://github.com/lij768423-svg/grok2api/tree/main)
 
@@ -26,7 +26,12 @@ Current baseline:
 - Passive audits use the grok2api panel formula `output tokens / (duration - first token)`; output tokens include reasoning tokens.
 - **Passive hard-threshold hits quarantine immediately**. Soft hits still trigger a fixed-prompt active confirmation and require consecutive strikes.
 - Active soft and hard thresholds, consecutive probe-error handling, minimum healthy-node protection, quarantine, and recovery.
+- Fail-closed quarantine before confirmation, with same-IP confirmation for short buffered bursts to avoid false rotation.
+- A trusted per-node rotation webhook and a 1024Proxy `sid-...-t-...` sticky-session rotator.
+- One real-model check per new IP: healthy results restore immediately; anomalous or indeterminate results remain isolated.
+- Account-selection failures are deferred without counting a proxy error or rotating the IP.
 - Admin UI, manual diagnostics, hot-reloadable policy, and persistent statistics.
+- One replaceable toast per node action, with manual tests disabled while a node is quarantined or rotating.
 - Create, edit, delete, enable, disable, and refresh Build proxy nodes directly from the node-quality table.
 - Select individual or all nodes and batch enable, disable, or delete them with destructive-action confirmation.
 - Automatically discover proxied Build nodes when `QUALITY_GUARD_NODE_IDS` is empty while publishing resolved IDs for compatibility with older admin pages.
@@ -51,7 +56,9 @@ For newer upstream versions, follow [AI_MERGE_GUIDE.md](./docs/AI_MERGE_GUIDE.md
 
 ```sh
 go test ./...
-python3 -m unittest -v tools/egress-quality-guard/quality_guard_test.py  # 18 tests
+python3 -m unittest -v \
+  tools/egress-quality-guard/quality_guard_test.py \
+  tools/egress-quality-guard/session_rotator_test.py  # 26 tests
 cd frontend
 pnpm lint
 pnpm build

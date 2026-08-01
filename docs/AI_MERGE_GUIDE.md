@@ -23,8 +23,12 @@
 10. 被动 hard TPS 必须立即隔离；被动 soft TPS 仍需固定 Prompt 主动复测确认，主动 hard 立即隔离，主动 soft 连续命中后隔离。被动触发的复测错误不得直接隔离。
 11. 质量守护页必须复用出口节点 API，保持代理 URL 只写，并提供单节点 CRUD、启停、刷新以及批量选择、批量启停和批量删除。
 12. `QUALITY_GUARD_NODE_IDS` 为空时必须自动发现已启用代理 Build 节点，并在状态里发布已解析 ID 以兼容旧版页面；手工停用节点不得被主动探测。
-13. 不得读取或修改真实 .env、config.yaml、数据库、状态卷或生产代理配置。
-14. 完成后运行 Go 全量测试、sidecar 单测、前端 lint/build，并列出所有语义冲突和处理方式。
+13. 严格模式下可疑节点先摘流；短窗口缓冲突增必须先在原 IP 复测，确认异常后才换 IP。新 IP 只检测一次，正常立即恢复，否则保持隔离。
+14. 连续主动探测错误达到阈值后才隔离。账号选择失败必须返回独立错误码，守护只延后复测，不得累计代理故障或触发换 IP。
+15. 节点级换 IP 只能作用于显式允许的节点，不得覆盖其他代理。1024Proxy 粘性会话用户名应保持 `sid-...-t-...` 结构并验证出口确实变化。
+16. 质量检测、节点启停和批量操作的提示不得互相堆叠；隔离或轮换中的节点不得并发手动检测。
+17. 不得读取或修改真实 .env、config.yaml、数据库、状态卷或生产代理配置。
+18. 完成后运行 Go 全量测试、质量守护与轮换器单测、前端 lint/build，并列出所有语义冲突和处理方式。
 ```
 
 ## 手工起点
@@ -49,7 +53,9 @@ git am --3way patches/0001-feat-add-egress-recovery-and-quality-guard.patch
 
 ```sh
 go test ./...
-python3 -m unittest -v tools/egress-quality-guard/quality_guard_test.py
+python3 -m unittest -v \
+  tools/egress-quality-guard/quality_guard_test.py \
+  tools/egress-quality-guard/session_rotator_test.py
 cd frontend && pnpm lint && pnpm build
 git diff --check
 ```

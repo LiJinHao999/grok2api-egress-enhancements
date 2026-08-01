@@ -6,7 +6,7 @@
 
 - 上游版本：`v3.0.11`
 - 上游提交：`090104504b403d65675a01dab9c92b3a235ee832`
-- 补丁提交：见 `MANIFEST.json` 的 `patch_commit`（节点管理完整版）
+- 补丁提交：见 `MANIFEST.json` 的 `patch_commit`（严格隔离与自动换 IP 完整版）
 - 上游 Draft PR：[chenyme/grok2api#837](https://github.com/chenyme/grok2api/pull/837)
 - 可运行 Fork：[lij768423-svg/grok2api](https://github.com/lij768423-svg/grok2api/tree/main)
 
@@ -26,7 +26,12 @@
 - 被动审计按 grok2api 面板同口径计算 `输出 Token / (总耗时 - 首字耗时)`，其中输出 Token 包含推理 Token。
 - **被动硬阈值立即隔离节点**；软阈值触发固定 Prompt 主动复测，连续命中后才隔离。
 - 主动软/硬阈值、连续探测错误、最低健康节点、隔离与自动恢复保护。
+- 严格模式下先摘流再确认；短窗口流式缓冲突增会先在原 IP 复测，确认异常后才换 IP。
+- 支持受信任的节点级换 IP Webhook，以及 1024Proxy `sid-...-t-...` 粘性会话轮换器。
+- 新 IP 只执行一次真实模型质量检测；正常立即恢复，异常或不确定则保持隔离。
+- 账号调度失败与代理故障分开处理：暂无可调度账号时延后复测，不累计代理错误、不浪费流量换 IP。
 - 管理端质量守护页面、手动诊断、策略热加载和累计统计。
+- 手动检测与节点操作使用单条可更新提示；隔离或轮换中的节点禁止并发手动检测。
 - 在节点质量表中直接添加、编辑、删除、启用、停用和刷新 Build 代理节点。
 - 支持单选、全选、批量启用、批量停用和批量删除，并为删除操作提供确认。
 - `QUALITY_GUARD_NODE_IDS` 留空时自动发现所有已启用的代理 Build 节点；状态文件同时发布已解析节点，兼容旧版管理页面。
@@ -50,7 +55,9 @@ git am --3way /path/to/grok2api-egress-enhancements/patches/0001-feat-add-egress
 
 ```sh
 go test ./...
-python3 -m unittest -v tools/egress-quality-guard/quality_guard_test.py  # 18 tests
+python3 -m unittest -v \
+  tools/egress-quality-guard/quality_guard_test.py \
+  tools/egress-quality-guard/session_rotator_test.py  # 26 tests
 cd frontend
 pnpm lint
 pnpm build
@@ -63,6 +70,7 @@ pnpm build
 - 不健康探针不会提前恢复节点；
 - 动态代理池不会因单次连接失败进入全局冷却；
 - 管理 API 不返回管理员密码、Client Key 密钥、代理 URL、探测 Prompt 或模型响应正文。
+- 账号调度失败不会触发代理 IP 轮换，未经模型质量验证的隔离节点也不会被恢复。
 
 ## 安全与隐私
 

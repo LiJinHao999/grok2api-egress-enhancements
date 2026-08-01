@@ -1,50 +1,52 @@
-From b6f18fbbb6cc8d1d703021ace934df7b542f2a6f Mon Sep 17 00:00:00 2001
+From 8afc0a08582a102529546b8964eb636fc0bffd3e Mon Sep 17 00:00:00 2001
 From: lij768423-svg <265844445+lij768423-svg@users.noreply.github.com>
-Date: Sat, 1 Aug 2026 14:19:26 +0000
-Subject: [PATCH] feat: add egress recovery and quality guard node management
+Date: Sat, 1 Aug 2026 16:47:02 +0000
+Subject: [PATCH] feat: add hardened egress recovery and quality guard
 
-Add fixed-proxy immediate recovery, hybrid quality detection, hard-threshold quarantine, automatic node discovery, and complete node management in the quality-guard UI.
 ---
- .dockerignore                                 |   4 +
- .gitignore                                    |   5 +
- README.md                                     |   4 +
- README.zh-CN.md                               |   4 +
- backend/internal/app/application.go           |   5 +-
- .../internal/application/clientkey/service.go |  10 +
- .../application/egress/quality_probe_test.go  |  73 ++
- .../internal/application/egress/service.go    | 103 +-
- .../application/gateway/quality_probe.go      | 191 ++++
- .../application/gateway/quality_probe_test.go |  19 +
- .../internal/application/gateway/selector.go  |  18 +-
- .../application/gateway/selector_test.go      |  46 +
- .../internal/application/gateway/service.go   |   5 +
- backend/internal/domain/egress/egress.go      |   2 +
- .../internal/infra/egress/FAILURE_RETRY.md    |  44 +
- backend/internal/infra/egress/manager.go      | 157 ++-
- backend/internal/infra/egress/manager_test.go | 268 +++++
- backend/internal/infra/egress/trace.go        |  19 +
- .../relational/egress_operations_test.go      |  20 +
- .../relational/egress_repository.go           |  31 +-
- .../internal/transport/http/egress/handler.go | 368 ++++++-
- .../transport/http/egress/handler_test.go     |  82 ++
- backend/internal/transport/http/server.go     |  34 +-
- frontend/src/app/app-shell.tsx                |   3 +-
- frontend/src/app/deferred-pages.tsx           |   5 +
- frontend/src/app/router.tsx                   |   3 +-
- .../quality-guard/quality-guard-api.ts        | 152 +++
- .../quality-guard/quality-guard-page.tsx      | 507 ++++++++++
- .../src/features/settings/egress-nodes.tsx    |   2 +
- frontend/src/shared/i18n/index.ts             |  19 +-
- tools/egress-quality-guard/Dockerfile         |  13 +
- tools/egress-quality-guard/README.md          | 209 ++++
- tools/egress-quality-guard/README.zh-CN.md    | 138 +++
- tools/egress-quality-guard/SECURITY.md        |  22 +
- .../compose.override.example.yml              |  25 +
- .../egress-quality-guard.env.example          |  33 +
- .../grok2api-egress-quality-guard.service     |  27 +
- tools/egress-quality-guard/quality_guard.py   | 924 ++++++++++++++++++
- .../quality_guard_test.py                     | 324 ++++++
- 39 files changed, 3855 insertions(+), 63 deletions(-)
+ .dockerignore                                 |    4 +
+ .gitignore                                    |    5 +
+ README.md                                     |    4 +
+ README.zh-CN.md                               |    4 +
+ backend/internal/app/application.go           |    5 +-
+ .../internal/application/clientkey/service.go |   10 +
+ .../application/egress/quality_probe_test.go  |   73 ++
+ .../internal/application/egress/service.go    |  104 +-
+ .../application/gateway/quality_probe.go      |  198 +++
+ .../application/gateway/quality_probe_test.go |   31 +
+ .../internal/application/gateway/selector.go  |   18 +-
+ .../application/gateway/selector_test.go      |   46 +
+ .../internal/application/gateway/service.go   |    5 +
+ backend/internal/domain/egress/egress.go      |    2 +
+ .../internal/infra/egress/FAILURE_RETRY.md    |   44 +
+ backend/internal/infra/egress/manager.go      |  157 ++-
+ backend/internal/infra/egress/manager_test.go |  268 ++++
+ backend/internal/infra/egress/trace.go        |   19 +
+ .../relational/egress_operations_test.go      |   20 +
+ .../relational/egress_repository.go           |   31 +-
+ .../internal/transport/http/egress/handler.go |  381 +++++-
+ .../transport/http/egress/handler_test.go     |  100 ++
+ backend/internal/transport/http/server.go     |   34 +-
+ frontend/src/app/app-shell.tsx                |    3 +-
+ frontend/src/app/deferred-pages.tsx           |    5 +
+ frontend/src/app/router.tsx                   |    3 +-
+ .../quality-guard/quality-guard-api.ts        |  152 +++
+ .../quality-guard/quality-guard-page.tsx      |  510 ++++++++
+ .../src/features/settings/egress-nodes.tsx    |    2 +
+ frontend/src/shared/i18n/index.ts             |   19 +-
+ tools/egress-quality-guard/Dockerfile         |   13 +
+ .../Dockerfile.session-rotator                |    7 +
+ tools/egress-quality-guard/README.md          |  230 ++++
+ tools/egress-quality-guard/README.zh-CN.md    |  158 +++
+ tools/egress-quality-guard/SECURITY.md        |   22 +
+ .../compose.override.example.yml              |   25 +
+ .../egress-quality-guard.env.example          |   43 +
+ .../grok2api-egress-quality-guard.service     |   27 +
+ tools/egress-quality-guard/quality_guard.py   | 1080 +++++++++++++++++
+ .../quality_guard_test.py                     |  506 ++++++++
+ tools/egress-quality-guard/session_rotator.py |  301 +++++
+ .../session_rotator_test.py                   |   71 ++
+ 42 files changed, 4677 insertions(+), 63 deletions(-)
  create mode 100644 backend/internal/application/egress/quality_probe_test.go
  create mode 100644 backend/internal/application/gateway/quality_probe.go
  create mode 100644 backend/internal/application/gateway/quality_probe_test.go
@@ -52,6 +54,7 @@ Add fixed-proxy immediate recovery, hybrid quality detection, hard-threshold qua
  create mode 100644 frontend/src/features/quality-guard/quality-guard-api.ts
  create mode 100644 frontend/src/features/quality-guard/quality-guard-page.tsx
  create mode 100644 tools/egress-quality-guard/Dockerfile
+ create mode 100644 tools/egress-quality-guard/Dockerfile.session-rotator
  create mode 100644 tools/egress-quality-guard/README.md
  create mode 100644 tools/egress-quality-guard/README.zh-CN.md
  create mode 100644 tools/egress-quality-guard/SECURITY.md
@@ -60,6 +63,8 @@ Add fixed-proxy immediate recovery, hybrid quality detection, hard-threshold qua
  create mode 100644 tools/egress-quality-guard/grok2api-egress-quality-guard.service
  create mode 100755 tools/egress-quality-guard/quality_guard.py
  create mode 100644 tools/egress-quality-guard/quality_guard_test.py
+ create mode 100644 tools/egress-quality-guard/session_rotator.py
+ create mode 100644 tools/egress-quality-guard/session_rotator_test.py
 
 diff --git a/.dockerignore b/.dockerignore
 index 40deb96..134177a 100644
@@ -275,10 +280,10 @@ index 0000000..af09b4a
 +	}
 +}
 diff --git a/backend/internal/application/egress/service.go b/backend/internal/application/egress/service.go
-index 8badd49..1f8f023 100644
+index 8badd49..3e6b5d7 100644
 --- a/backend/internal/application/egress/service.go
 +++ b/backend/internal/application/egress/service.go
-@@ -16,14 +16,54 @@ import (
+@@ -16,14 +16,55 @@ import (
  )
  
  var (
@@ -294,6 +299,7 @@ index 8badd49..1f8f023 100644
 +	ErrNotFound                = errors.New("代理节点不存在")
 +	ErrProbeStale              = errors.New("代理配置在探测期间已更新，请重新测试")
 +	ErrQualityProbeUnavailable = errors.New("出口质量探测不可用")
++	ErrQualityProbeNoAccount   = errors.New("质量检测暂无可调度账号")
 +	ErrClearanceUnavailable    = errors.New("Clearance 刷新不可用")
  )
  
@@ -339,7 +345,7 @@ index 8badd49..1f8f023 100644
  const (
  	maxProxyURLBytes         = 8192
  	maxCloudflareCookieBytes = 16 << 10
-@@ -67,11 +107,62 @@ type Service struct {
+@@ -67,11 +108,62 @@ type Service struct {
  	clearance         ClearanceManager
  	prober            NodeProber
  	operationsCache   OperationsConfigInvalidator
@@ -404,10 +410,10 @@ index 8badd49..1f8f023 100644
  type AccountBindingRepository interface {
 diff --git a/backend/internal/application/gateway/quality_probe.go b/backend/internal/application/gateway/quality_probe.go
 new file mode 100644
-index 0000000..3f20505
+index 0000000..f449bb3
 --- /dev/null
 +++ b/backend/internal/application/gateway/quality_probe.go
-@@ -0,0 +1,191 @@
+@@ -0,0 +1,198 @@
 +package gateway
 +
 +import (
@@ -483,7 +489,7 @@ index 0000000..3f20505
 +		Streaming: true, Operation: audit.OperationChat, ForcedEgressNodeID: nodeID,
 +	})
 +	if err != nil {
-+		return egressapp.QualityProbeResult{}, err
++		return egressapp.QualityProbeResult{}, normalizeQualityProbeRequestError(err)
 +	}
 +	defer result.Body.Close()
 +
@@ -592,6 +598,13 @@ index 0000000..3f20505
 +	}, nil
 +}
 +
++func normalizeQualityProbeRequestError(err error) error {
++	if errors.Is(err, ErrNoAvailableAccount) {
++		return egressapp.ErrQualityProbeNoAccount
++	}
++	return err
++}
++
 +func qualityProbeOutputTokensPerSecond(outputTokens, durationMS, firstTokenMS int64) float64 {
 +	generationMS := durationMS - firstTokenMS
 +	if outputTokens <= 0 || generationMS <= 0 {
@@ -601,13 +614,25 @@ index 0000000..3f20505
 +}
 diff --git a/backend/internal/application/gateway/quality_probe_test.go b/backend/internal/application/gateway/quality_probe_test.go
 new file mode 100644
-index 0000000..bcd79d8
+index 0000000..4a9f3ab
 --- /dev/null
 +++ b/backend/internal/application/gateway/quality_probe_test.go
-@@ -0,0 +1,19 @@
+@@ -0,0 +1,31 @@
 +package gateway
 +
-+import "testing"
++import (
++	"errors"
++	"testing"
++
++	egressapp "github.com/chenyme/grok2api/backend/internal/application/egress"
++)
++
++func TestQualityProbeSelectionFailureCanBeIdentifiedByCaller(t *testing.T) {
++	err := normalizeQualityProbeRequestError(errors.Join(ErrNoAvailableAccount, &SelectionUnavailableError{Reason: SelectionCooling}))
++	if !errors.Is(err, egressapp.ErrQualityProbeNoAccount) {
++		t.Fatalf("error = %v", err)
++	}
++}
 +
 +func TestQualityProbeOutputTokensPerSecondMatchesAuditPanel(t *testing.T) {
 +	got := qualityProbeOutputTokensPerSecond(1335, 17320, 17100)
@@ -1453,7 +1478,7 @@ index b0da95d..e182d17 100644
  		return mapError(result.Error)
  	}
 diff --git a/backend/internal/transport/http/egress/handler.go b/backend/internal/transport/http/egress/handler.go
-index 1e5b2b8..8e6e7a8 100644
+index 1e5b2b8..9b11d85 100644
 --- a/backend/internal/transport/http/egress/handler.go
 +++ b/backend/internal/transport/http/egress/handler.go
 @@ -1,9 +1,14 @@
@@ -1793,7 +1818,7 @@ index 1e5b2b8..8e6e7a8 100644
 +		Expected: state.Guard.Expected, MaxOutputTokens: state.Guard.MaxOutputTokens,
 +	})
 +	if err != nil {
-+		h.writeError(c, err)
++		h.writeQualityProbeError(c, err)
 +		return
 +	}
 +	response.Success(c, http.StatusOK, gin.H{
@@ -1843,7 +1868,7 @@ index 1e5b2b8..8e6e7a8 100644
 +		Expected: request.Expected, MaxOutputTokens: request.MaxOutputTokens,
 +	})
 +	if err != nil {
-+		h.writeError(c, err)
++		h.writeQualityProbeError(c, err)
 +		return
 +	}
 +	response.Success(c, http.StatusOK, gin.H{
@@ -1870,8 +1895,28 @@ index 1e5b2b8..8e6e7a8 100644
  	case strings.Contains(err.Error(), "FlareSolverr") || strings.Contains(err.Error(), "Clearance"):
  		response.Error(c, http.StatusBadGateway, "clearanceRefreshFailed", err.Error())
  	default:
+@@ -732,6 +1096,19 @@ func (h *Handler) writeError(c *gin.Context, err error) {
+ 	}
+ }
+ 
++func (h *Handler) writeQualityProbeError(c *gin.Context, err error) {
++	switch {
++	case errors.Is(err, egressapp.ErrQualityProbeNoAccount):
++		response.Error(c, http.StatusServiceUnavailable, "egressQualityProbeNoAccount", "质量检测暂无可调度账号，请稍后重试")
++	case errors.Is(err, egressapp.ErrInvalidInput),
++		errors.Is(err, egressapp.ErrNotFound),
++		errors.Is(err, egressapp.ErrQualityProbeUnavailable):
++		h.writeError(c, err)
++	default:
++		response.Error(c, http.StatusBadGateway, "egressQualityProbeFailed", "质量检测暂不可用，请稍后重试")
++	}
++}
++
+ func pathID(c *gin.Context) (uint64, bool) {
+ 	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+ 	if err != nil || id == 0 {
 diff --git a/backend/internal/transport/http/egress/handler_test.go b/backend/internal/transport/http/egress/handler_test.go
-index 83ff3fa..07389b6 100644
+index 83ff3fa..c702d2f 100644
 --- a/backend/internal/transport/http/egress/handler_test.go
 +++ b/backend/internal/transport/http/egress/handler_test.go
 @@ -4,6 +4,7 @@ import (
@@ -1882,7 +1927,7 @@ index 83ff3fa..07389b6 100644
  	"strings"
  	"testing"
  	"time"
-@@ -13,6 +14,87 @@ import (
+@@ -13,6 +14,105 @@ import (
  	"github.com/gin-gonic/gin"
  )
  
@@ -1910,6 +1955,24 @@ index 83ff3fa..07389b6 100644
 +	context.Request = httptest.NewRequest("GET", "/egress-quality-guard", nil)
 +	NewHandler(nil).qualityGuardStatus(context)
 +	if recorder.Code != 200 || !strings.Contains(recorder.Body.String(), `"available":false`) {
++		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
++	}
++}
++
++func TestWriteQualityProbeErrorUsesSpecificSafeMessage(t *testing.T) {
++	recorder := httptest.NewRecorder()
++	context, _ := gin.CreateTestContext(recorder)
++	NewHandler(nil).writeQualityProbeError(context, errors.New("sensitive upstream failure"))
++	if recorder.Code != 502 || !strings.Contains(recorder.Body.String(), `"code":"egressQualityProbeFailed"`) || !strings.Contains(recorder.Body.String(), "质量检测暂不可用") || strings.Contains(recorder.Body.String(), "sensitive upstream failure") {
++		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
++	}
++}
++
++func TestWriteQualityProbeErrorIdentifiesMissingProbeAccount(t *testing.T) {
++	recorder := httptest.NewRecorder()
++	context, _ := gin.CreateTestContext(recorder)
++	NewHandler(nil).writeQualityProbeError(context, egressapp.ErrQualityProbeNoAccount)
++	if recorder.Code != 503 || !strings.Contains(recorder.Body.String(), `"code":"egressQualityProbeNoAccount"`) || !strings.Contains(recorder.Body.String(), "暂无可调度账号") {
 +		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
 +	}
 +}
@@ -2245,10 +2308,10 @@ index 0000000..a3d7273
 +}
 diff --git a/frontend/src/features/quality-guard/quality-guard-page.tsx b/frontend/src/features/quality-guard/quality-guard-page.tsx
 new file mode 100644
-index 0000000..1d1e6d4
+index 0000000..88017f1
 --- /dev/null
 +++ b/frontend/src/features/quality-guard/quality-guard-page.tsx
-@@ -0,0 +1,507 @@
+@@ -0,0 +1,510 @@
 +import { zodResolver } from "@hookform/resolvers/zod";
 +import { useMutation, useQuery, useQueryClient, type UseMutationResult } from "@tanstack/react-query";
 +import { Activity, AlertTriangle, BarChart3, Bot, Coins, Eye, Gauge, MoreHorizontal, Pencil, Plus, Power, PowerOff, RefreshCw, RotateCcw, RotateCw, Shield, ShieldCheck, ShieldX, TimerReset, Trash2, Zap } from "lucide-react";
@@ -2275,6 +2338,8 @@ index 0000000..1d1e6d4
 +import { PageHeader } from "@/shared/components/page-header";
 +import { cn } from "@/shared/lib/cn";
 +
++const NODE_ACTION_TOAST_ID = "quality-guard-node-action";
++
 +export function QualityGuardPage() {
 +  const { t, i18n } = useTranslation();
 +  const queryClient = useQueryClient();
@@ -2296,11 +2361,12 @@ index 0000000..1d1e6d4
 +  });
 +  const testMutation = useMutation({
 +    mutationFn: ({ nodeId, status }: { nodeId: string; status: QualityGuardStatus }) => runQualityTest(nodeId, status),
++    onMutate: () => toast.loading(t("qualityGuard.testing"), { id: NODE_ACTION_TOAST_ID }),
 +    onSuccess: (result, variables) => {
 +      setManualResults((current) => ({ ...current, [variables.nodeId]: qualityTestState(result, variables.status) }));
-+      toast.success(t("qualityGuard.testComplete", { speed: formatTPS(result.outputTokensPerSecond) }));
++      toast.success(t("qualityGuard.testComplete", { speed: formatTPS(result.outputTokensPerSecond) }), { id: NODE_ACTION_TOAST_ID });
 +    },
-+    onError: (error) => toast.error(error instanceof Error ? error.message : t("errors.generic")),
++    onError: (error) => toast.error(error instanceof Error ? error.message : t("qualityGuard.testFailed"), { id: NODE_ACTION_TOAST_ID }),
 +  });
 +
 +  const refreshNodeQueries = () => Promise.all([
@@ -2323,26 +2389,26 @@ index 0000000..1d1e6d4
 +    onSuccess: () => {
 +      setEditingNode(undefined);
 +      void refreshNodeQueries();
-+      toast.success(t("settings.egress.saved"));
++      toast.success(t("settings.egress.saved"), { id: NODE_ACTION_TOAST_ID });
 +    },
-+    onError: (error) => toast.error(error instanceof Error ? error.message : t("settings.egress.operationFailed")),
++    onError: (error) => toast.error(error instanceof Error ? error.message : t("settings.egress.operationFailed"), { id: NODE_ACTION_TOAST_ID }),
 +  });
 +  const toggleNodeMutation = useMutation({
 +    mutationFn: ({ node, enabled }: { node: EgressNodeDTO; enabled: boolean }) => updateEgressNodesEnabled([node.id], enabled),
 +    onSuccess: (_, { enabled }) => {
 +      void refreshNodeQueries();
-+      toast.success(t(enabled ? "qualityGuard.nodeEnabled" : "qualityGuard.nodeDisabled"));
++      toast.success(t(enabled ? "qualityGuard.nodeEnabled" : "qualityGuard.nodeDisabled"), { id: NODE_ACTION_TOAST_ID });
 +    },
-+    onError: (error) => toast.error(error instanceof Error ? error.message : t("settings.egress.operationFailed")),
++    onError: (error) => toast.error(error instanceof Error ? error.message : t("settings.egress.operationFailed"), { id: NODE_ACTION_TOAST_ID }),
 +  });
 +  const batchToggleMutation = useMutation({
 +    mutationFn: ({ nodes, enabled }: { nodes: EgressNodeDTO[]; enabled: boolean }) => updateEgressNodesEnabled(nodes.map((node) => node.id), enabled),
 +    onSuccess: (_, { enabled }) => {
 +      setSelectedNodeIDs(new Set());
 +      void refreshNodeQueries();
-+      toast.success(t(enabled ? "qualityGuard.nodesEnabled" : "qualityGuard.nodesDisabled"));
++      toast.success(t(enabled ? "qualityGuard.nodesEnabled" : "qualityGuard.nodesDisabled"), { id: NODE_ACTION_TOAST_ID });
 +    },
-+    onError: (error) => toast.error(error instanceof Error ? error.message : t("settings.egress.operationFailed")),
++    onError: (error) => toast.error(error instanceof Error ? error.message : t("settings.egress.operationFailed"), { id: NODE_ACTION_TOAST_ID }),
 +  });
 +  const deleteNodeMutation = useMutation({
 +    mutationFn: (nodes: EgressNodeDTO[]) => deleteEgressNodes(nodes.map((node) => node.id)),
@@ -2350,9 +2416,9 @@ index 0000000..1d1e6d4
 +      setDeletingNodes([]);
 +      setSelectedNodeIDs(new Set());
 +      void refreshNodeQueries();
-+      toast.success(t("settings.egress.deleted"));
++      toast.success(t("settings.egress.deleted"), { id: NODE_ACTION_TOAST_ID });
 +    },
-+    onError: (error) => toast.error(error instanceof Error ? error.message : t("settings.egress.operationFailed")),
++    onError: (error) => toast.error(error instanceof Error ? error.message : t("settings.egress.operationFailed"), { id: NODE_ACTION_TOAST_ID }),
 +  });
 +
 +  const openCreateNode = () => {
@@ -2523,7 +2589,7 @@ index 0000000..1d1e6d4
 +    <TableCell className="text-xs text-muted-foreground">{formatTime(state?.last_observed_at, locale)}</TableCell>
 +    <TableCell className="text-right"><div className="flex items-center justify-end gap-1">
 +      <Switch checked={node.enabled} disabled={toggling} onCheckedChange={(enabled) => toggleMutation.mutate({ node, enabled })} aria-label={t(node.enabled ? "qualityGuard.disableNode" : "qualityGuard.enableNode", { name: node.name })} />
-+      <Button variant="ghost" size="sm" disabled={testing || !status.config || !node.enabled} onClick={() => testMutation.mutate({ nodeId: node.id, status })}><RotateCw className={cn(testing && "animate-spin")} />{t("qualityGuard.test")}</Button>
++      <Button variant="ghost" size="sm" disabled={testing || !status.config || !node.enabled || state?.disabled_by_guard} onClick={() => testMutation.mutate({ nodeId: node.id, status })}><RotateCw className={cn(testing && "animate-spin")} />{t("qualityGuard.test")}</Button>
 +      <DropdownMenu>
 +        <DropdownMenuTrigger asChild><Button type="button" variant="ghost" size="icon" className="size-8" aria-label={t("common.actions")}><MoreHorizontal /></Button></DropdownMenuTrigger>
 +        <DropdownMenuContent align="end">
@@ -2770,7 +2836,7 @@ index b11a54f..447a5f6 100644
    const save = useMutation({
      mutationFn: () => {
 diff --git a/frontend/src/shared/i18n/index.ts b/frontend/src/shared/i18n/index.ts
-index 7caddbb..1d0dd50 100644
+index 7caddbb..ef3e657 100644
 --- a/frontend/src/shared/i18n/index.ts
 +++ b/frontend/src/shared/i18n/index.ts
 @@ -175,6 +175,7 @@ const resources = {
@@ -2792,11 +2858,11 @@ index 7caddbb..1d0dd50 100644
 +        nodes: "节点质量", nodesHelp: "速度与 grok2api 面板同口径：输出 Token 包含推理 Token。被动异常只触发主动复测。打击计数依次为被动 / 主动 / 错误。", updatedAt: "状态更新于 {{time}}",
 +        node: "节点", state: "状态", outputTPS: "面板输出速度", firstToken: "首字延迟", source: "数据来源", strikes: "打击计数", lastObserved: "最近观测", test: "检测",
 +        sources: { active: "主动探针", passive: "请求审计" }, quarantined: "已隔离", suspect: "可疑", healthy: "正常", pending: "待观测", probeFailed: "检测失败",
-+        events: "最近事件", noEvents: "暂无异常或恢复事件", eventTypes: { node_quarantined: "节点已隔离", node_restored: "节点已恢复", passive_audit_anomaly: "检测到异常请求" },
++        events: "最近事件", noEvents: "暂无异常或恢复事件", eventTypes: { node_quarantined: "节点已隔离", node_restored: "节点已恢复", node_rotated: "节点已更换 IP", passive_audit_anomaly: "检测到异常请求" },
 +        statistics: "自动检测统计", statisticsSince: "自 {{time}} 开始累计，不含手动检测。", statisticsChecks: "有效检测总数", statisticsChecksHelp: "主动探测与有效被动审计", statisticsActive: "主动探测", statisticsActiveDetail: "正常 {{healthy}}，错误 {{errors}}", statisticsPassive: "被动审计", statisticsPassiveDetail: "正常 {{healthy}}，来自真实请求", statisticsTokens: "主动探测输出 Token", statisticsTokensHelp: "包含推理 Token，不代表代理流量", statisticsAnomalies: "异常命中", statisticsAnomalyDetail: "软异常 {{soft}}，硬异常 {{hard}}", statisticsQuarantines: "执行隔离", statisticsActionDetail: "已恢复 {{restored}}，受保护未隔离 {{suppressed}}",
-+        reasons: { unknown: "未记录原因", hard_tps: "超过硬阈值", soft_tps: "超过软阈值", passive_hard_tps: "请求速度超过硬阈值", passive_soft_tps: "请求速度连续超过软阈值", quality_probe_healthy: "模型质量检测恢复正常", expected_marker_missing: "响应标记缺失", insufficient_output_tokens: "输出 Token 不足", insufficient_visible_tokens: "可见 Token 不足", probe_errors: "主动检测连续失败" },
++        reasons: { unknown: "未记录原因", hard_tps: "超过硬阈值", soft_tps: "超过软阈值", buffered_burst: "短窗口输出突增，等待原 IP 复测", passive_hard_tps: "请求速度超过硬阈值", passive_soft_tps: "请求速度连续超过软阈值", quality_probe_healthy: "模型质量检测恢复正常", expected_marker_missing: "响应标记缺失", insufficient_output_tokens: "输出 Token 不足", insufficient_visible_tokens: "可见 Token 不足", insufficient_generation_window: "有效生成窗口不足", probe_errors: "主动检测连续失败", probe_no_account: "暂无可调度账号，已延后复测", recovery_probe_error: "恢复检测失败", rotation_error: "更换 IP 失败" },
 +        policy: "当前策略", editPolicy: "编辑策略", editPolicyTitle: "编辑质量守护策略", editPolicyDescription: "保存后由守护进程热加载，无需重启服务。", restoreDefaults: "恢复默认值", policySaved: "策略已保存，正在热加载", invalidPolicyValue: "数值超出允许范围", softThresholdMustBeLower: "软阈值必须低于硬阈值", activeIntervalSeconds: "主动检测间隔（秒）", passiveIntervalSeconds: "被动审计间隔（秒）", consecutiveSoft: "软阈值连续次数", consecutiveErrors: "检测错误连续次数", quarantineSeconds: "隔离时长（秒）", softThreshold: "软阈值", hardThreshold: "硬阈值", activeInterval: "主动间隔", passiveInterval: "审计间隔", quarantineDuration: "隔离时长", minimumNodes: "最少保留节点",
-+        unavailable: "质量守护尚未连接", unavailableHelp: "为主服务挂载 guard 状态卷，并设置 QUALITY_GUARD_STATE_FILE 后，这里会显示实时状态。", testComplete: "检测完成：{{speed}}",
++        unavailable: "质量守护尚未连接", unavailableHelp: "为主服务挂载 guard 状态卷，并设置 QUALITY_GUARD_STATE_FILE 后，这里会显示实时状态。", testing: "正在检测节点质量", testComplete: "检测完成：{{speed}}", testFailed: "质量检测暂不可用，请稍后重试",
 +        refreshNodes: "刷新节点", nodeEnabled: "节点已启用", nodeDisabled: "节点已停用", nodesEnabled: "所选节点已启用", nodesDisabled: "所选节点已停用", enableNode: "启用节点 {{name}}", disableNode: "停用节点 {{name}}",
 +        nodeEditorDescription: "管理质量守护使用的 Grok Build 出口。代理地址仅写入；编辑时留空会保留现有配置。", nodeCapacityHelp: "最多可绑定的账号数，0 表示不限制。", deleteNodeTitle: "删除代理节点？", deleteNodeDescription: "将永久删除节点“{{name}}”。此操作无法撤销。", deleteNodesTitle: "删除所选 {{count}} 个节点？", deleteNodesDescription: "所选代理节点将被永久删除，此操作无法撤销。",
 +      },
@@ -2816,7 +2882,7 @@ index 7caddbb..1d0dd50 100644
        media: { images: { title: "Gallery", description: "Browse generated image assets", search: "Search ID, type, or hash", empty: "No images", noMatches: "No matching images", totalImages: "Total images", totalBytes: "Storage", pageSummary: "Showing {{count}} / {{total}}", openImage: "Open image {{id}}", deleteTitle: "Delete {{count}} selected images?", deleteDescription: "The image files and gallery records will be permanently removed, and existing image links will stop working. This cannot be undone.", deleted: "Deleted {{count}} images" }, videos: { title: "Video Gallery", description: "View video generation job records", search: "Search prompt or ID", empty: "No video jobs", statusFilter: "Status filter", totalJobs: "Total jobs", queued: "Queued", inProgress: "In progress", completed: "Completed", failed: "Failed", prompt: "Prompt", model: "Model", status: "Status", progress: "Progress", statusProgress: "Status / progress", spec: "Spec", owner: "Owner", createdAt: "Created", completedAt: "Completed", time: "Time", createdShort: "Created", completedShort: "Done", preview: "Preview video", previewTitle: "Video preview", previewUnavailable: "Local video unavailable", deleteTitle: "Delete {{count}} video records?", deleteDescription: "The task records and their local videos will be permanently removed, and existing video links will stop working. This cannot be undone.", deleted: "Deleted {{count}} video records", seconds: "{{count}} sec", pageSummary: "Showing {{count}} / {{total}}" }, videoStatus: { queued: "Queued", in_progress: "In progress", completed: "Completed", failed: "Failed" } },
        auth: { title: "Admin sign in", productTitle: "Lightweight API gateway", subtitle: "Manage upstream accounts, model routes, and client access.", username: "Username", password: "Password", usernameRequired: "Enter your username", passwordRequired: "Enter your password", signIn: "Sign in", signingIn: "Signing in", signOut: "Sign out", changePassword: "Change password", currentPassword: "Current password", newPassword: "New password", passwordUpdated: "Password updated. Sign in again.", sessionUnavailable: "Unable to restore the session", sessionUnavailableDescription: "The service may be temporarily unavailable. Your session was not cleared; please retry shortly.", retrySession: "Retry" },
        shell: { appearance: "Appearance", dark: "Dark", light: "Light", system: "System", language: "Language", navigation: "Navigation", openNavigation: "Open navigation" },
-+      qualityGuard: { title: "Quality guard", description: "Monitor Grok egress quality and quarantine anomalous nodes automatically.", overview: "Quality guard overview", serviceStatus: "Guard service", running: "Running", stale: "Status stale", mode: "Detection mode", availableNodes: "Enabled nodes", quarantinedNodes: "Quarantined", modes: { active: "Active probes", passive: "Passive audits", hybrid: "Hybrid" }, nodes: "Node quality", nodesHelp: "Speed matches the grok2api panel: output tokens include reasoning tokens. Passive anomalies only trigger an active confirmation. Strike counts are passive / active / errors.", updatedAt: "Updated {{time}}", node: "Node", state: "State", outputTPS: "Panel output speed", firstToken: "First token", source: "Source", strikes: "Strikes", lastObserved: "Last observed", test: "Test", sources: { active: "Active probe", passive: "Request audit" }, quarantined: "Quarantined", suspect: "Suspect", healthy: "Healthy", pending: "Pending", probeFailed: "Probe failed", events: "Recent events", noEvents: "No anomaly or recovery events", eventTypes: { node_quarantined: "Node quarantined", node_restored: "Node restored", passive_audit_anomaly: "Anomalous request detected" }, statistics: "Automatic detection statistics", statisticsSince: "Accumulated since {{time}}. Manual tests are excluded.", statisticsChecks: "Valid checks", statisticsChecksHelp: "Active probes and valid passive audits", statisticsActive: "Active probes", statisticsActiveDetail: "Healthy {{healthy}}, errors {{errors}}", statisticsPassive: "Passive audits", statisticsPassiveDetail: "Healthy {{healthy}}, from real requests", statisticsTokens: "Active output tokens", statisticsTokensHelp: "Includes reasoning tokens; not proxy traffic", statisticsAnomalies: "Anomaly hits", statisticsAnomalyDetail: "Soft {{soft}}, hard {{hard}}", statisticsQuarantines: "Quarantines applied", statisticsActionDetail: "Restored {{restored}}, protected {{suppressed}}", reasons: { unknown: "No reason recorded", hard_tps: "Hard threshold exceeded", soft_tps: "Soft threshold exceeded", passive_hard_tps: "Request exceeded hard threshold", passive_soft_tps: "Requests repeatedly exceeded soft threshold", quality_probe_healthy: "Model quality probe recovered", expected_marker_missing: "Expected marker missing", insufficient_output_tokens: "Too few output tokens", insufficient_visible_tokens: "Too few visible tokens", probe_errors: "Repeated probe errors" }, policy: "Current policy", editPolicy: "Edit policy", editPolicyTitle: "Edit quality guard policy", editPolicyDescription: "The guard hot-reloads saved changes without a service restart.", restoreDefaults: "Restore defaults", policySaved: "Policy saved and queued for hot reload", invalidPolicyValue: "Value is outside the allowed range", softThresholdMustBeLower: "The soft threshold must be lower than the hard threshold", activeIntervalSeconds: "Active interval (seconds)", passiveIntervalSeconds: "Passive interval (seconds)", consecutiveSoft: "Consecutive soft strikes", consecutiveErrors: "Consecutive probe errors", quarantineSeconds: "Quarantine (seconds)", softThreshold: "Soft threshold", hardThreshold: "Hard threshold", activeInterval: "Active interval", passiveInterval: "Audit interval", quarantineDuration: "Quarantine", minimumNodes: "Minimum nodes", unavailable: "Quality guard is not connected", unavailableHelp: "Mount the guard state volume into the main service and set QUALITY_GUARD_STATE_FILE to display live status here.", testComplete: "Test complete: {{speed}}", refreshNodes: "Refresh nodes", nodeEnabled: "Node enabled", nodeDisabled: "Node disabled", nodesEnabled: "Selected nodes enabled", nodesDisabled: "Selected nodes disabled", enableNode: "Enable node {{name}}", disableNode: "Disable node {{name}}", nodeEditorDescription: "Manage Grok Build egress used by the quality guard. Proxy URLs are write-only; leave the field blank while editing to keep the current value.", nodeCapacityHelp: "Maximum number of bound accounts; 0 means unlimited.", deleteNodeTitle: "Delete proxy node?", deleteNodeDescription: "Node “{{name}}” will be permanently deleted. This action cannot be undone.", deleteNodesTitle: "Delete {{count}} selected nodes?", deleteNodesDescription: "The selected proxy nodes will be permanently deleted. This action cannot be undone." },
++      qualityGuard: { title: "Quality guard", description: "Monitor Grok egress quality and quarantine anomalous nodes automatically.", overview: "Quality guard overview", serviceStatus: "Guard service", running: "Running", stale: "Status stale", mode: "Detection mode", availableNodes: "Enabled nodes", quarantinedNodes: "Quarantined", modes: { active: "Active probes", passive: "Passive audits", hybrid: "Hybrid" }, nodes: "Node quality", nodesHelp: "Speed matches the grok2api panel: output tokens include reasoning tokens. Passive anomalies only trigger an active confirmation. Strike counts are passive / active / errors.", updatedAt: "Updated {{time}}", node: "Node", state: "State", outputTPS: "Panel output speed", firstToken: "First token", source: "Source", strikes: "Strikes", lastObserved: "Last observed", test: "Test", sources: { active: "Active probe", passive: "Request audit" }, quarantined: "Quarantined", suspect: "Suspect", healthy: "Healthy", pending: "Pending", probeFailed: "Probe failed", events: "Recent events", noEvents: "No anomaly or recovery events", eventTypes: { node_quarantined: "Node quarantined", node_restored: "Node restored", node_rotated: "Node IP rotated", passive_audit_anomaly: "Anomalous request detected" }, statistics: "Automatic detection statistics", statisticsSince: "Accumulated since {{time}}. Manual tests are excluded.", statisticsChecks: "Valid checks", statisticsChecksHelp: "Active probes and valid passive audits", statisticsActive: "Active probes", statisticsActiveDetail: "Healthy {{healthy}}, errors {{errors}}", statisticsPassive: "Passive audits", statisticsPassiveDetail: "Healthy {{healthy}}, from real requests", statisticsTokens: "Active output tokens", statisticsTokensHelp: "Includes reasoning tokens; not proxy traffic", statisticsAnomalies: "Anomaly hits", statisticsAnomalyDetail: "Soft {{soft}}, hard {{hard}}", statisticsQuarantines: "Quarantines applied", statisticsActionDetail: "Restored {{restored}}, protected {{suppressed}}", reasons: { unknown: "No reason recorded", hard_tps: "Hard threshold exceeded", soft_tps: "Soft threshold exceeded", buffered_burst: "Short-window output burst; retesting the same IP", passive_hard_tps: "Request exceeded hard threshold", passive_soft_tps: "Requests repeatedly exceeded soft threshold", quality_probe_healthy: "Model quality probe recovered", expected_marker_missing: "Expected marker missing", insufficient_output_tokens: "Too few output tokens", insufficient_visible_tokens: "Too few visible tokens", insufficient_generation_window: "Generation window too short", probe_errors: "Repeated probe errors", probe_no_account: "No schedulable probe account; retry deferred", recovery_probe_error: "Recovery probe failed", rotation_error: "IP rotation failed" }, policy: "Current policy", editPolicy: "Edit policy", editPolicyTitle: "Edit quality guard policy", editPolicyDescription: "The guard hot-reloads saved changes without a service restart.", restoreDefaults: "Restore defaults", policySaved: "Policy saved and queued for hot reload", invalidPolicyValue: "Value is outside the allowed range", softThresholdMustBeLower: "The soft threshold must be lower than the hard threshold", activeIntervalSeconds: "Active interval (seconds)", passiveIntervalSeconds: "Passive interval (seconds)", consecutiveSoft: "Consecutive soft strikes", consecutiveErrors: "Consecutive probe errors", quarantineSeconds: "Quarantine (seconds)", softThreshold: "Soft threshold", hardThreshold: "Hard threshold", activeInterval: "Active interval", passiveInterval: "Audit interval", quarantineDuration: "Quarantine", minimumNodes: "Minimum nodes", unavailable: "Quality guard is not connected", unavailableHelp: "Mount the guard state volume into the main service and set QUALITY_GUARD_STATE_FILE to display live status here.", testing: "Testing node quality", testComplete: "Test complete: {{speed}}", testFailed: "Quality test is temporarily unavailable. Try again shortly.", refreshNodes: "Refresh nodes", nodeEnabled: "Node enabled", nodeDisabled: "Node disabled", nodesEnabled: "Selected nodes enabled", nodesDisabled: "Selected nodes disabled", enableNode: "Enable node {{name}}", disableNode: "Disable node {{name}}", nodeEditorDescription: "Manage Grok Build egress used by the quality guard. Proxy URLs are write-only; leave the field blank while editing to keep the current value.", nodeCapacityHelp: "Maximum number of bound accounts; 0 means unlimited.", deleteNodeTitle: "Delete proxy node?", deleteNodeDescription: "Node “{{name}}” will be permanently deleted. This action cannot be undone.", deleteNodesTitle: "Delete {{count}} selected nodes?", deleteNodesDescription: "The selected proxy nodes will be permanently deleted. This action cannot be undone." },
        accountQuotaReset: { action: "Reset quota", description: "This clears only local waiting-reset and model quota blocks. It does not change upstream Billing or audit history. Accounts that remain exhausted will be marked again by real traffic.", completed: "Reset local quota state for {{reset}} accounts" },
        accountQuotaTask: { title: "Process quota for {{count}} selected accounts", description: "Choose the quota task to run for the selected Grok Build accounts.", allTitle: "Process quota for all accounts", allDescription: "Choose the quota task to run for all enabled Grok Build accounts.", syncDescription: "Request upstream Billing and update local quota snapshots, account tiers, and recovery state.", resetAllDescription: "Clear local waiting-reset and exhausted-quota blocks for all enabled Grok Build accounts without changing upstream Billing or audit history.", execute: "Run task" },
        accountExport: { countDescription: "Exports accounts in stable order, up to 10,000 per batch.", batchProgress: "Exported {{count}} accounts; the next download is batch {{batch}}.", nextBatch: "Export next batch", batchCompleted: "Exported {{count}} accounts in this batch", completed: "Export complete: {{count}} accounts" },
@@ -2839,12 +2905,25 @@ index 0000000..53b30ec
 +USER quality-guard
 +VOLUME ["/var/lib/grok2api-quality-guard"]
 +ENTRYPOINT ["/usr/local/bin/grok2api-egress-quality-guard"]
+diff --git a/tools/egress-quality-guard/Dockerfile.session-rotator b/tools/egress-quality-guard/Dockerfile.session-rotator
+new file mode 100644
+index 0000000..8cae840
+--- /dev/null
++++ b/tools/egress-quality-guard/Dockerfile.session-rotator
+@@ -0,0 +1,7 @@
++FROM python:3.12-alpine
++
++COPY tools/egress-quality-guard/session_rotator.py /usr/local/bin/grok2api-session-rotator
++RUN chmod 0755 /usr/local/bin/grok2api-session-rotator
++
++USER 1000:1000
++ENTRYPOINT ["/usr/local/bin/grok2api-session-rotator"]
 diff --git a/tools/egress-quality-guard/README.md b/tools/egress-quality-guard/README.md
 new file mode 100644
-index 0000000..b36bac6
+index 0000000..9f3e8b5
 --- /dev/null
 +++ b/tools/egress-quality-guard/README.md
-@@ -0,0 +1,209 @@
+@@ -0,0 +1,230 @@
 +# Egress Quality Guard
 +
 +Egress Quality Guard combines passive production-audit monitoring with active
@@ -2907,6 +2986,26 @@ index 0000000..b36bac6
 +residential exits can reach Grok normally while a probe endpoint is blocked.
 +The model-quality request is the authoritative recovery signal.
 +
++## Strict quarantine and IP rotation
++
++With `QUALITY_GUARD_FAIL_CLOSED=true`, soft, hard, and indeterminate samples
++leave scheduling before confirmation. The minimum healthy-node floor no longer
++suppresses quarantine. A short buffered burst is first retested on the same IP
++and is restored immediately when that one real-model probe is healthy, avoiding
++an unnecessary rotation for a measurement artifact.
++
++`QUALITY_GUARD_ROTATION_URL` enables a trusted internal rotation webhook scoped
++by `QUALITY_GUARD_ROTATABLE_NODE_IDS`. Confirmed suspect nodes are rotated, the
++exit-IP change is verified by the webhook, and one real-model quality probe must
++pass before restoration. The optional `session_rotator.py` implements this
++contract for 1024Proxy-style usernames containing `sid-...-t-...`.
++
++Probe failures require `QUALITY_GUARD_CONSECUTIVE_ERRORS` consecutive attempts
++before quarantine. Account-selection failures are reported separately: if no
++account assigned to a node is currently schedulable, the guard defers recovery
++without counting a proxy failure or rotating the IP. The node remains isolated
++until a real model-quality probe can pass.
++
 +## Admin UI
 +
 +The admin sidebar includes a Quality guard page showing service freshness, mode, per-node panel-equivalent output Token/s, time to first token, strike counts, quarantine state, and recent events. Operators can also run one real model quality test against a selected node.
@@ -2936,6 +3035,7 @@ index 0000000..b36bac6
 +- Never deletes a node or changes account bindings.
 +- Never restores a node disabled by an operator.
 +- Refuses to quarantine below `QUALITY_GUARD_MIN_HEALTHY_NODES`.
++- Strict mode overrides that floor rather than scheduling an unverified exit.
 +- Uses an exclusive process lock to prevent duplicate guards.
 +- Writes state atomically with mode `0600`.
 +- Logs metrics and node metadata, never credentials, proxy URLs, or response text.
@@ -3056,10 +3156,10 @@ index 0000000..b36bac6
 +configuration validation, and private atomic state.
 diff --git a/tools/egress-quality-guard/README.zh-CN.md b/tools/egress-quality-guard/README.zh-CN.md
 new file mode 100644
-index 0000000..424d720
+index 0000000..b1e4016
 --- /dev/null
 +++ b/tools/egress-quality-guard/README.zh-CN.md
-@@ -0,0 +1,138 @@
+@@ -0,0 +1,158 @@
 +# 出口质量守护程序
 +
 +出口质量守护程序同时支持“真实请求审计被动检测”和“固定 Prompt 主动探测”。被动检测命中
@@ -3097,6 +3197,25 @@ index 0000000..424d720
 +
 +通用 IP/Cloudflare 探针不作为恢复硬门槛：部分住宅出口可能无法访问探针站点，但访问 Grok 完全正常。真实模型质量请求才是最终判据。
 +
++## 严格隔离与换 IP
++
++设置 `QUALITY_GUARD_FAIL_CLOSED=true` 后，软阈值、硬阈值和无法形成有效生成窗口的
++可疑样本都会先摘除节点，再进行确认；最低健康节点数不再阻止隔离。短生成窗口产生的
++瞬时高 TPS 会先在原 IP 上主动复测，复测正常即立即恢复，避免因为流式缓冲误换 IP。
++
++可通过 `QUALITY_GUARD_ROTATION_URL` 接入受信任的内部换 IP Webhook，并用
++`QUALITY_GUARD_ROTATABLE_NODE_IDS` 限制允许轮换的节点。确认异常后，守护程序会先调用
++Webhook，确认出口发生变化，再执行一次真实模型质量检测；检测正常立即恢复，否则保持
++隔离。Webhook 请求不包含代理凭据。
++
++仓库提供了可选的 `session_rotator.py`，用于用户名带 `sid-...-t-...` 的 1024Proxy
++粘性会话。它应与 Mihomo 控制器运行在同一受信任主机，仅监听回环地址，并只挂载需要
++更新的凭据列表和 Mihomo 配置文件。
++
++主动探测连续失败达到 `QUALITY_GUARD_CONSECUTIVE_ERRORS` 后才会隔离并换 IP。如果失败发生在
++账号调度阶段，例如该节点绑定的账号当前都不可调度，后端会返回独立错误码；守护程序只延后
++复测，不累计代理故障，也不执行无意义的换 IP。节点仍保持隔离，直到真实模型质量检测通过。
++
 +## 管理界面
 +
 +新版管理端左侧提供“质量守护”页面，显示守护进程新鲜度、当前模式、各节点与 grok2api 面板同口径的输出 Token/s、首字延迟、打击计数、隔离状态和最近事件，也可以对单个节点立即执行一次真实模型质量检测。
@@ -3126,6 +3245,7 @@ index 0000000..424d720
 +- 不删除节点，不修改账号绑定。
 +- 不会恢复管理员手动禁用的节点。
 +- 启用节点数低于 `QUALITY_GUARD_MIN_HEALTHY_NODES` 时拒绝继续隔离。
++- 严格模式会覆盖最低健康节点保护：无法确认质量时宁可无可用节点，也不调度可疑出口。
 +- 使用进程锁防止重复运行。
 +- 状态文件原子写入且权限为 `0600`。
 +- 日志不记录管理员令牌、代理地址或模型回答正文。
@@ -3259,10 +3379,10 @@ index 0000000..2b60561
 +  quality_guard_state:
 diff --git a/tools/egress-quality-guard/egress-quality-guard.env.example b/tools/egress-quality-guard/egress-quality-guard.env.example
 new file mode 100644
-index 0000000..ec586c0
+index 0000000..6132c5c
 --- /dev/null
 +++ b/tools/egress-quality-guard/egress-quality-guard.env.example
-@@ -0,0 +1,33 @@
+@@ -0,0 +1,43 @@
 +# grok2api administrator API. Keep the deployed file mode at 0600.
 +GROK2API_BASE_URL=http://127.0.0.1:8000
 +GROK2API_ADMIN_USERNAME=admin
@@ -3291,6 +3411,16 @@ index 0000000..ec586c0
 +QUALITY_GUARD_QUARANTINE_SECONDS=300
 +QUALITY_GUARD_MIN_HEALTHY_NODES=3
 +QUALITY_GUARD_MAX_OUTPUT_TOKENS=384
++
++# Optional strict mode. Suspect nodes leave scheduling before confirmation.
++QUALITY_GUARD_FAIL_CLOSED=false
++QUALITY_GUARD_MIN_GENERATION_MS=1000
++
++# Optional internal IP-rotation webhook.
++QUALITY_GUARD_ROTATION_URL=
++QUALITY_GUARD_ROTATION_TOKEN=
++QUALITY_GUARD_ROTATION_TIMEOUT_SECONDS=45
++QUALITY_GUARD_ROTATABLE_NODE_IDS=
 +
 +QUALITY_GUARD_STATE_FILE=/var/lib/grok2api-quality-guard/state.json
 +QUALITY_GUARD_LOCK_FILE=/var/lib/grok2api-quality-guard/guard.lock
@@ -3331,10 +3461,10 @@ index 0000000..d200d35
 +WantedBy=multi-user.target
 diff --git a/tools/egress-quality-guard/quality_guard.py b/tools/egress-quality-guard/quality_guard.py
 new file mode 100755
-index 0000000..a370c49
+index 0000000..fa6213e
 --- /dev/null
 +++ b/tools/egress-quality-guard/quality_guard.py
-@@ -0,0 +1,924 @@
+@@ -0,0 +1,1080 @@
 +#!/usr/bin/env python3
 +"""Active and passive quality guard for grok2api egress nodes.
 +
@@ -3438,6 +3568,12 @@ index 0000000..a370c49
 +    quarantine_seconds: int
 +    min_healthy_nodes: int
 +    max_output_tokens: int
++    fail_closed: bool
++    min_generation_ms: int
++    rotation_url: str
++    rotation_token: str
++    rotation_timeout_seconds: int
++    rotatable_node_ids: tuple[str, ...]
 +    prompt: str
 +    expected: str
 +    state_file: Path
@@ -3449,6 +3585,8 @@ index 0000000..a370c49
 +    def from_env(cls) -> "Config":
 +        raw_nodes = os.getenv("QUALITY_GUARD_NODE_IDS", "")
 +        node_ids = tuple(dict.fromkeys(value.strip() for value in raw_nodes.split(",") if value.strip()))
++        raw_rotatable_nodes = os.getenv("QUALITY_GUARD_ROTATABLE_NODE_IDS", "")
++        rotatable_node_ids = tuple(dict.fromkeys(value.strip() for value in raw_rotatable_nodes.split(",") if value.strip()))
 +        password = os.getenv("GROK2API_ADMIN_PASSWORD", "")
 +        password_file = os.getenv("GROK2API_ADMIN_PASSWORD_FILE", "").strip()
 +        if password_file:
@@ -3479,6 +3617,12 @@ index 0000000..a370c49
 +            quarantine_seconds=_env_int("QUALITY_GUARD_QUARANTINE_SECONDS", 300, 30),
 +            min_healthy_nodes=_env_int("QUALITY_GUARD_MIN_HEALTHY_NODES", 3, 1),
 +            max_output_tokens=_env_int("QUALITY_GUARD_MAX_OUTPUT_TOKENS", 384, 32),
++            fail_closed=_env_bool("QUALITY_GUARD_FAIL_CLOSED", False),
++            min_generation_ms=_env_int("QUALITY_GUARD_MIN_GENERATION_MS", 1000, 1),
++            rotation_url=os.getenv("QUALITY_GUARD_ROTATION_URL", "").strip(),
++            rotation_token=os.getenv("QUALITY_GUARD_ROTATION_TOKEN", "").strip(),
++            rotation_timeout_seconds=_env_int("QUALITY_GUARD_ROTATION_TIMEOUT_SECONDS", 45, 5),
++            rotatable_node_ids=rotatable_node_ids,
 +            prompt=os.getenv("QUALITY_GUARD_PROMPT", DEFAULT_PROMPT).strip(),
 +            expected=os.getenv("QUALITY_GUARD_EXPECTED", "QUALITY_OK").strip(),
 +            state_file=Path(os.getenv("QUALITY_GUARD_STATE_FILE", "/var/lib/grok2api-quality-guard/state.json")),
@@ -3515,6 +3659,16 @@ index 0000000..a370c49
 +            raise ValueError("QUALITY_GUARD_QUARANTINE_SECONDS must not exceed 86400")
 +        if self.min_healthy_nodes < 1 or (self.node_ids and self.min_healthy_nodes > len(self.node_ids)):
 +            raise ValueError("QUALITY_GUARD_MIN_HEALTHY_NODES must fit the configured node count")
++        if self.min_generation_ms > self.request_timeout_seconds * 1000:
++            raise ValueError("QUALITY_GUARD_MIN_GENERATION_MS must fit the request timeout")
++        if self.rotation_url:
++            rotation_url = urllib.parse.urlparse(self.rotation_url)
++            if rotation_url.scheme not in {"http", "https"} or not rotation_url.netloc:
++                raise ValueError("QUALITY_GUARD_ROTATION_URL must be an absolute HTTP(S) URL")
++        elif self.rotatable_node_ids:
++            raise ValueError("QUALITY_GUARD_ROTATION_URL is required when rotatable nodes are configured")
++        if any(not value.isdigit() or int(value) < 1 for value in self.rotatable_node_ids):
++            raise ValueError("QUALITY_GUARD_ROTATABLE_NODE_IDS must contain positive integers")
 +        if self.passive_page_size > 2000:
 +            raise ValueError("QUALITY_GUARD_PASSIVE_PAGE_SIZE must not exceed 2000")
 +
@@ -3658,6 +3812,33 @@ index 0000000..a370c49
 +        result = self._request("PATCH", "/api/admin/v1/egress-nodes/batch", {"ids": [node_id], "enabled": enabled})
 +        return int(result.get("updated") or 0)
 +
++    def rotate_node(self, node_id: str, old_exit_ip: str = "") -> dict[str, Any]:
++        if not self.config.rotation_url:
++            raise RuntimeError("rotation endpoint is not configured")
++        data = json.dumps({"nodeId": node_id, "oldExitIp": old_exit_ip}, separators=(",", ":")).encode()
++        headers = {"Accept": "application/json", "Content-Type": "application/json"}
++        if self.config.rotation_token:
++            headers["Authorization"] = f"Bearer {self.config.rotation_token}"
++        request = urllib.request.Request(self.config.rotation_url, data=data, headers=headers, method="POST")
++        try:
++            with urllib.request.urlopen(
++                request,
++                timeout=self.config.rotation_timeout_seconds,
++                context=self.ssl_context,
++            ) as response:
++                payload = json.load(response)
++        except urllib.error.HTTPError as exc:
++            try:
++                payload = json.loads(exc.read().decode("utf-8", "replace"))
++            except (ValueError, OSError):
++                payload = {}
++            raise RuntimeError(f"rotation failed: HTTP {exc.code} {payload.get('error', 'request failed')}") from exc
++        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
++            raise RuntimeError(f"rotation failed: {type(exc).__name__}") from exc
++        if not isinstance(payload, dict) or not bool(payload.get("changed")):
++            raise RuntimeError("rotation did not confirm an exit IP change")
++        return payload
++
 +
 +def classify_result(result: dict[str, Any], config: Config) -> tuple[str, str]:
 +    if not bool(result.get("expectedMatched")):
@@ -3668,8 +3849,13 @@ index 0000000..a370c49
 +        # Rolling upgrades may still expose panel-equivalent TPS under the legacy name.
 +        speed_value = result.get("visibleTokensPerSecond")
 +    speed = float(speed_value or 0.0)
++    generation_ms = int(result.get("generationMs") or 0)
++    if generation_ms <= 0:
++        generation_ms = max(0, int(result.get("durationMs") or 0) - int(result.get("firstTokenMs") or 0))
 +    if output_tokens < 32:
 +        return "soft", "insufficient_output_tokens"
++    if config.fail_closed and generation_ms < config.min_generation_ms:
++        return "soft", "insufficient_generation_window"
 +    if speed >= config.hard_tps:
 +        return "hard", "hard_tps"
 +    if speed >= config.soft_tps:
@@ -3691,6 +3877,8 @@ index 0000000..a370c49
 +    if generation_ms <= 0 or output_tokens < 32:
 +        return "ignored", "insufficient_output_tokens", 0.0, output_tokens
 +    speed = float(output_tokens) * 1000 / float(generation_ms)
++    if config.fail_closed and generation_ms < config.min_generation_ms and speed >= config.soft_tps:
++        return "hard", "buffered_burst", speed, output_tokens
 +    if speed >= config.hard_tps:
 +        return "hard", "hard_tps", speed, output_tokens
 +    if speed >= config.soft_tps:
@@ -3714,6 +3902,9 @@ index 0000000..a370c49
 +        "last_output_tokens": 0,
 +        "last_first_token_ms": 0,
 +        "last_duration_ms": 0,
++        "last_rotation_at": 0.0,
++        "last_rotation_exit_ip": "",
++        "rotation_failures": 0,
 +    }
 +
 +
@@ -3830,6 +4021,9 @@ index 0000000..a370c49
 +            "quarantine_seconds": self.config.quarantine_seconds,
 +            "min_healthy_nodes": self.config.min_healthy_nodes,
 +            "max_output_tokens": self.config.max_output_tokens,
++            "fail_closed": self.config.fail_closed,
++            "min_generation_ms": self.config.min_generation_ms,
++            "rotatable_node_ids": list(self.config.rotatable_node_ids),
 +            "prompt": self.config.prompt,
 +            "expected": self.config.expected,
 +        }
@@ -3868,7 +4062,24 @@ index 0000000..a370c49
 +    def _can_quarantine(self, nodes: list[dict[str, Any]], node_id: str) -> bool:
 +        enabled = sum(1 for node in nodes if bool(node.get("enabled")))
 +        target_enabled = any(str(node.get("id")) == node_id and bool(node.get("enabled")) for node in nodes)
++        if self.config.fail_closed:
++            return target_enabled
 +        return target_enabled and enabled - 1 >= self.config.min_healthy_nodes
++
++    def _should_rotate(self, node_id: str, reason: str) -> bool:
++        return (
++            bool(self.config.rotation_url)
++            and node_id in set(self.config.rotatable_node_ids)
++            and reason in {
++                "hard_tps", "soft_tps", "buffered_burst", "expected_marker_missing",
++                "insufficient_output_tokens", "insufficient_generation_window", "probe_errors",
++                "recovery_probe_error", "rotation_error",
++            }
++        )
++
++    @staticmethod
++    def _probe_account_unavailable(exc: Exception) -> bool:
++        return isinstance(exc, ApiError) and exc.code == "egressQualityProbeNoAccount"
 +
 +    def _quarantine(self, nodes: list[dict[str, Any]], node: dict[str, Any], reason: str, now: float) -> None:
 +        node_id = str(node["id"])
@@ -3893,6 +4104,10 @@ index 0000000..a370c49
 +        self._bump_statistic("actions", "quarantined")
 +        append_state_event(self.state, "node_quarantined", node_id=node_id, node_name=node.get("name"), reason=reason)
 +        log_event("node_quarantined", node_id=node_id, node_name=node.get("name"), reason=reason, quarantine_seconds=self.config.quarantine_seconds)
++        if reason == "buffered_burst":
++            self._recover_quarantined(node, time.time(), rotate=False, rotate_on_failure=True)
++        elif self._should_rotate(node_id, reason):
++            self._recover_quarantined(node, time.time(), rotate=True)
 +
 +    def _record_probe(self, node: dict[str, Any], result: dict[str, Any], classification: str, reason: str, now: float) -> None:
 +        node_id = str(node["id"])
@@ -3943,6 +4158,11 @@ index 0000000..a370c49
 +        try:
 +            result = self.api.quality_test(node_id)
 +        except Exception as exc:
++            if self._probe_account_unavailable(exc):
++                state["last_probe_at"] = now
++                state["last_reason"] = "probe_no_account"
++                log_event("quality_probe_deferred", node_id=node_id, node_name=node.get("name"), trigger=trigger, reason="probe_no_account")
++                return
 +            self._bump_statistic("active", "errors")
 +            state["error_strikes"] = int(state.get("error_strikes", 0)) + 1
 +            state["last_probe_at"] = now
@@ -3952,14 +4172,42 @@ index 0000000..a370c49
 +            return
 +        classification, reason = classify_result(result, self.config)
 +        self._record_probe(node, result, classification, reason, now)
-+        if classification == "hard" or int(state.get("active_soft_strikes", 0)) >= self.config.consecutive_soft:
++        if classification == "hard" or (
++            classification == "soft" and self.config.fail_closed
++        ) or int(state.get("active_soft_strikes", 0)) >= self.config.consecutive_soft:
 +            self._quarantine(nodes, node, reason, now)
 +
-+    def _probe_quarantined(self, node: dict[str, Any], now: float) -> None:
++    def _recover_quarantined(
++        self,
++        node: dict[str, Any],
++        now: float,
++        rotate: bool,
++        rotate_on_failure: bool = False,
++    ) -> None:
 +        node_id = str(node["id"])
 +        state = self._state_for(node_id)
-+        if now < float(state.get("quarantined_until", 0.0)):
-+            return
++        if rotate:
++            try:
++                rotation = self.api.rotate_node(node_id, str(node.get("exitIp") or ""))
++            except Exception as exc:
++                state["rotation_failures"] = int(state.get("rotation_failures", 0)) + 1
++                state["quarantined_until"] = now + self.config.quarantine_seconds
++                state["last_reason"] = "rotation_error"
++                log_event("node_rotation_failed", node_id=node_id, node_name=node.get("name"), error_type=type(exc).__name__)
++                return
++            state.update({
++                "last_rotation_at": time.time(),
++                "last_rotation_exit_ip": str(rotation.get("newExitIp") or ""),
++                "rotation_failures": 0,
++            })
++            append_state_event(
++                self.state,
++                "node_rotated",
++                node_id=node_id,
++                node_name=node.get("name"),
++                exit_ip=str(rotation.get("newExitIp") or ""),
++            )
++            log_event("node_rotated", node_id=node_id, node_name=node.get("name"), exit_ip=str(rotation.get("newExitIp") or ""))
 +        try:
 +            try:
 +                connectivity = self.api.connectivity_test(node_id)
@@ -3972,6 +4220,11 @@ index 0000000..a370c49
 +            classification, reason = classify_result(result, self.config)
 +            self._record_probe(node, result, classification, reason, now)
 +        except Exception as exc:
++            if self._probe_account_unavailable(exc):
++                state["quarantined_until"] = now + self.config.quarantine_seconds
++                state["last_reason"] = "probe_no_account"
++                log_event("recovery_probe_deferred", node_id=node_id, node_name=node.get("name"), reason="probe_no_account")
++                return
 +            self._bump_statistic("active", "errors")
 +            state["quarantined_until"] = now + self.config.quarantine_seconds
 +            state["last_reason"] = "recovery_probe_error"
@@ -3981,6 +4234,8 @@ index 0000000..a370c49
 +            state["quarantined_until"] = now + self.config.quarantine_seconds
 +            state["last_reason"] = reason
 +            log_event("quarantine_extended", node_id=node_id, node_name=node.get("name"), reason=reason)
++            if rotate_on_failure and self._should_rotate(node_id, reason):
++                self._recover_quarantined(node, time.time(), rotate=True)
 +            return
 +        updated = self.api.set_enabled(node_id, True)
 +        if updated != 1:
@@ -3999,6 +4254,19 @@ index 0000000..a370c49
 +        append_state_event(self.state, "node_restored", node_id=node_id, node_name=node.get("name"), reason="quality_probe_healthy")
 +        log_event("node_restored", node_id=node_id, node_name=node.get("name"), connectivity_status=connectivity_status)
 +
++    def _probe_quarantined(self, node: dict[str, Any], now: float) -> None:
++        node_id = str(node["id"])
++        state = self._state_for(node_id)
++        if now < float(state.get("quarantined_until", 0.0)):
++            return
++        reason = str(state.get("last_reason") or "")
++        self._recover_quarantined(
++            node,
++            now,
++            rotate=self._should_rotate(node_id, reason) and reason != "buffered_burst",
++            rotate_on_failure=reason == "buffered_burst",
++        )
++
 +    def _prepare_nodes(self, now: float) -> tuple[list[dict[str, Any]], list[dict[str, Any]], set[str]]:
 +        all_nodes = self.api.list_nodes()
 +        if not self.config.node_ids:
@@ -4012,6 +4280,21 @@ index 0000000..a370c49
 +            node_id = str(node["id"])
 +            state = self._state_for(node_id)
 +            if state.get("disabled_by_guard") and node.get("enabled"):
++                if self.config.fail_closed:
++                    updated = self.api.set_enabled(node_id, False)
++                    if updated == 1:
++                        node["enabled"] = False
++                        state["quarantined_until"] = now + self.config.quarantine_seconds
++                        log_event("operator_reenable_requires_probe", node_id=node_id, node_name=node.get("name"))
++                        reason = str(state.get("last_reason") or "")
++                        self._recover_quarantined(
++                            node,
++                            now,
++                            rotate=self._should_rotate(node_id, reason) and reason != "buffered_burst",
++                            rotate_on_failure=reason == "buffered_burst",
++                        )
++                    skip_ids.add(node_id)
++                    continue
 +                state.update({
 +                    "active_soft_strikes": 0,
 +                    "passive_soft_strikes": 0,
@@ -4133,6 +4416,9 @@ index 0000000..a370c49
 +            strikes=int(state.get("passive_soft_strikes", 0)),
 +        )
 +        if classification == "hard":
++            self._quarantine(all_nodes, node, reason, now)
++            return
++        if self.config.fail_closed:
 +            self._quarantine(all_nodes, node, reason, now)
 +            return
 +        self._probe_active(all_nodes, node, now, trigger="passive_confirmation")
@@ -4261,10 +4547,10 @@ index 0000000..a370c49
 +    raise SystemExit(main())
 diff --git a/tools/egress-quality-guard/quality_guard_test.py b/tools/egress-quality-guard/quality_guard_test.py
 new file mode 100644
-index 0000000..406763c
+index 0000000..bbac460
 --- /dev/null
 +++ b/tools/egress-quality-guard/quality_guard_test.py
-@@ -0,0 +1,324 @@
+@@ -0,0 +1,506 @@
 +import importlib.util
 +import stat
 +import sys
@@ -4289,6 +4575,8 @@ index 0000000..406763c
 +        request_timeout_seconds=120, soft_tps=500.0, hard_tps=1000.0,
 +        consecutive_soft=2, consecutive_errors=2, quarantine_seconds=300,
 +        min_healthy_nodes=3, max_output_tokens=384, prompt="probe", expected="QUALITY_OK",
++        fail_closed=False, min_generation_ms=1000, rotation_url="", rotation_token="",
++        rotation_timeout_seconds=45, rotatable_node_ids=(),
 +        state_file=Path("/tmp/state.json"), lock_file=Path("/tmp/lock"), insecure_tls=False,
 +        runtime_config_file=Path("/tmp/runtime-config.json"),
 +    )
@@ -4376,6 +4664,7 @@ index 0000000..406763c
 +        self.audit_pages = list(audit_pages or [])
 +        self.enabled_calls = []
 +        self.quality_calls = []
++        self.rotation_calls = []
 +
 +    def list_nodes(self):
 +        return self.nodes
@@ -4397,6 +4686,10 @@ index 0000000..406763c
 +                node["enabled"] = enabled
 +                return 1
 +        return 0
++
++    def rotate_node(self, node_id, old_exit_ip=""):
++        self.rotation_calls.append((node_id, old_exit_ip))
++        return {"changed": True, "oldExitIp": old_exit_ip, "newExitIp": "203.0.113.10"}
 +
 +    def list_audits(self, _cursor=""):
 +        if self.audit_pages:
@@ -4459,6 +4752,181 @@ index 0000000..406763c
 +            guard.run_cycle()
 +            self.assertEqual(api.enabled_calls, [])
 +            self.assertFalse(guard.state["nodes"]["1"]["disabled_by_guard"])
++
++    def test_fail_closed_rotates_soft_signal_and_restores_after_one_good_probe(self):
++        with tempfile.TemporaryDirectory() as directory:
++            cfg = config(
++                state_file=Path(directory) / "state.json",
++                lock_file=Path(directory) / "lock",
++                node_ids=("1",),
++                fail_closed=True,
++                rotation_url="http://127.0.0.1:19099/rotate",
++                rotatable_node_ids=("1",),
++            )
++            good = {
++                "expectedMatched": True,
++                "outputTokens": 128,
++                "outputTokensPerSecond": 100,
++                "generationMs": 1500,
++            }
++            audit = self.audit("user", "1", 600)
++            audit.update({"durationMs": 2500, "outputTokens": 900})
++            api = FakeApi(self.nodes(3), [good], [
++                {"items": [], "hasMore": False, "nextCursor": ""},
++                {"items": [audit], "hasMore": False, "nextCursor": ""},
++            ])
++            guard = quality_guard.Guard(cfg, api)
++            guard.run_passive_cycle()
++            guard.run_passive_cycle()
++            self.assertEqual(api.enabled_calls, [("1", False), ("1", True)])
++            self.assertEqual(api.rotation_calls, [("1", "")])
++            self.assertEqual(api.quality_calls, ["1"])
++            self.assertFalse(guard.state["nodes"]["1"]["disabled_by_guard"])
++
++    def test_fail_closed_requires_consecutive_probe_errors_then_rotates(self):
++        with tempfile.TemporaryDirectory() as directory:
++            cfg = config(
++                state_file=Path(directory) / "state.json",
++                lock_file=Path(directory) / "lock",
++                node_ids=("1",),
++                fail_closed=True,
++                consecutive_errors=2,
++                rotation_url="http://127.0.0.1:19099/rotate",
++                rotatable_node_ids=("1",),
++            )
++            good = {
++                "expectedMatched": True,
++                "outputTokens": 128,
++                "outputTokensPerSecond": 100,
++                "generationMs": 1500,
++            }
++            api = FakeApi(self.nodes(3), [
++                RuntimeError("temporary"), RuntimeError("still failing"),
++                RuntimeError("new IP still failing"), good,
++            ])
++            guard = quality_guard.Guard(cfg, api)
++
++            guard.run_active_cycle()
++            self.assertEqual(api.enabled_calls, [])
++            self.assertEqual(guard.state["nodes"]["1"]["error_strikes"], 1)
++
++            guard.run_active_cycle()
++            self.assertEqual(api.enabled_calls, [("1", False)])
++            self.assertEqual(api.rotation_calls, [("1", "")])
++            self.assertTrue(guard.state["nodes"]["1"]["disabled_by_guard"])
++            self.assertEqual(guard.state["nodes"]["1"]["last_reason"], "recovery_probe_error")
++
++            guard.state["nodes"]["1"]["quarantined_until"] = 0
++            guard.run_active_cycle()
++            self.assertEqual(api.enabled_calls, [("1", False), ("1", True)])
++            self.assertEqual(api.rotation_calls, [("1", ""), ("1", "")])
++            self.assertFalse(guard.state["nodes"]["1"]["disabled_by_guard"])
++
++    def test_probe_without_schedulable_account_is_deferred_without_rotation(self):
++        with tempfile.TemporaryDirectory() as directory:
++            cfg = config(
++                state_file=Path(directory) / "state.json",
++                lock_file=Path(directory) / "lock",
++                node_ids=("1",),
++                fail_closed=True,
++                consecutive_errors=1,
++                rotation_url="http://127.0.0.1:19099/rotate",
++                rotatable_node_ids=("1",),
++            )
++            unavailable = lambda: quality_guard.ApiError(503, "egressQualityProbeNoAccount", "no account")
++            api = FakeApi(self.nodes(3), [unavailable(), unavailable()])
++            guard = quality_guard.Guard(cfg, api)
++
++            guard.run_active_cycle()
++            self.assertEqual(api.enabled_calls, [])
++            self.assertEqual(api.rotation_calls, [])
++            self.assertEqual(guard.state["nodes"]["1"]["error_strikes"], 0)
++            self.assertEqual(guard.state["nodes"]["1"]["last_reason"], "probe_no_account")
++
++            api.nodes[0]["enabled"] = False
++            state = guard.state["nodes"]["1"]
++            state["disabled_by_guard"] = True
++            guard._recover_quarantined(api.nodes[0], 10.0, rotate=False)
++            self.assertEqual(api.enabled_calls, [])
++            self.assertEqual(api.rotation_calls, [])
++            self.assertEqual(state["last_reason"], "probe_no_account")
++            self.assertTrue(state["disabled_by_guard"])
++
++    def test_fail_closed_buffered_burst_restores_same_ip_after_one_good_probe(self):
++        with tempfile.TemporaryDirectory() as directory:
++            cfg = config(
++                state_file=Path(directory) / "state.json",
++                lock_file=Path(directory) / "lock",
++                node_ids=("1",),
++                fail_closed=True,
++                rotation_url="http://127.0.0.1:19099/rotate",
++                rotatable_node_ids=("1",),
++            )
++            good = {
++                "expectedMatched": True,
++                "outputTokens": 128,
++                "outputTokensPerSecond": 100,
++                "generationMs": 1500,
++            }
++            api = FakeApi(self.nodes(3), [good], [
++                {"items": [], "hasMore": False, "nextCursor": ""},
++                {"items": [self.audit("burst", "1", 2500)], "hasMore": False, "nextCursor": ""},
++            ])
++            guard = quality_guard.Guard(cfg, api)
++            guard.run_passive_cycle()
++            guard.run_passive_cycle()
++            self.assertEqual(api.enabled_calls, [("1", False), ("1", True)])
++            self.assertEqual(api.rotation_calls, [])
++            self.assertEqual(api.quality_calls, ["1"])
++
++    def test_fail_closed_keeps_node_isolated_when_rotated_ip_probe_is_ambiguous(self):
++        with tempfile.TemporaryDirectory() as directory:
++            cfg = config(
++                state_file=Path(directory) / "state.json",
++                lock_file=Path(directory) / "lock",
++                node_ids=("1",),
++                fail_closed=True,
++                rotation_url="http://127.0.0.1:19099/rotate",
++                rotatable_node_ids=("1",),
++                min_healthy_nodes=3,
++            )
++            ambiguous = {
++                "expectedMatched": True,
++                "outputTokens": 128,
++                "outputTokensPerSecond": 100,
++                "generationMs": 50,
++            }
++            api = FakeApi(self.nodes(3), [ambiguous, ambiguous.copy()])
++            guard = quality_guard.Guard(cfg, api)
++            guard._probe_active(api.nodes, api.nodes[0], 1.0)
++            self.assertEqual(api.enabled_calls, [("1", False)])
++            self.assertEqual(api.rotation_calls, [("1", "")])
++            self.assertTrue(guard.state["nodes"]["1"]["disabled_by_guard"])
++            self.assertEqual(guard.state["nodes"]["1"]["last_reason"], "insufficient_generation_window")
++
++    def test_fail_closed_manual_reenable_requires_probe(self):
++        with tempfile.TemporaryDirectory() as directory:
++            cfg = config(
++                state_file=Path(directory) / "state.json",
++                lock_file=Path(directory) / "lock",
++                node_ids=("1",),
++                fail_closed=True,
++            )
++            good = {
++                "expectedMatched": True,
++                "outputTokens": 128,
++                "outputTokensPerSecond": 100,
++                "generationMs": 1500,
++            }
++            nodes = self.nodes()
++            api = FakeApi(nodes, [good])
++            guard = quality_guard.Guard(cfg, api)
++            state = guard._state_for("1")
++            state.update({"disabled_by_guard": True, "last_reason": "hard_tps"})
++            guard.run_active_cycle()
++            self.assertEqual(api.enabled_calls, [("1", False), ("1", True)])
++            self.assertEqual(api.quality_calls, ["1"])
++            self.assertFalse(state["disabled_by_guard"])
 +
 +    def test_model_probe_can_restore_when_generic_connectivity_probe_is_unhealthy(self):
 +        with tempfile.TemporaryDirectory() as directory:
@@ -4585,6 +5053,390 @@ index 0000000..406763c
 +            "outputTokens": output_tokens, "reasoningTokens": min(100, max(0, output_tokens - 1)),
 +            "egressNodeId": node_id, "errorCode": None,
 +        }
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tools/egress-quality-guard/session_rotator.py b/tools/egress-quality-guard/session_rotator.py
+new file mode 100644
+index 0000000..c20f188
+--- /dev/null
++++ b/tools/egress-quality-guard/session_rotator.py
+@@ -0,0 +1,301 @@
++#!/usr/bin/env python3
++"""Rotate one 1024Proxy sticky session and hot-reload Mihomo.
++
++The service is intentionally provider-specific. It only exposes a loopback
++HTTP endpoint and never logs proxy credentials or session identifiers.
++"""
++
++from __future__ import annotations
++
++import dataclasses
++import hmac
++import json
++import os
++import random
++import re
++import ssl
++import string
++import threading
++import time
++import urllib.error
++import urllib.request
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++from pathlib import Path
++from typing import Any
++
++
++SESSION_PATTERN = re.compile(r"^(?P<prefix>.+-sid-)(?P<sid>[A-Za-z0-9]+)-t-(?P<ttl>\d+)$")
++PROXY_NAME_PREFIX = "1024Proxy-Grok-Sticky-"
++
++
++def env_int(name: str, default: int, minimum: int = 0) -> int:
++    try:
++        value = int(os.getenv(name, str(default)).strip())
++    except ValueError as exc:
++        raise ValueError(f"{name} must be an integer") from exc
++    if value < minimum:
++        raise ValueError(f"{name} must be >= {minimum}")
++    return value
++
++
++@dataclasses.dataclass(frozen=True)
++class Config:
++    listen: str
++    port: int
++    token: str
++    credentials_file: Path
++    mihomo_config_file: Path
++    mihomo_controller_url: str
++    mihomo_reload_path: str
++    node_id_base: int
++    listener_port_base: int
++    sticky_minutes: int
++    max_attempts: int
++    verify_timeout_seconds: int
++
++    @classmethod
++    def from_env(cls) -> "Config":
++        value = cls(
++            listen=os.getenv("ROTATOR_LISTEN", "127.0.0.1").strip(),
++            port=env_int("ROTATOR_PORT", 19099, 1),
++            token=os.getenv("ROTATOR_TOKEN", "").strip(),
++            credentials_file=Path(os.getenv("ROTATOR_CREDENTIALS_FILE", "/config/1024proxy-sticky.list")),
++            mihomo_config_file=Path(os.getenv("ROTATOR_MIHOMO_CONFIG_FILE", "/config/mihomo-1024.yaml")),
++            mihomo_controller_url=os.getenv("ROTATOR_MIHOMO_CONTROLLER_URL", "http://127.0.0.1:9099").strip().rstrip("/"),
++            mihomo_reload_path=os.getenv("ROTATOR_MIHOMO_RELOAD_PATH", "/root/.config/mihomo/config.yaml").strip(),
++            node_id_base=env_int("ROTATOR_NODE_ID_BASE", 8, 1),
++            listener_port_base=env_int("ROTATOR_LISTENER_PORT_BASE", 7951, 1),
++            sticky_minutes=env_int("ROTATOR_STICKY_MINUTES", 10, 1),
++            max_attempts=env_int("ROTATOR_MAX_ATTEMPTS", 4, 1),
++            verify_timeout_seconds=env_int("ROTATOR_VERIFY_TIMEOUT_SECONDS", 30, 5),
++        )
++        if not value.listen or not value.mihomo_reload_path:
++            raise ValueError("rotator listen address and Mihomo reload path are required")
++        return value
++
++
++def log_event(event: str, **fields: Any) -> None:
++    print(json.dumps({"event": event, **fields}, ensure_ascii=True, sort_keys=True, separators=(",", ":")), flush=True)
++
++
++def read_credentials(path: Path) -> tuple[list[str], list[tuple[int, str, str, str, str]]]:
++    lines = path.read_text(encoding="utf-8").splitlines()
++    entries: list[tuple[int, str, str, str, str]] = []
++    for line_number, raw in enumerate(lines):
++        value = raw.strip()
++        if not value or value.startswith("#"):
++            continue
++        parts = value.split(":", 3)
++        if len(parts) != 4 or not all(parts):
++            raise RuntimeError(f"invalid credential entry at line {line_number + 1}")
++        entries.append((line_number, *parts))
++    if not entries:
++        raise RuntimeError("credential list is empty")
++    return lines, entries
++
++
++def replace_username_in_mihomo(value: str, proxy_index: int, username: str) -> str:
++    target_name = f"- name: {PROXY_NAME_PREFIX}{proxy_index + 1:02d}"
++    lines = value.splitlines()
++    in_target = False
++    replaced = False
++    for index, line in enumerate(lines):
++        if line.startswith("- name: "):
++            in_target = line.strip() == target_name
++            continue
++        if in_target and line.startswith("  username:"):
++            lines[index] = f"  username: {username}"
++            replaced = True
++            break
++    if not replaced:
++        raise RuntimeError("target Mihomo proxy username was not found")
++    return "\n".join(lines) + "\n"
++
++
++def write_checked(path: Path, value: str) -> None:
++    with path.open("w", encoding="utf-8") as handle:
++        handle.write(value)
++        handle.flush()
++        os.fsync(handle.fileno())
++    os.chmod(path, 0o600)
++
++
++class Rotator:
++    def __init__(self, config: Config):
++        self.config = config
++        self.lock = threading.Lock()
++        self.ssl_context = ssl.create_default_context()
++
++    def _reload_mihomo(self) -> None:
++        data = json.dumps({"path": self.config.mihomo_reload_path}, separators=(",", ":")).encode()
++        request = urllib.request.Request(
++            self.config.mihomo_controller_url + "/configs?force=true",
++            data=data,
++            headers={"Content-Type": "application/json"},
++            method="PUT",
++        )
++        try:
++            with urllib.request.urlopen(request, timeout=10) as response:
++                if response.status < 200 or response.status >= 300:
++                    raise RuntimeError(f"Mihomo reload returned HTTP {response.status}")
++        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as exc:
++            raise RuntimeError(f"Mihomo reload failed: {type(exc).__name__}") from exc
++
++    def _exit_ip(self, proxy_index: int) -> str:
++        proxy_url = f"http://127.0.0.1:{self.config.listener_port_base + proxy_index}"
++        opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
++        request = urllib.request.Request(
++            "https://1.1.1.1/cdn-cgi/trace",
++            headers={"User-Agent": "grok2api-session-rotator/1", "Accept": "text/plain"},
++        )
++        with opener.open(request, timeout=8) as response:
++            body = response.read(8192).decode("utf-8", "replace")
++        for line in body.splitlines():
++            if line.startswith("ip="):
++                return line.removeprefix("ip=").strip()
++        return ""
++
++    def _wait_for_exit_ip(self, proxy_index: int) -> str:
++        deadline = time.monotonic() + self.config.verify_timeout_seconds
++        last_error: Exception | None = None
++        while time.monotonic() < deadline:
++            try:
++                value = self._exit_ip(proxy_index)
++                if value:
++                    return value
++            except Exception as exc:
++                last_error = exc
++            time.sleep(1)
++        if last_error is not None:
++            raise RuntimeError(f"exit IP verification failed: {type(last_error).__name__}") from last_error
++        raise RuntimeError("exit IP verification returned no address")
++
++    @staticmethod
++    def _new_session_id() -> str:
++        alphabet = string.ascii_letters + string.digits
++        return "".join(random.SystemRandom().choice(alphabet) for _ in range(8))
++
++    def _update_session(self, proxy_index: int, session_id: str) -> None:
++        credential_lines, entries = read_credentials(self.config.credentials_file)
++        if proxy_index < 0 or proxy_index >= len(entries):
++            raise RuntimeError("node is not mapped to a sticky session")
++        line_number, server, port, username, password = entries[proxy_index]
++        match = SESSION_PATTERN.match(username)
++        if match is None:
++            raise RuntimeError("sticky username does not contain a supported session marker")
++        new_username = f"{match.group('prefix')}{session_id}-t-{self.config.sticky_minutes}"
++        credential_lines[line_number] = f"{server}:{port}:{new_username}:{password}"
++        mihomo_value = self.config.mihomo_config_file.read_text(encoding="utf-8")
++        new_mihomo_value = replace_username_in_mihomo(mihomo_value, proxy_index, new_username)
++        write_checked(self.config.credentials_file, "\n".join(credential_lines) + "\n")
++        write_checked(self.config.mihomo_config_file, new_mihomo_value)
++
++    def rotate(self, node_id: str, expected_old_exit_ip: str = "") -> dict[str, Any]:
++        try:
++            numeric_node_id = int(node_id)
++        except ValueError as exc:
++            raise RuntimeError("node ID is invalid") from exc
++        proxy_index = numeric_node_id - self.config.node_id_base
++        with self.lock:
++            original_credentials = self.config.credentials_file.read_text(encoding="utf-8")
++            original_mihomo = self.config.mihomo_config_file.read_text(encoding="utf-8")
++            old_exit_ip = expected_old_exit_ip.strip()
++            if not old_exit_ip:
++                try:
++                    old_exit_ip = self._exit_ip(proxy_index)
++                except Exception:
++                    old_exit_ip = ""
++            try:
++                for attempt in range(1, self.config.max_attempts + 1):
++                    self._update_session(proxy_index, self._new_session_id())
++                    self._reload_mihomo()
++                    new_exit_ip = self._wait_for_exit_ip(proxy_index)
++                    if not old_exit_ip or new_exit_ip != old_exit_ip:
++                        log_event("session_rotated", node_id=node_id, attempt=attempt, old_exit_ip=old_exit_ip, new_exit_ip=new_exit_ip)
++                        return {
++                            "changed": True,
++                            "nodeId": node_id,
++                            "oldExitIp": old_exit_ip,
++                            "newExitIp": new_exit_ip,
++                            "stickyMinutes": self.config.sticky_minutes,
++                        }
++                raise RuntimeError("provider returned the same exit IP after all rotation attempts")
++            except Exception:
++                write_checked(self.config.credentials_file, original_credentials)
++                write_checked(self.config.mihomo_config_file, original_mihomo)
++                try:
++                    self._reload_mihomo()
++                except Exception:
++                    pass
++                raise
++
++
++class Handler(BaseHTTPRequestHandler):
++    server_version = "grok2api-session-rotator/1"
++
++    def _json(self, status: int, value: dict[str, Any]) -> None:
++        payload = json.dumps(value, ensure_ascii=True, separators=(",", ":")).encode()
++        self.send_response(status)
++        self.send_header("Content-Type", "application/json")
++        self.send_header("Content-Length", str(len(payload)))
++        self.end_headers()
++        self.wfile.write(payload)
++
++    def do_GET(self) -> None:
++        if self.path != "/healthz":
++            self._json(404, {"error": "not found"})
++            return
++        self._json(200, {"status": "ok"})
++
++    def do_POST(self) -> None:
++        if self.path != "/rotate":
++            self._json(404, {"error": "not found"})
++            return
++        config: Config = self.server.config  # type: ignore[attr-defined]
++        if config.token:
++            expected = f"Bearer {config.token}"
++            if not hmac.compare_digest(self.headers.get("Authorization", ""), expected):
++                self._json(401, {"error": "unauthorized"})
++                return
++        try:
++            length = int(self.headers.get("Content-Length", "0"))
++            if length < 2 or length > 4096:
++                raise ValueError("request body size is invalid")
++            body = json.loads(self.rfile.read(length))
++            node_id = str(body.get("nodeId") or "")
++            value = self.server.rotator.rotate(node_id, str(body.get("oldExitIp") or ""))  # type: ignore[attr-defined]
++        except (ValueError, RuntimeError, OSError) as exc:
++            log_event("rotation_request_failed", error_type=type(exc).__name__)
++            self._json(503, {"error": str(exc)})
++            return
++        self._json(200, value)
++
++    def log_message(self, _format: str, *_args: Any) -> None:
++        return
++
++
++def main() -> int:
++    try:
++        config = Config.from_env()
++        rotator = Rotator(config)
++        _, entries = read_credentials(config.credentials_file)
++        if not entries:
++            raise RuntimeError("no sticky sessions configured")
++    except (ValueError, RuntimeError, OSError) as exc:
++        log_event("rotator_start_failed", error_type=type(exc).__name__)
++        return 2
++    server = ThreadingHTTPServer((config.listen, config.port), Handler)
++    server.config = config  # type: ignore[attr-defined]
++    server.rotator = rotator  # type: ignore[attr-defined]
++    log_event("rotator_started", listen=config.listen, port=config.port, sticky_minutes=config.sticky_minutes)
++    try:
++        server.serve_forever(poll_interval=0.5)
++    except KeyboardInterrupt:
++        pass
++    finally:
++        server.server_close()
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/egress-quality-guard/session_rotator_test.py b/tools/egress-quality-guard/session_rotator_test.py
+new file mode 100644
+index 0000000..0350bfa
+--- /dev/null
++++ b/tools/egress-quality-guard/session_rotator_test.py
+@@ -0,0 +1,71 @@
++import importlib.util
++import sys
++import tempfile
++import unittest
++from pathlib import Path
++
++
++MODULE_PATH = Path(__file__).with_name("session_rotator.py")
++SPEC = importlib.util.spec_from_file_location("session_rotator", MODULE_PATH)
++session_rotator = importlib.util.module_from_spec(SPEC)
++assert SPEC.loader is not None
++sys.modules[SPEC.name] = session_rotator
++SPEC.loader.exec_module(session_rotator)
++
++
++class SessionRotatorTests(unittest.TestCase):
++    def test_replaces_only_selected_proxy_username(self):
++        value = """proxies:
++- name: 1024Proxy-Grok-Sticky-01
++  type: socks5
++  username: account-region-US-sid-old1111-t-120
++- name: 1024Proxy-Grok-Sticky-02
++  type: socks5
++  username: account-region-US-sid-old2222-t-120
++"""
++        result = session_rotator.replace_username_in_mihomo(
++            value,
++            1,
++            "account-region-US-sid-new2222-t-10",
++        )
++        self.assertIn("sid-old1111-t-120", result)
++        self.assertIn("sid-new2222-t-10", result)
++        self.assertNotIn("sid-old2222-t-120", result)
++
++    def test_update_session_sets_new_sid_and_ten_minute_stickiness(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            credentials = root / "credentials.list"
++            mihomo = root / "mihomo.yaml"
++            credentials.write_text(
++                "proxy.example:3000:account-region-US-sid-old1111-t-120:secret\n",
++                encoding="utf-8",
++            )
++            mihomo.write_text(
++                "- name: 1024Proxy-Grok-Sticky-01\n"
++                "  type: socks5\n"
++                "  username: account-region-US-sid-old1111-t-120\n",
++                encoding="utf-8",
++            )
++            cfg = session_rotator.Config(
++                listen="127.0.0.1",
++                port=19099,
++                token="",
++                credentials_file=credentials,
++                mihomo_config_file=mihomo,
++                mihomo_controller_url="http://127.0.0.1:9099",
++                mihomo_reload_path="/root/.config/mihomo/config.yaml",
++                node_id_base=8,
++                listener_port_base=7951,
++                sticky_minutes=10,
++                max_attempts=1,
++                verify_timeout_seconds=5,
++            )
++            rotator = session_rotator.Rotator(cfg)
++            rotator._update_session(0, "new1111")
++            self.assertIn("sid-new1111-t-10", credentials.read_text(encoding="utf-8"))
++            self.assertIn("sid-new1111-t-10", mihomo.read_text(encoding="utf-8"))
 +
 +
 +if __name__ == "__main__":
