@@ -1,6 +1,6 @@
 # grok2api 出口增强补丁
 
-这是一个非官方补丁分发仓库，为 [chenyme/grok2api](https://github.com/chenyme/grok2api) 增加固定代理快速恢复和可选的出口质量守护。仓库不复制上游完整源码，只发布可审计的 Git patch、功能说明和 AI 合并指南。
+这是一个非官方增强分发仓库，为 [chenyme/grok2api](https://github.com/chenyme/grok2api) 增加固定代理快速恢复和可选的出口质量守护。仓库不复制上游完整源码，只发布可审计的 Git patch、功能说明、AI 合并指南和可选 CPA 管理插件源码。
 
 当前补丁基于：
 
@@ -8,7 +8,7 @@
 - 上游提交：`090104504b403d65675a01dab9c92b3a235ee832`
 - 补丁提交：见 `MANIFEST.json` 的 `patch_commit`（严格隔离与自动换 IP 完整版）
 - 上游 Draft PR：[chenyme/grok2api#837](https://github.com/chenyme/grok2api/pull/837)
-- 可运行 Fork：[lij768423-svg/grok2api](https://github.com/lij768423-svg/grok2api/tree/main)
+- 可运行 Fork：[lij768423-svg/grok2api](https://github.com/lij768423-svg/grok2api/tree/agent/egress-resilience-quality-guard)
 
 ## 包含功能
 
@@ -30,12 +30,18 @@
 - 支持受信任的节点级换 IP Webhook，以及 1024Proxy `sid-...-t-...` 粘性会话轮换器。
 - 新 IP 只执行一次真实模型质量检测；正常立即恢复，异常或不确定则保持隔离。
 - 账号调度失败与代理故障分开处理：暂无可调度账号时延后复测，不累计代理错误、不浪费流量换 IP。
+- 目标节点绑定账号不可调度时，管理员质量探针会借用任意健康 Build 账号，但实际请求仍强制走被测节点；普通流量不受影响。
+- 整个账号池不可用时按独立长退避延后检测并抑制重复日志，节点仍保持隔离。
 - 管理端质量守护页面、手动诊断、策略热加载和累计统计。
 - 手动检测与节点操作使用单条可更新提示；隔离或轮换中的节点禁止并发手动检测。
 - 在节点质量表中直接添加、编辑、删除、启用、停用和刷新 Build 代理节点。
 - 支持单选、全选、批量启用、批量停用和批量删除，并为删除操作提供确认。
 - `QUALITY_GUARD_NODE_IDS` 留空时自动发现所有已启用的代理 Build 节点；状态文件同时发布已解析节点，兼容旧版管理页面。
 - 独立 Python sidecar、Docker Compose、systemd、安全说明和中英文文档。
+
+### CPA 管理插件
+
+`cpa-plugin/go` 提供可选的 CLIProxyAPI 动态插件，支持节点增删改、批量启停/删除、连通性检测、真实质量检测、策略编辑、统计事件和深浅色模式。构建与部署方法见 [cpa-plugin/README.md](./cpa-plugin/README.md)。
 
 质量守护是启发式熔断器，不是模型能力鉴定器。中间层缓冲、已有文件、长常量或缓存内容可能造成异常高瞬时 Token/s。硬阈值策略偏激进，可按链路调高 `hard_tps`；软阈值仍以固定 Prompt 复测确认。
 

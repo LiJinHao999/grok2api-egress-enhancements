@@ -5444,3 +5444,401 @@ index 0000000..0350bfa
 -- 
 2.53.0
 
+From 334dbe0f01ea0294318856873136c4196f835a04 Mon Sep 17 00:00:00 2001
+From: lij768423-svg <265844445+lij768423-svg@users.noreply.github.com>
+Date: Sat, 1 Aug 2026 17:49:18 +0000
+Subject: [PATCH] fix: recover quality probes without bound accounts
+
+---
+ .../internal/application/gateway/selector.go  | 17 +++++--
+ .../application/gateway/selector_test.go      | 45 +++++++++++++++++++
+ .../internal/application/gateway/service.go   |  2 +-
+ .../internal/infra/provider/cli/adapter.go    |  3 ++
+ .../infra/provider/cli/adapter_test.go        | 29 ++++++++++++
+ backend/internal/infra/provider/provider.go   |  3 ++
+ tools/egress-quality-guard/README.md          | 14 +++---
+ tools/egress-quality-guard/README.zh-CN.md    |  7 +--
+ .../egress-quality-guard.env.example          |  2 +
+ tools/egress-quality-guard/quality_guard.py   | 28 +++++++++---
+ .../quality_guard_test.py                     |  9 +++-
+ 11 files changed, 139 insertions(+), 20 deletions(-)
+
+diff --git a/backend/internal/application/gateway/selector.go b/backend/internal/application/gateway/selector.go
+index 1a6ca7b..7486491 100644
+--- a/backend/internal/application/gateway/selector.go
++++ b/backend/internal/application/gateway/selector.go
+@@ -305,13 +305,24 @@ func (s *Selector) AcquireForKey(ctx context.Context, provider account.Provider,
+ 	return s.acquire(ctx, provider, modelRouteID, upstreamModel, quotaMode, affinityKey, excluded, allowQuotaProbe, scope, 0)
+ }
+ 
+-// AcquireForKeyOnEgressNode is reserved for administrator probes. It limits
+-// account selection to credentials explicitly bound to the requested node.
++// AcquireForKeyOnEgressNode is reserved for administrator probes. It prefers a
++// credential bound to the requested node, then borrows any schedulable
++// credential when the node's own accounts are unavailable. The request layer
++// still forces the physical call through nodeID.
+ func (s *Selector) AcquireForKeyOnEgressNode(ctx context.Context, provider account.Provider, modelRouteID uint64, upstreamModel, quotaMode, affinityKey string, excluded map[uint64]bool, allowQuotaProbe bool, scope clientkeydomain.AccountScope, nodeID uint64) (*accountLease, error) {
+ 	if nodeID == 0 {
+ 		return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts, Scope: scope}
+ 	}
+-	return s.acquire(ctx, provider, modelRouteID, upstreamModel, quotaMode, affinityKey, excluded, allowQuotaProbe, scope, nodeID)
++	lease, err := s.acquire(ctx, provider, modelRouteID, upstreamModel, quotaMode, affinityKey, excluded, allowQuotaProbe, scope, nodeID)
++	if err == nil {
++		return lease, nil
++	}
++	var unavailable *SelectionUnavailableError
++	if !errors.As(err, &unavailable) {
++		return nil, err
++	}
++	// Probe borrowing must not create or reuse ordinary sticky affinity.
++	return s.acquire(ctx, provider, modelRouteID, upstreamModel, quotaMode, "", excluded, allowQuotaProbe, scope, 0)
+ }
+ 
+ func (s *Selector) acquire(ctx context.Context, provider account.Provider, modelRouteID uint64, upstreamModel, quotaMode, affinityKey string, excluded map[uint64]bool, allowQuotaProbe bool, requestedScope clientkeydomain.AccountScope, forcedEgressNodeID uint64) (lease *accountLease, err error) {
+diff --git a/backend/internal/application/gateway/selector_test.go b/backend/internal/application/gateway/selector_test.go
+index 21731c7..b8ab147 100644
+--- a/backend/internal/application/gateway/selector_test.go
++++ b/backend/internal/application/gateway/selector_test.go
+@@ -147,6 +147,51 @@ func TestSelectorQualityProbePinsAccountToRequestedEgressNode(t *testing.T) {
+ 	}
+ }
+ 
++func TestSelectorQualityProbeBorrowsHealthyAccountForUnavailableNode(t *testing.T) {
++	ctx := context.Background()
++	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "selector-egress-fallback.db"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer database.Close()
++	if err := database.InitializeSchema(ctx); err != nil {
++		t.Fatal(err)
++	}
++	egressNodes := relational.NewEgressRepository(database)
++	targetNode, err := egressNodes.CreateEgressNode(ctx, egressdomain.Node{Name: "target", Scope: egressdomain.ScopeBuild, Enabled: false, EncryptedProxyURL: "target"})
++	if err != nil {
++		t.Fatal(err)
++	}
++	healthyNode, err := egressNodes.CreateEgressNode(ctx, egressdomain.Node{Name: "healthy", Scope: egressdomain.ScopeBuild, Enabled: true, EncryptedProxyURL: "healthy"})
++	if err != nil {
++		t.Fatal(err)
++	}
++	accounts := relational.NewAccountRepository(database)
++	_, _, err = accounts.UpsertByIdentity(ctx, account.Credential{
++		Provider: account.ProviderBuild, Name: "target-reauth", SourceKey: "target-reauth", EncryptedAccessToken: "encrypted",
++		Enabled: true, AuthStatus: account.AuthStatusReauthRequired, MaxConcurrent: 1, EgressNodeID: targetNode.ID,
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	healthy, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
++		Provider: account.ProviderBuild, Name: "healthy", SourceKey: "healthy", EncryptedAccessToken: "encrypted",
++		Enabled: true, AuthStatus: account.AuthStatusActive, MaxConcurrent: 1, EgressNodeID: healthyNode.ID,
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, time.Second, time.Minute)
++	lease, err := selector.AcquireForKeyOnEgressNode(ctx, account.ProviderBuild, 0, "grok-test", "", "ordinary-affinity", nil, false, clientkeydomain.AccountScope{}, targetNode.ID)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer lease.Release()
++	if lease.Credential.ID != healthy.ID {
++		t.Fatalf("selected account=%d, want borrowed healthy account=%d", lease.Credential.ID, healthy.ID)
++	}
++}
++
+ func BenchmarkSelectorCandidatePlanning(b *testing.B) {
+ 	ctx := context.Background()
+ 	limiter := memory.NewConcurrencyLimiter()
+diff --git a/backend/internal/application/gateway/service.go b/backend/internal/application/gateway/service.go
+index cbad781..b62bf9e 100644
+--- a/backend/internal/application/gateway/service.go
++++ b/backend/internal/application/gateway/service.go
+@@ -750,7 +750,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
+ 		started := time.Now()
+ 		responseStartedAt = started
+ 		lease.markSelectorUpstreamStarted()
+-		response, err := adapter.ForwardResponse(physicalCallCtx, provider.ResponseResourceRequest{Credential: credential, Billing: billing, Method: http.MethodPost, Path: path, Model: route.UpstreamModel, PromptCacheKey: input.PromptCacheKey, ReasoningReplayKey: reasoningReplayKey, AllowClientToolCacheRoute: input.AllowClientToolCacheRoute, GrokTurnIndex: input.GrokTurnIndex, IdempotencyID: idempotencyID, Body: input.Body, Streaming: input.Streaming, NormalizeBody: true, Operation: string(operation)})
++		response, err := adapter.ForwardResponse(physicalCallCtx, provider.ResponseResourceRequest{Credential: credential, ForcedEgressNodeID: input.ForcedEgressNodeID, Billing: billing, Method: http.MethodPost, Path: path, Model: route.UpstreamModel, PromptCacheKey: input.PromptCacheKey, ReasoningReplayKey: reasoningReplayKey, AllowClientToolCacheRoute: input.AllowClientToolCacheRoute, GrokTurnIndex: input.GrokTurnIndex, IdempotencyID: idempotencyID, Body: input.Body, Streaming: input.Streaming, NormalizeBody: true, Operation: string(operation)})
+ 		err = failureAttempts.captureResponse(credential, started, response, err)
+ 		timing.markUpstream(time.Since(started))
+ 		return response, err
+diff --git a/backend/internal/infra/provider/cli/adapter.go b/backend/internal/infra/provider/cli/adapter.go
+index 30988ee..cb24392 100644
+--- a/backend/internal/infra/provider/cli/adapter.go
++++ b/backend/internal/infra/provider/cli/adapter.go
+@@ -455,6 +455,9 @@ func (a *Adapter) doResponseRequest(ctx context.Context, request provider.Respon
+ 		bodyReader = bytes.NewReader(body)
+ 	}
+ 	requestCtx := infraegress.WithCredential(ctx, request.Credential)
++	if request.ForcedEgressNodeID != 0 {
++		requestCtx = infraegress.WithEgressNode(requestCtx, request.ForcedEgressNodeID)
++	}
+ 	plane := "build"
+ 	if fallback := a.fallbackBaseURL(); fallback != "" && strings.EqualFold(strings.TrimRight(base, "/"), fallback) {
+ 		plane = "xai"
+diff --git a/backend/internal/infra/provider/cli/adapter_test.go b/backend/internal/infra/provider/cli/adapter_test.go
+index df0aa3e..8a2fbd5 100644
+--- a/backend/internal/infra/provider/cli/adapter_test.go
++++ b/backend/internal/infra/provider/cli/adapter_test.go
+@@ -16,6 +16,7 @@ import (
+ 	"github.com/google/uuid"
+ 
+ 	"github.com/chenyme/grok2api/backend/internal/domain/account"
++	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
+ 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
+ 	"github.com/chenyme/grok2api/backend/internal/infra/provider/conversation"
+ 	"github.com/chenyme/grok2api/backend/internal/infra/runtime/memory"
+@@ -29,6 +30,34 @@ func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error)
+ 	return fn(request)
+ }
+ 
++func TestResponseRequestForcedEgressOverridesCredentialBinding(t *testing.T) {
++	var gotNodeID uint64
++	adapter := NewAdapter(Config{BaseURL: "https://cli-chat-proxy.grok.com/v1"}, nil)
++	adapter.http.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
++		gotNodeID = infraegress.EgressNodeFromContext(request.Context())
++		return &http.Response{
++			StatusCode: http.StatusOK,
++			Status:     "200 OK",
++			Header:     make(http.Header),
++			Body:       io.NopCloser(strings.NewReader(`{}`)),
++			Request:    request,
++		}, nil
++	})
++	response, _, err := adapter.doResponseRequest(context.Background(), provider.ResponseResourceRequest{
++		Credential:         account.Credential{ID: 7, Provider: account.ProviderBuild, EgressNodeID: 11},
++		ForcedEgressNodeID: 22,
++		Method:             http.MethodPost,
++		Path:               "/responses",
++	}, "access-token", nil, "https://cli-chat-proxy.grok.com/v1")
++	if err != nil {
++		t.Fatal(err)
++	}
++	_ = response.Body.Close()
++	if gotNodeID != 22 {
++		t.Fatalf("egress node=%d, want forced node=22", gotNodeID)
++	}
++}
++
+ func TestAdapterHotUpdatesDirectResponseHeaderTimeout(t *testing.T) {
+ 	adapter := NewAdapter(Config{ResponseHeaderTimeout: 2 * time.Minute}, nil)
+ 	before := adapter.base.current.Load()
+diff --git a/backend/internal/infra/provider/provider.go b/backend/internal/infra/provider/provider.go
+index b5187ce..7b7383b 100644
+--- a/backend/internal/infra/provider/provider.go
++++ b/backend/internal/infra/provider/provider.go
+@@ -123,6 +123,9 @@ func (e *CredentialRefreshError) Unwrap() error {
+ // ResponseResourceRequest describes a common upstream request to a Responses resource endpoint.
+ type ResponseResourceRequest struct {
+ 	Credential account.Credential
++	// ForcedEgressNodeID is set only by administrator quality probes. It lets a
++	// healthy credential test a quarantined node without changing its binding.
++	ForcedEgressNodeID uint64
+ 	// Billing is used only to determine XAI eligibility in Build auto mode; nil means the account tier is unknown.
+ 	Billing        *account.Billing
+ 	Method         string
+diff --git a/tools/egress-quality-guard/README.md b/tools/egress-quality-guard/README.md
+index 9f3e8b5..a9cd735 100644
+--- a/tools/egress-quality-guard/README.md
++++ b/tools/egress-quality-guard/README.md
+@@ -24,8 +24,9 @@ your own traffic before allowing automatic quarantine.
+    `output` intentionally includes reasoning tokens.
+ 2. Active mode calls the administrator-only
+    `POST /api/admin/v1/egress-nodes/{id}/quality-test` endpoint.
+-3. grok2api selects only an account explicitly bound to that node and sends a
+-   fixed streaming prompt.
++3. grok2api prefers an account bound to that node. If none is schedulable, it
++   borrows any healthy account while still forcing the physical request through
++   the node under test, then sends a fixed streaming prompt.
+ 4. The fixed probe checks output tokens, chunk cadence, first-token time,
+    instruction-marker compliance, and panel-equivalent output-token throughput.
+ 5. A high-TPS production request at the hard threshold quarantines the node
+@@ -75,10 +76,11 @@ pass before restoration. The optional `session_rotator.py` implements this
+ contract for 1024Proxy-style usernames containing `sid-...-t-...`.
+ 
+ Probe failures require `QUALITY_GUARD_CONSECUTIVE_ERRORS` consecutive attempts
+-before quarantine. Account-selection failures are reported separately: if no
+-account assigned to a node is currently schedulable, the guard defers recovery
+-without counting a proxy failure or rotating the IP. The node remains isolated
+-until a real model-quality probe can pass.
++before quarantine. Account-selection failures are reported separately: if the
++entire Grok Build pool has no schedulable account, the guard backs off for
++`QUALITY_GUARD_NO_ACCOUNT_BACKOFF_SECONDS` and suppresses duplicate logs without
++counting a proxy failure or rotating the IP. The node remains isolated until a
++real model-quality probe can pass.
+ 
+ ## Admin UI
+ 
+diff --git a/tools/egress-quality-guard/README.zh-CN.md b/tools/egress-quality-guard/README.zh-CN.md
+index b1e4016..cd0b8c3 100644
+--- a/tools/egress-quality-guard/README.zh-CN.md
++++ b/tools/egress-quality-guard/README.zh-CN.md
+@@ -17,7 +17,7 @@ Token/s，因此建议先观察 JSON 日志，再根据实际流量调整阈值
+ 
+ 1. 被动检测每 5 秒读取普通成功流式请求的新增审计，并按 grok2api 面板同口径的 `输出 Token / (总耗时 - 首字耗时)` 计算速度；输出 Token 故意包含 Reasoning Token。
+ 2. 主动检测调用仅管理员可访问的 `POST /api/admin/v1/egress-nodes/{id}/quality-test`。
+-3. grok2api 只从明确绑定到该节点的账号中选号，并发送固定流式 Prompt。
++3. grok2api 优先使用明确绑定到该节点的账号；如果这些账号不可调度，则借用任意健康账号，但仍强制实际请求走被测节点，再发送固定流式 Prompt。
+ 4. 普通真实请求达到硬阈值时立即隔离；达到软阈值时触发一次固定 Prompt 主动复测。
+ 5. 主动复测达到硬阈值会立即隔离；主动软异常必须达到配置的连续次数。
+ 6. 隔离节点仍可接受管理员探测，但不会承载普通用户请求。
+@@ -51,8 +51,9 @@ Webhook，确认出口发生变化，再执行一次真实模型质量检测；
+ 更新的凭据列表和 Mihomo 配置文件。
+ 
+ 主动探测连续失败达到 `QUALITY_GUARD_CONSECUTIVE_ERRORS` 后才会隔离并换 IP。如果失败发生在
+-账号调度阶段，例如该节点绑定的账号当前都不可调度，后端会返回独立错误码；守护程序只延后
+-复测，不累计代理故障，也不执行无意义的换 IP。节点仍保持隔离，直到真实模型质量检测通过。
++账号调度阶段，例如整个 Grok Build 账号池当前都不可调度，后端会返回独立错误码；守护程序按
++`QUALITY_GUARD_NO_ACCOUNT_BACKOFF_SECONDS` 延后复测并抑制重复日志，不累计代理故障，也不执行
++无意义的换 IP。节点仍保持隔离，直到真实模型质量检测通过。
+ 
+ ## 管理界面
+ 
+diff --git a/tools/egress-quality-guard/egress-quality-guard.env.example b/tools/egress-quality-guard/egress-quality-guard.env.example
+index 6132c5c..c40ac7b 100644
+--- a/tools/egress-quality-guard/egress-quality-guard.env.example
++++ b/tools/egress-quality-guard/egress-quality-guard.env.example
+@@ -24,6 +24,8 @@ QUALITY_GUARD_HARD_TPS=1000
+ QUALITY_GUARD_CONSECUTIVE_SOFT=2
+ QUALITY_GUARD_CONSECUTIVE_ERRORS=2
+ QUALITY_GUARD_QUARANTINE_SECONDS=300
++# Back off when the entire Grok Build account pool has no schedulable account.
++QUALITY_GUARD_NO_ACCOUNT_BACKOFF_SECONDS=300
+ QUALITY_GUARD_MIN_HEALTHY_NODES=3
+ QUALITY_GUARD_MAX_OUTPUT_TOKENS=384
+ 
+diff --git a/tools/egress-quality-guard/quality_guard.py b/tools/egress-quality-guard/quality_guard.py
+index fa6213e..c9f433e 100755
+--- a/tools/egress-quality-guard/quality_guard.py
++++ b/tools/egress-quality-guard/quality_guard.py
+@@ -99,6 +99,7 @@ class Config:
+     consecutive_soft: int
+     consecutive_errors: int
+     quarantine_seconds: int
++    no_account_backoff_seconds: int
+     min_healthy_nodes: int
+     max_output_tokens: int
+     fail_closed: bool
+@@ -148,6 +149,7 @@ class Config:
+             consecutive_soft=_env_int("QUALITY_GUARD_CONSECUTIVE_SOFT", 2, 1),
+             consecutive_errors=_env_int("QUALITY_GUARD_CONSECUTIVE_ERRORS", 2, 1),
+             quarantine_seconds=_env_int("QUALITY_GUARD_QUARANTINE_SECONDS", 300, 30),
++            no_account_backoff_seconds=_env_int("QUALITY_GUARD_NO_ACCOUNT_BACKOFF_SECONDS", 300, 30),
+             min_healthy_nodes=_env_int("QUALITY_GUARD_MIN_HEALTHY_NODES", 3, 1),
+             max_output_tokens=_env_int("QUALITY_GUARD_MAX_OUTPUT_TOKENS", 384, 32),
+             fail_closed=_env_bool("QUALITY_GUARD_FAIL_CLOSED", False),
+@@ -190,6 +192,8 @@ class Config:
+             raise ValueError("quality guard consecutive strike limits must not exceed 20")
+         if self.quarantine_seconds > 86400:
+             raise ValueError("QUALITY_GUARD_QUARANTINE_SECONDS must not exceed 86400")
++        if self.no_account_backoff_seconds > 86400:
++            raise ValueError("QUALITY_GUARD_NO_ACCOUNT_BACKOFF_SECONDS must not exceed 86400")
+         if self.min_healthy_nodes < 1 or (self.node_ids and self.min_healthy_nodes > len(self.node_ids)):
+             raise ValueError("QUALITY_GUARD_MIN_HEALTHY_NODES must fit the configured node count")
+         if self.min_generation_ms > self.request_timeout_seconds * 1000:
+@@ -438,6 +442,7 @@ def default_node_state() -> dict[str, Any]:
+         "last_rotation_at": 0.0,
+         "last_rotation_exit_ip": "",
+         "rotation_failures": 0,
++        "last_no_account_log_at": 0.0,
+     }
+ 
+ 
+@@ -552,6 +557,7 @@ class Guard:
+             "consecutive_soft": self.config.consecutive_soft,
+             "consecutive_errors": self.config.consecutive_errors,
+             "quarantine_seconds": self.config.quarantine_seconds,
++            "no_account_backoff_seconds": self.config.no_account_backoff_seconds,
+             "min_healthy_nodes": self.config.min_healthy_nodes,
+             "max_output_tokens": self.config.max_output_tokens,
+             "fail_closed": self.config.fail_closed,
+@@ -577,6 +583,18 @@ class Guard:
+             current.setdefault(key, value)
+         return current
+ 
++    def _defer_no_account(self, state: dict[str, Any], node: dict[str, Any], now: float, event: str, **fields: Any) -> None:
++        state["last_probe_at"] = now
++        state["last_reason"] = "probe_no_account"
++        state["quarantined_until"] = max(
++            float(state.get("quarantined_until", 0.0)),
++            now + self.config.no_account_backoff_seconds,
++        )
++        last_logged = float(state.get("last_no_account_log_at", 0.0))
++        if last_logged <= 0 or now - last_logged >= self.config.no_account_backoff_seconds:
++            state["last_no_account_log_at"] = now
++            log_event(event, node_id=str(node["id"]), node_name=node.get("name"), reason="probe_no_account", **fields)
++
+     def _eligible_nodes(self, nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+         configured = set(self.config.node_ids)
+         state_nodes = self.state.get("nodes") or {}
+@@ -687,14 +705,14 @@ class Guard:
+     def _probe_active(self, nodes: list[dict[str, Any]], node: dict[str, Any], now: float, trigger: str = "scheduled") -> None:
+         node_id = str(node["id"])
+         state = self._state_for(node_id)
++        if state.get("last_reason") == "probe_no_account" and now < float(state.get("quarantined_until", 0.0)):
++            return
+         self._bump_statistic("active", "total")
+         try:
+             result = self.api.quality_test(node_id)
+         except Exception as exc:
+             if self._probe_account_unavailable(exc):
+-                state["last_probe_at"] = now
+-                state["last_reason"] = "probe_no_account"
+-                log_event("quality_probe_deferred", node_id=node_id, node_name=node.get("name"), trigger=trigger, reason="probe_no_account")
++                self._defer_no_account(state, node, now, "quality_probe_deferred", trigger=trigger)
+                 return
+             self._bump_statistic("active", "errors")
+             state["error_strikes"] = int(state.get("error_strikes", 0)) + 1
+@@ -754,9 +772,7 @@ class Guard:
+             self._record_probe(node, result, classification, reason, now)
+         except Exception as exc:
+             if self._probe_account_unavailable(exc):
+-                state["quarantined_until"] = now + self.config.quarantine_seconds
+-                state["last_reason"] = "probe_no_account"
+-                log_event("recovery_probe_deferred", node_id=node_id, node_name=node.get("name"), reason="probe_no_account")
++                self._defer_no_account(state, node, now, "recovery_probe_deferred")
+                 return
+             self._bump_statistic("active", "errors")
+             state["quarantined_until"] = now + self.config.quarantine_seconds
+diff --git a/tools/egress-quality-guard/quality_guard_test.py b/tools/egress-quality-guard/quality_guard_test.py
+index bbac460..72f92af 100644
+--- a/tools/egress-quality-guard/quality_guard_test.py
++++ b/tools/egress-quality-guard/quality_guard_test.py
+@@ -21,6 +21,7 @@ def config(**overrides):
+         passive_poll_seconds=5, passive_page_size=200, passive_max_pages=10, jitter_seconds=0,
+         request_timeout_seconds=120, soft_tps=500.0, hard_tps=1000.0,
+         consecutive_soft=2, consecutive_errors=2, quarantine_seconds=300,
++        no_account_backoff_seconds=300,
+         min_healthy_nodes=3, max_output_tokens=384, prompt="probe", expected="QUALITY_OK",
+         fail_closed=False, min_generation_ms=1000, rotation_url="", rotation_token="",
+         rotation_timeout_seconds=45, rotatable_node_ids=(),
+@@ -287,17 +288,23 @@ class GuardTests(unittest.TestCase):
+             guard.run_active_cycle()
+             self.assertEqual(api.enabled_calls, [])
+             self.assertEqual(api.rotation_calls, [])
++            self.assertEqual(api.quality_calls, ["1"])
+             self.assertEqual(guard.state["nodes"]["1"]["error_strikes"], 0)
+             self.assertEqual(guard.state["nodes"]["1"]["last_reason"], "probe_no_account")
+ 
++            guard.run_active_cycle()
++            self.assertEqual(api.quality_calls, ["1"])
++
+             api.nodes[0]["enabled"] = False
+             state = guard.state["nodes"]["1"]
+             state["disabled_by_guard"] = True
+-            guard._recover_quarantined(api.nodes[0], 10.0, rotate=False)
++            recovery_at = state["quarantined_until"]
++            guard._recover_quarantined(api.nodes[0], recovery_at, rotate=False)
+             self.assertEqual(api.enabled_calls, [])
+             self.assertEqual(api.rotation_calls, [])
+             self.assertEqual(state["last_reason"], "probe_no_account")
+             self.assertTrue(state["disabled_by_guard"])
++            self.assertEqual(state["quarantined_until"], recovery_at + cfg.no_account_backoff_seconds)
+ 
+     def test_fail_closed_buffered_burst_restores_same_ip_after_one_good_probe(self):
+         with tempfile.TemporaryDirectory() as directory:
+-- 
+2.53.0
+

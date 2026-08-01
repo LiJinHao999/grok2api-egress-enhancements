@@ -1,14 +1,14 @@
 # grok2api egress enhancement patches
 
-This is an unofficial patch distribution for [chenyme/grok2api](https://github.com/chenyme/grok2api). It adds immediate fixed-proxy recovery and an optional egress quality guard without copying the complete upstream repository.
+This is an unofficial enhancement distribution for [chenyme/grok2api](https://github.com/chenyme/grok2api). It adds immediate fixed-proxy recovery and an optional egress quality guard without copying the complete upstream repository. It also includes source for an optional CLIProxyAPI management plugin.
 
 Current baseline:
 
 - Upstream release: `v3.0.11`
 - Upstream commit: `090104504b403d65675a01dab9c92b3a235ee832`
-- Patch commit: `8afc0a08582a102529546b8964eb636fc0bffd3e`
+- Patch commit: `334dbe0f01ea0294318856873136c4196f835a04`
 - Upstream draft PR: [chenyme/grok2api#837](https://github.com/chenyme/grok2api/pull/837)
-- Runnable fork: [lij768423-svg/grok2api](https://github.com/lij768423-svg/grok2api/tree/main)
+- Runnable fork: [lij768423-svg/grok2api](https://github.com/lij768423-svg/grok2api/tree/agent/egress-resilience-quality-guard)
 
 ## Features
 
@@ -30,12 +30,18 @@ Current baseline:
 - A trusted per-node rotation webhook and a 1024Proxy `sid-...-t-...` sticky-session rotator.
 - One real-model check per new IP: healthy results restore immediately; anomalous or indeterminate results remain isolated.
 - Account-selection failures are deferred without counting a proxy error or rotating the IP.
+- If a target node's bound accounts are unavailable, administrator probes borrow any healthy Build account while still forcing the physical request through the node under test. Ordinary traffic is unchanged.
+- If the entire account pool is unavailable, the guard uses a separate long backoff and suppresses duplicate no-account logs while keeping the node isolated.
 - Admin UI, manual diagnostics, hot-reloadable policy, and persistent statistics.
 - One replaceable toast per node action, with manual tests disabled while a node is quarantined or rotating.
 - Create, edit, delete, enable, disable, and refresh Build proxy nodes directly from the node-quality table.
 - Select individual or all nodes and batch enable, disable, or delete them with destructive-action confirmation.
 - Automatically discover proxied Build nodes when `QUALITY_GUARD_NODE_IDS` is empty while publishing resolved IDs for compatibility with older admin pages.
 - Python sidecar, Docker Compose and systemd examples, security notes, and bilingual documentation.
+
+### CPA management plugin
+
+`cpa-plugin/go` provides an optional CLIProxyAPI shared-library plugin with node CRUD, batch operations, connectivity and real-model tests, policy editing, statistics, events, and light/dark themes. See [cpa-plugin/README.md](./cpa-plugin/README.md) for build and deployment instructions.
 
 The quality guard is a heuristic circuit breaker, not proof that upstream model capability changed. Immediate hard quarantine is intentionally aggressive; raise `hard_tps` when false positives are more costly. Soft anomalies still require confirmation probes.
 
