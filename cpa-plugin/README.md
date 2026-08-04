@@ -8,7 +8,7 @@
 | | |
 |---|---|
 | 插件名 | `grok2api-egress` |
-| 当前版本 | **1.0.5** |
+| 当前版本 | **1.0.7** |
 | 语言 | Go (`-buildmode=c-shared` → `.so`) |
 | CPA SDK | `CLIProxyAPI/v7` (`pluginabi` / `pluginapi`) |
 | 能力 | Management UI + Usage Plugin + Scheduler + Request Interceptor |
@@ -332,6 +332,22 @@ CPA_LOADTEST_LOG_DIR=/var/log/cpa-loadtest \
 | 节点 | 3 sticky 出口，分配 184 / 183 / 183 |
 | 守护动作 | quarantined **4** · restored **6** · suppressed **9** |
 | 结束态 | **Q=0 · H=3**，三通道 healthy |
+
+---
+
+## 性能（v1.0.7）
+
+低配机器上若出现 CPA 整体变卡 / CPU 打满，通常不是探测本身，而是旧版热路径对 `host.auth.list` + N 次 `host.auth.get` 的反复全量扫描，以及每条 usage 事件全量 `MarshalIndent` 写 `state.json`。
+
+v1.0.7 起：
+
+- 账号列表 **60s 缓存** + save 后就地 patch（migrate 不再 N 次全量扫）
+- 请求热路径（Scheduler / Intercept / Usage）**只读内存映射**，不再 `host.auth.get`
+- 观测统计 / 事件 / 绑定数 **2s 防抖落盘**；隔离/启停/代理变更仍立即落盘
+- 后台 `refreshAssignedCounts` 从每 30s 降为约每 5 分钟
+- `state.json` 改为 compact JSON
+
+功能语义（粘性 `proxy_url`、隔离迁出、校验写回、主动/被动探测）不变。
 
 ---
 

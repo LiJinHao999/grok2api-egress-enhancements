@@ -171,6 +171,7 @@ func TestMigrationFailsClosedAndVerifiesHostAuthSave(t *testing.T) {
 		authProxyCache = nil
 		authProxyAt = time.Time{}
 		authProxyMu.Unlock()
+		invalidateAuthListCache()
 	}()
 
 	if err := migrateAuthsOffNode(store, bad); err != nil {
@@ -397,5 +398,126 @@ func TestDispatchNodesImportRedactsProxyURLs(t *testing.T) {
 	}
 	if len(store.listNodes()) != 2 {
 		t.Fatalf("node count=%d", len(store.listNodes()))
+	}
+}
+
+func TestAuthListCacheAvoidsRepeatedHostGets(t *testing.T) {
+	invalidateAuthListCache()
+	calls := map[string]int{}
+	auths := map[string]map[string]any{
+		"a.json": {"type": "xai", "email": "a@example.test", "access_token": "t", "proxy_url": "http://127.0.0.1:1", "disabled": false},
+		"b.json": {"type": "xai", "email": "b@example.test", "access_token": "t", "proxy_url": "http://127.0.0.1:2", "disabled": false},
+	}
+	original := hostCall
+	hostCall = func(method string, payload []byte) (json.RawMessage, error) {
+		calls[method]++
+		switch method {
+		case pluginabi.MethodHostAuthList:
+			entries := make([]pluginapi.HostAuthFileEntry, 0, len(auths))
+			for name, raw := range auths {
+				disabled, _ := raw["disabled"].(bool)
+				entries = append(entries, pluginapi.HostAuthFileEntry{ID: name, AuthIndex: name, Name: name, Provider: "xai", Type: "xai", Disabled: disabled})
+			}
+			return json.Marshal(hostAuthListResponse{Files: entries})
+		case pluginabi.MethodHostAuthGet:
+			var request map[string]string
+			_ = json.Unmarshal(payload, &request)
+			name := request["auth_index"]
+			if name == "" {
+				name = request["name"]
+			}
+			raw, ok := auths[name]
+			if !ok {
+				return nil, fmt.Errorf("missing %s", name)
+			}
+			body, _ := json.Marshal(raw)
+			return json.Marshal(hostAuthGetResponse{AuthIndex: name, Name: name, Path: "/auths/" + name, JSON: body})
+		case pluginabi.MethodHostAuthSave:
+			var request struct {
+				Name string          `json:"name"`
+				JSON json.RawMessage `json:"json"`
+			}
+			if err := json.Unmarshal(payload, &request); err != nil {
+				return nil, err
+			}
+			updated := map[string]any{}
+			if err := json.Unmarshal(request.JSON, &updated); err != nil {
+				return nil, err
+			}
+			auths[request.Name] = updated
+			return json.Marshal(pluginapi.HostAuthSaveResponse{Name: request.Name, Path: "/auths/" + request.Name})
+		default:
+			return nil, fmt.Errorf("unexpected %s", method)
+		}
+	}
+	defer func() {
+		hostCall = original
+		invalidateAuthListCache()
+		authProxyMu.Lock()
+		authProxyCache = nil
+		authProxyAt = time.Time{}
+		authProxyMu.Unlock()
+	}()
+
+	first, err := listAuthFiles()
+	if err != nil || len(first) != 2 {
+		t.Fatalf("first list: n=%d err=%v", len(first), err)
+	}
+	if calls[pluginabi.MethodHostAuthList] != 1 || calls[pluginabi.MethodHostAuthGet] != 2 {
+		t.Fatalf("cold list host calls list=%d get=%d, want 1/2", calls[pluginabi.MethodHostAuthList], calls[pluginabi.MethodHostAuthGet])
+	}
+	for i := 0; i < 5; i++ {
+		if _, err := listAuthFiles(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if calls[pluginabi.MethodHostAuthList] != 1 || calls[pluginabi.MethodHostAuthGet] != 2 {
+		t.Fatalf("warm path re-hit host: list=%d get=%d", calls[pluginabi.MethodHostAuthList], calls[pluginabi.MethodHostAuthGet])
+	}
+	if err := saveAuthFile("a.json", map[string]any{
+		"type": "xai", "email": "a@example.test", "access_token": "t", "proxy_url": "http://127.0.0.1:9", "disabled": false,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// patched cache must reflect new proxy without another full list/get sweep
+	got, err := listAuthFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, a := range got {
+		if a.Name == "a.json" && a.ProxyURL == "http://127.0.0.1:9" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("cache was not patched after save")
+	}
+	if calls[pluginabi.MethodHostAuthList] != 1 || calls[pluginabi.MethodHostAuthGet] != 2 {
+		t.Fatalf("save+list triggered refetch list=%d get=%d", calls[pluginabi.MethodHostAuthList], calls[pluginabi.MethodHostAuthGet])
+	}
+}
+
+func TestDebouncedPersistCoalescesStats(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	s := newStateStore(path)
+	s.flushDelay = 50 * time.Millisecond
+	for i := 0; i < 20; i++ {
+		s.bumpStat("passive", "healthy", 10)
+	}
+	if err := s.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st guardState
+	if err := json.Unmarshal(raw, &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Stats.Passive.Total != 20 {
+		t.Fatalf("passive total=%d want 20", st.Stats.Passive.Total)
 	}
 }

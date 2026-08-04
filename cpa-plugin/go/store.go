@@ -111,9 +111,14 @@ type guardState struct {
 }
 
 type stateStore struct {
-	mu   sync.Mutex
-	path string
-	data guardState
+	mu         sync.Mutex
+	path       string
+	data       guardState
+	dirty      bool
+	flushTimer *time.Timer
+	// flushDelay batches high-frequency observation/event writes so every
+	// usage event does not MarshalIndent+fsync the full state file.
+	flushDelay time.Duration
 }
 
 func defaultPolicy() policyConfig {
@@ -136,7 +141,7 @@ func defaultPolicy() policyConfig {
 }
 
 func newStateStore(path string) *stateStore {
-	s := &stateStore{path: path}
+	s := &stateStore{path: path, flushDelay: 2 * time.Second}
 	s.data = guardState{
 		Version: 1,
 		Policy:  defaultPolicy(),
@@ -210,7 +215,9 @@ func (s *stateStore) persistLocked() error {
 	for _, n := range s.data.Nodes {
 		n.ProxyURLStored = n.ProxyURL
 	}
-	raw, err := json.MarshalIndent(s.data, "", "  ")
+	// Compact JSON is enough for a machine-owned state file and is much
+	// cheaper than MarshalIndent on every observation tick.
+	raw, err := json.Marshal(s.data)
 	if err != nil {
 		return err
 	}
@@ -218,7 +225,52 @@ func (s *stateStore) persistLocked() error {
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
 		return err
 	}
+	s.dirty = false
 	return os.Rename(tmp, s.path)
+}
+
+// scheduleFlushLocked coalesces non-critical writes. Caller holds s.mu.
+func (s *stateStore) scheduleFlushLocked() {
+	s.dirty = true
+	delay := s.flushDelay
+	if delay <= 0 {
+		delay = 2 * time.Second
+	}
+	if s.flushTimer != nil {
+		return
+	}
+	s.flushTimer = time.AfterFunc(delay, func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.flushTimer = nil
+		if !s.dirty {
+			return
+		}
+		_ = s.persistLocked()
+	})
+}
+
+// flushNowLocked cancels a pending timer and writes immediately. Caller holds s.mu.
+func (s *stateStore) flushNowLocked() error {
+	if s.flushTimer != nil {
+		s.flushTimer.Stop()
+		s.flushTimer = nil
+	}
+	return s.persistLocked()
+}
+
+// Flush writes any dirty state. Safe for shutdown / tests.
+func (s *stateStore) Flush() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.dirty && s.flushTimer == nil {
+		// still fine to no-op; callers may want a barrier after critical ops
+		return nil
+	}
+	return s.flushNowLocked()
 }
 
 func (s *stateStore) snapshot() guardState {
@@ -397,6 +449,10 @@ func (s *stateStore) updateNode(id string, mut func(*nodeRecord) error) (*nodeRe
 	if !ok {
 		return nil, fmt.Errorf("节点不存在")
 	}
+	beforeGuard := n.DisabledByGuard
+	beforeUntil := n.QuarantinedUntil
+	beforeEnabled := n.Enabled
+	beforeProxy := n.ProxyURL
 	if err := mut(n); err != nil {
 		return nil, err
 	}
@@ -406,7 +462,19 @@ func (s *stateStore) updateNode(id string, mut func(*nodeRecord) error) (*nodeRe
 		}
 	}
 	n.UpdatedAt = time.Now().UTC()
-	if err := s.persistLocked(); err != nil {
+	// Quarantine / enable / proxy changes must hit disk immediately so a crash
+	// cannot resurrect a known-bad egress. Pure observation metrics can wait.
+	critical := n.DisabledByGuard != beforeGuard ||
+		n.QuarantinedUntil != beforeUntil ||
+		n.Enabled != beforeEnabled ||
+		n.ProxyURL != beforeProxy
+	var err error
+	if critical {
+		err = s.flushNowLocked()
+	} else {
+		s.scheduleFlushLocked()
+	}
+	if err != nil {
 		return nil, err
 	}
 	cp := *n
@@ -458,7 +526,7 @@ func (s *stateStore) appendEvent(ev guardEvent) {
 	if len(s.data.Events) > 100 {
 		s.data.Events = s.data.Events[len(s.data.Events)-100:]
 	}
-	_ = s.persistLocked()
+	s.scheduleFlushLocked()
 }
 
 func (s *stateStore) events() []guardEvent {
@@ -498,7 +566,7 @@ func (s *stateStore) bumpStat(source, class string, tokens int64) {
 	case "ignored", "account_error", "upstream_error", "no_account":
 		ps.Ignored++
 	}
-	_ = s.persistLocked()
+	s.scheduleFlushLocked()
 }
 
 func (s *stateStore) bumpAction(kind string) {
@@ -512,7 +580,7 @@ func (s *stateStore) bumpAction(kind string) {
 	case "suppressed":
 		s.data.Stats.Actions.Suppressed++
 	}
-	_ = s.persistLocked()
+	s.scheduleFlushLocked()
 }
 
 func (s *stateStore) setAssignedCounts(counts map[string]int) {
@@ -521,7 +589,22 @@ func (s *stateStore) setAssignedCounts(counts map[string]int) {
 	for id, n := range s.data.Nodes {
 		n.AssignedAccountCount = counts[id]
 	}
-	_ = s.persistLocked()
+	s.scheduleFlushLocked()
+}
+
+// nodeIDByProxy returns the node id bound to proxyURL (O(nodes), typically small).
+func (s *stateStore) nodeIDByProxy(proxyURL string) string {
+	if s == nil || proxyURL == "" {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, n := range s.data.Nodes {
+		if n.ProxyURL == proxyURL {
+			return n.ID
+		}
+	}
+	return ""
 }
 
 func publicNode(n *nodeRecord) map[string]any {

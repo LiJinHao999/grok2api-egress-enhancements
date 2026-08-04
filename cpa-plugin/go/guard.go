@@ -37,7 +37,10 @@ func computeTPS(outputTokens, durationMs, firstTokenMs, minGenerationMs int64) f
 	return float64(outputTokens) / (float64(denom) / 1000.0)
 }
 
-// authProxyCache maps auth id/index/name → proxy_url (refreshed periodically).
+// authProxyCache maps auth id/index/name → proxy_url.
+// Rebuilt from the auth-list cache (no host N+1) after TTL or explicit invalidate.
+const authProxyCacheTTL = 60 * time.Second
+
 var (
 	authProxyMu    sync.Mutex
 	authProxyCache map[string]string
@@ -52,10 +55,14 @@ func invalidateAuthProxyCache() {
 
 func refreshAuthProxyCache() map[string]string {
 	authProxyMu.Lock()
-	defer authProxyMu.Unlock()
-	if authProxyCache != nil && time.Since(authProxyAt) < 15*time.Second {
-		return authProxyCache
+	if authProxyCache != nil && time.Since(authProxyAt) < authProxyCacheTTL {
+		out := authProxyCache
+		authProxyMu.Unlock()
+		return out
 	}
+	authProxyMu.Unlock()
+
+	// listAuthFiles is itself cached; this rebuild does not stampede Host API.
 	out := map[string]string{}
 	auths, err := listAuthFiles()
 	if err == nil {
@@ -83,12 +90,21 @@ func refreshAuthProxyCache() map[string]string {
 			}
 		}
 	}
+
+	authProxyMu.Lock()
 	authProxyCache = out
 	authProxyAt = time.Now()
+	authProxyMu.Unlock()
 	return out
 }
 
+// resolveNodeIDForAuth is on the request hot path. It only consults in-memory
+// caches — never host.auth.get — so a cache miss yields "" (unmapped) rather
+// than blocking the CPA request on N Host RPCs.
 func resolveNodeIDForAuth(store *stateStore, authKeys ...string) string {
+	if store == nil {
+		return ""
+	}
 	cache := refreshAuthProxyCache()
 	var proxy string
 	for _, k := range authKeys {
@@ -100,19 +116,12 @@ func resolveNodeIDForAuth(store *stateStore, authKeys ...string) string {
 			proxy = p
 			break
 		}
-		// try host get as fallback
-		if a, err := getAuthFile(k); err == nil && a.ProxyURL != "" {
-			proxy = a.ProxyURL
-			break
-		}
 	}
 	if proxy == "" {
 		return ""
 	}
-	for _, n := range store.listNodes() {
-		if n.ProxyURL == proxy {
-			return n.ID
-		}
+	if id := store.nodeIDByProxy(proxy); id != "" {
+		return id
 	}
 	return ""
 }
@@ -940,11 +949,14 @@ func startGuardWorker(ctx context.Context, store *stateStore) {
 	go func() {
 		t := time.NewTicker(30 * time.Second)
 		defer t.Stop()
+		tick := 0
 		for {
 			select {
 			case <-ctx.Done():
+				_ = store.Flush()
 				return
 			case <-t.C:
+				tick++
 				pol := store.policy()
 				now := float64(time.Now().Unix())
 				for _, n := range store.listNodes() {
@@ -961,7 +973,11 @@ func startGuardWorker(ctx context.Context, store *stateStore) {
 						}
 					}
 				}
-				refreshAssignedCounts(store)
+				// Assigned counts are maintained on rebalance/migrate; a slow
+				// background reconcile is enough for drift from external edits.
+				if tick%10 == 0 {
+					refreshAssignedCounts(store)
+				}
 			}
 		}
 	}()

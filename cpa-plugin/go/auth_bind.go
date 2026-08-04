@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
@@ -33,7 +34,80 @@ type authFile struct {
 	Raw      map[string]any
 }
 
+// auth list cache: avoids the host.auth.list + N×host.auth.get stampede on
+// every scheduler / usage / worker tick. Mutations patch the cache in place;
+// a 60s TTL still picks up external CPA auth changes.
+const authListCacheTTL = 60 * time.Second
+
+var (
+	authListMu      sync.Mutex
+	authListCache   []authFile
+	authListAt      time.Time
+	authListLoading bool
+	authListWait    = sync.NewCond(&authListMu)
+)
+
+func invalidateAuthListCache() {
+	authListMu.Lock()
+	authListCache = nil
+	authListAt = time.Time{}
+	authListMu.Unlock()
+}
+
+func cloneAuthFiles(in []authFile) []authFile {
+	if in == nil {
+		return nil
+	}
+	out := make([]authFile, len(in))
+	copy(out, in)
+	return out
+}
+
+// listAuthFiles returns xAI auth files, preferring a warm cache.
 func listAuthFiles() ([]authFile, error) {
+	return listAuthFilesCached(false)
+}
+
+// listAuthFilesFresh bypasses TTL (management UI, rebalance entry).
+func listAuthFilesFresh() ([]authFile, error) {
+	return listAuthFilesCached(true)
+}
+
+func listAuthFilesCached(force bool) ([]authFile, error) {
+	authListMu.Lock()
+	for authListLoading {
+		authListWait.Wait()
+	}
+	if !force && authListCache != nil && time.Since(authListAt) < authListCacheTTL {
+		out := cloneAuthFiles(authListCache)
+		authListMu.Unlock()
+		return out, nil
+	}
+	authListLoading = true
+	authListMu.Unlock()
+
+	loaded, err := fetchAuthFilesFromHost()
+
+	authListMu.Lock()
+	authListLoading = false
+	if err == nil {
+		authListCache = loaded
+		authListAt = time.Now()
+	}
+	out := cloneAuthFiles(authListCache)
+	authListWait.Broadcast()
+	authListMu.Unlock()
+	if err != nil {
+		if out != nil {
+			// serve stale on transient host errors to keep hot path alive
+			return out, nil
+		}
+		return nil, err
+	}
+	return out, nil
+}
+
+func fetchAuthFilesFromHost() ([]authFile, error) {
 	raw, err := hostCall(pluginabi.MethodHostAuthList, mustJSON(map[string]any{}))
 	if err != nil {
 		return nil, err
@@ -83,6 +157,37 @@ func listAuthFiles() ([]authFile, error) {
 		out = append(out, got)
 	}
 	return out, nil
+}
+
+// patchAuthListCacheAfterSave updates one entry after host.auth.save so migrate
+// of hundreds of accounts does not re-trigger N+1 list/get.
+func patchAuthListCacheAfterSave(name string, obj map[string]any) {
+	if name == "" || obj == nil {
+		return
+	}
+	proxy, _ := obj["proxy_url"].(string)
+	proxy = strings.TrimSpace(proxy)
+	disabled, _ := obj["disabled"].(bool)
+	email, _ := obj["email"].(string)
+
+	authListMu.Lock()
+	defer authListMu.Unlock()
+	if authListCache == nil {
+		return
+	}
+	for i := range authListCache {
+		a := &authListCache[i]
+		if a.Name != name && a.Index != name && a.ID != name {
+			continue
+		}
+		a.ProxyURL = proxy
+		a.Disabled = disabled
+		a.Raw = obj
+		if email != "" {
+			a.Email = email
+		}
+		return
+	}
 }
 
 func getAuthFile(authIndex string) (authFile, error) {
@@ -140,6 +245,8 @@ func saveAuthFile(name string, obj map[string]any) error {
 		"json": json.RawMessage(raw),
 	}))
 	if err == nil {
+		patchAuthListCacheAfterSave(name, obj)
+		// Rebuild proxy map from the patched list cache (no host round-trips).
 		invalidateAuthProxyCache()
 	}
 	return err
@@ -187,16 +294,15 @@ func verifyAuthBinding(a authFile, expectedProxy string, expectedDisabled bool) 
 		return nil
 	}
 	// A host may regenerate the runtime auth index after host.auth.save. Verify
-	// by the stable physical file name before treating the write as failed.
-	for _, candidate := range []string{a.Name, filepath.Base(a.Path)} {
+	// by stable name/path with single gets — never re-list the whole auth pool.
+	for _, candidate := range []string{a.Name, filepath.Base(a.Path), a.Index, a.ID} {
 		candidate = strings.TrimSpace(candidate)
-		if candidate == "" {
+		if candidate == "" || candidate == key {
 			continue
 		}
-		for _, listed := range listAuthFilesBestEffort() {
-			if listed.Name == candidate && listed.ProxyURL == expectedProxy && listed.Disabled == expectedDisabled {
-				return nil
-			}
+		got2, err2 := getAuthFile(candidate)
+		if err2 == nil && got2.ProxyURL == expectedProxy && got2.Disabled == expectedDisabled {
+			return nil
 		}
 	}
 	if err != nil {
@@ -214,7 +320,8 @@ func listAuthFilesBestEffort() []authFile {
 }
 
 func rebalanceAuthsToNodes(store *stateStore) (map[string]int, error) {
-	auths, err := listAuthFiles()
+	// Fresh list so operator-driven rebalance sees latest CPA auth files.
+	auths, err := listAuthFilesFresh()
 	if err != nil {
 		return nil, err
 	}
@@ -403,7 +510,8 @@ func listAuthsForNode(node *nodeRecord, limit int) ([]authFile, error) {
 
 // listBoundAuthSummaries returns lightweight account info for a node (no secrets).
 func listBoundAuthSummaries(node *nodeRecord) ([]map[string]any, error) {
-	auths, err := listAuthFiles()
+	// UI path: prefer fresh data so operators see post-rebalance bindings immediately.
+	auths, err := listAuthFilesFresh()
 	if err != nil {
 		return nil, err
 	}
@@ -457,7 +565,8 @@ func migrateAuthsOffNode(store *stateStore, bad *nodeRecord) error {
 	if bad == nil || bad.ProxyURL == "" {
 		return nil
 	}
-	auths, err := listAuthFiles()
+	// Force a fresh snapshot once; subsequent saves patch the cache in place.
+	auths, err := listAuthFilesFresh()
 	if err != nil {
 		return err
 	}

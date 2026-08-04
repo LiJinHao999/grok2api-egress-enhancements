@@ -75,7 +75,7 @@ import (
 
 const (
 	pluginName          = "grok2api-egress"
-	pluginVersion       = "1.0.5"
+	pluginVersion       = "1.0.7"
 	resourcePath        = "/status"
 	managementAPIPath   = "/v0/management/grok2api-egress/api"
 	resourceContentType = "text/html; charset=utf-8"
@@ -222,6 +222,10 @@ func cliproxyPluginFree(ptr unsafe.Pointer, len C.size_t) {
 func cliproxyPluginShutdown() {
 	if workerCancel != nil {
 		workerCancel()
+		workerCancel = nil
+	}
+	if store != nil {
+		_ = store.Flush()
 	}
 }
 
