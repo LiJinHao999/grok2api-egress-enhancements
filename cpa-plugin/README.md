@@ -213,13 +213,11 @@ plugins:
 
 ### 插件商店（推荐）
 
-在 CPA 管理中心打开插件商店，搜索 **Grok Egress Guard** 或插件 ID
-`grok2api-egress`，选择与 CPA 主机架构一致的版本安装。发布包提供
-`linux/amd64` 和 `linux/arm64`；商店会从 GitHub Release 下载并校验
-`checksums.txt`。升级时在同一条目选择新版本即可，状态文件不会随插件二进制覆盖。
+**当前状态**：官方源收录 PR 已开（[CLIProxyAPI-Plugins-Store#65](https://github.com/router-for-me/CLIProxyAPI-Plugins-Store/pull/65)）。合并前请先配置上一节的 `store-sources`，否则默认商店搜不到。
 
-如果商店暂未收录，可从仓库最新 Release 下载对应 zip，校验
-`checksums.txt` 后按下面的手动方式安装。
+配置源并重启后，在 CPA 管理中心打开插件商店，搜索 **Grok Egress Guard** 或插件 ID `grok2api-egress`，选择与 CPA 主机架构一致的版本安装。发布包提供 `linux/amd64` 和 `linux/arm64`；商店会从 GitHub Release 下载并校验 `checksums.txt`。升级时在同一条目选择新版本即可，状态文件不会随插件二进制覆盖。
+
+也可直接从仓库 [Release](https://github.com/lij768423-svg/grok2api-egress-enhancements/releases) 下载 zip，校验 `checksums.txt` 后按下面的手动方式安装。
 
 ### 手动安装
 
