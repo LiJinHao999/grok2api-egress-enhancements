@@ -181,6 +181,34 @@ go build -buildmode=c-shared -o grok2api-egress.so .
 
 ---
 
+## 插件商店搜不到？
+
+CPA 默认只加载**官方源**：
+
+```text
+https://raw.githubusercontent.com/router-for-me/CLIProxyAPI-Plugins-Store/main/registry.json
+```
+
+本插件已提交官方收录 PR（`grok2api-egress`）。**合并前**在 CPA 配置里加第三方源即可搜到并在线安装：
+
+```yaml
+plugins:
+  store-sources:
+    - "https://raw.githubusercontent.com/lij768423-svg/grok2api-egress-enhancements/main/cpa-plugin/registry.json"
+```
+
+重启 CPA 后，在插件商店搜索：
+
+- `grok2api-egress`
+- `Grok Egress`
+- `Egress` / `Grok`
+
+官方源合并后可去掉上面的 `store-sources`（也可保留，无影响）。
+
+手动安装（不走商店）见下方「安装（CPA）」。
+
+---
+
 ## 安装（CPA）
 
 ### 插件商店（推荐）
