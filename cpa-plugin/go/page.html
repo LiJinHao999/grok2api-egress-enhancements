@@ -180,10 +180,10 @@
     <header class="page-head">
       <div>
         <h1>出口守护</h1>
-        <p>纯 CPA 实现 · 出口质量隔离 · 节点 CRUD · 质量检测 · 账号通道绑定</p>
+        <p>纯 CPA 实现 · 可对接本机 Clash PerfectAI · 降智时 API 切换节点 · 质量检测</p>
       </div>
       <div class="head-actions">
-        <span class="status-line"><span id="service-dot" class="status-dot"></span><span id="service-text">正在连接</span></span>
+        <span class="status-line"><span id="service-dot" class="status-dot"></span><span id="service-text">正在连接</span><span id="plugin-version" style="margin-left:0.35rem;opacity:0.75"></span></span>
         <button id="theme-button" class="button icon ghost" type="button" title="切换深浅色" aria-label="切换深浅色">◐</button>
         <button id="refresh-button" class="button" type="button" title="刷新页面快照，不会立即运行真实模型质量检测">刷新显示</button>
       </div>
@@ -201,7 +201,9 @@
         <div><h2 id="nodes-title">出口节点</h2><p id="nodes-freshness">页面每 15 秒刷新；节点健康状态随请求审计或主动检测更新，代理凭据不会回显</p></div>
         <div class="toolbar">
           <input id="node-search" class="search" type="search" placeholder="搜索节点、IP 或 ID" aria-label="搜索节点">
-          <button id="rebalance-nodes" class="button" type="button" title="按启用节点把 CPA 账号 proxy_url 重新均分">重平衡账号</button>
+          <button id="edit-clash" class="button" type="button" title="选择策略组、填写 Clash API 端点">Clash 配置</button>
+          <button id="sync-clash" class="button" type="button" title="从当前策略组同步叶子节点">同步 Clash</button>
+          <button id="rebalance-nodes" class="button" type="button" title="账号统一绑到 Clash mixed-port，并由当前策略组出口承接">重平衡账号</button>
           <button id="bulk-add-node" class="button" type="button">批量添加</button>
           <button id="add-node" class="button primary" type="button">添加节点</button>
         </div>
@@ -242,6 +244,20 @@
         <dl id="policy-view" class="policy"></dl>
       </section>
     </div>
+
+    <section class="section" aria-labelledby="clash-title">
+      <div class="section-head">
+        <div>
+          <h2 id="clash-title">Clash 对接</h2>
+          <p id="clash-summary">可在面板选择策略组与 API 端点，无需改 CPA 主机配置</p>
+        </div>
+        <div class="toolbar">
+          <button id="edit-clash-secondary" class="button" type="button">编辑对接</button>
+          <button id="refresh-clash-groups" class="button" type="button" title="从 Clash 拉取策略组列表">刷新组</button>
+        </div>
+      </div>
+      <dl id="clash-view" class="policy"></dl>
+    </section>
   </main>
 
   <div id="node-modal" class="modal-layer" hidden>
@@ -272,6 +288,27 @@
     </section>
   </div>
 
+  <div id="clash-modal" class="modal-layer" hidden>
+    <section class="modal wide" role="dialog" aria-modal="true" aria-labelledby="clash-modal-title">
+      <div class="modal-head"><div><h3 id="clash-modal-title">Clash 对接</h3><p>面板配置会覆盖 YAML 默认值，方便朋友本机直接用</p></div><button class="button icon ghost" type="button" data-close="clash-modal" aria-label="关闭">×</button></div>
+      <form id="clash-form">
+        <div class="modal-body form-grid">
+          <div class="field full check-row"><label for="clash-enabled">启用 Clash 对接</label><input id="clash-enabled" type="checkbox"></div>
+          <div class="field full"><label for="clash-api-url">Clash API 端点</label><input id="clash-api-url" type="url" autocomplete="off" placeholder="http://172.19.0.1:7888"><p class="help">external-controller 地址；保存后立即生效</p></div>
+          <div class="field"><label for="clash-group">策略组</label><input id="clash-group" list="clash-group-options" autocomplete="off" placeholder="🏜️ PerfectAI" maxlength="200"><datalist id="clash-group-options"></datalist><p class="help">可手填，或点「拉取策略组」后从列表选</p></div>
+          <div class="field"><label for="clash-proxy-url">本机代理 URL</label><input id="clash-proxy-url" type="text" autocomplete="off" placeholder="http://172.19.0.1:7890"><p class="help">账号统一走的 mixed-port</p></div>
+          <div class="field full"><label for="clash-secret">API Secret</label><input id="clash-secret" type="password" autocomplete="new-password" placeholder="留空保留现有 secret"><p id="clash-secret-help" class="help">优先使用面板 secret；也可依赖主机环境变量</p></div>
+          <div class="field full check-row"><div><label for="clash-clear-secret">清除面板 secret</label><p class="help">勾选后改回使用环境变量 / YAML</p></div><input id="clash-clear-secret" type="checkbox"></div>
+        </div>
+        <div class="modal-actions">
+          <button id="load-clash-groups" class="button" type="button">拉取策略组</button>
+          <button class="button" type="button" data-close="clash-modal">取消</button>
+          <button id="save-clash" class="button primary" type="submit">保存</button>
+        </div>
+      </form>
+    </section>
+  </div>
+
   <div id="policy-modal" class="modal-layer" hidden>
     <section class="modal wide" role="dialog" aria-modal="true" aria-labelledby="policy-modal-title">
       <div class="modal-head"><div><h3 id="policy-modal-title">守护策略</h3><p>严格模式下只有真实模型质量检测健康才会恢复节点</p></div><button class="button icon ghost" type="button" data-close="policy-modal" aria-label="关闭">×</button></div>
@@ -291,6 +328,7 @@
           <div class="field"><label for="policy-model">主动探测模型</label><input id="policy-model" maxlength="120" autocomplete="off"></div>
           <div class="field"><label for="policy-min-healthy">最低健康节点数</label><input id="policy-min-healthy" type="number" min="1" max="1000"></div>
           <div class="field full check-row"><div><label for="policy-disable-auth">迁移失败时停用原节点账号</label><p class="help">启用可防止坏出口继续接收请求；手动停用账号不会被自动恢复</p></div><input id="policy-disable-auth" type="checkbox"></div>
+          <div class="field full"><label for="policy-isolation-keywords">响应关键词隔离</label><textarea id="policy-isolation-keywords" rows="4" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="ListMcpResourcesTool&#10;sensitive-tool-name"></textarea><p class="help">每行一个关键词；上游响应（含流式 chunk）命中任一关键词时，隔离当前出口。不检查请求 Body。留空关闭。</p></div>
         </div>
         <div class="modal-actions"><button class="button" type="button" data-close="policy-modal">取消</button><button id="save-policy" class="button primary" type="submit">保存策略</button></div>
       </form>
@@ -363,12 +401,24 @@
     async function api(path, options = {}) {
       const key = managementKey();
       if (!key) throw new Error('CPA 管理密钥未持久化，请重新登录管理面板并勾选“记住密码”');
-      const response = await fetch(MANAGEMENT_API, {
-        method: 'POST',
-        headers: {'Content-Type':'application/json','Accept':'application/json','Authorization':'Bearer ' + key,'X-Grok2API-Egress-UI':'1'},
-        body: JSON.stringify({method: options.method || 'GET', path, body: options.body}),
-        cache: 'no-store'
-      });
+      const controller = new AbortController();
+      const timeoutMs = Number(options.timeoutMs) > 0 ? Number(options.timeoutMs) : 20000;
+      const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+      let response;
+      try {
+        response = await fetch(MANAGEMENT_API, {
+          method: 'POST',
+          headers: {'Content-Type':'application/json','Accept':'application/json','Authorization':'Bearer ' + key,'X-Grok2API-Egress-UI':'1'},
+          body: JSON.stringify({method: options.method || 'GET', path, body: options.body}),
+          cache: 'no-store',
+          signal: controller.signal
+        });
+      } catch (error) {
+        if (error && error.name === 'AbortError') throw new Error('请求超时（' + Math.round(timeoutMs / 1000) + ' 秒），请重试');
+        throw error;
+      } finally {
+        window.clearTimeout(timer);
+      }
       const raw = await response.text();
       let payload = {};
       try { payload = raw ? JSON.parse(raw) : {}; } catch (_) { throw new Error('服务返回了无效数据'); }
@@ -391,8 +441,8 @@
       $('service-dot').className = 'status-dot ' + (ok ? 'good' : 'bad');
       $('service-text').textContent = text;
     }
-    async function load(silent = false) {
-      if (state.loading) return;
+    async function load(silent = false, force = false) {
+      if (state.loading && !force) return;
       state.loading = true;
       busy($('refresh-button'), true);
       try {
@@ -406,8 +456,10 @@
         state.selected = new Set([...state.selected].filter((id) => state.nodes.some((node) => node.id === id)));
         render();
         setService(true, status?.engine === 'cpa-native' ? 'CPA 原生守护' : '已连接');
+        if ($('plugin-version')) $('plugin-version').textContent = status?.version ? ('v' + status.version) : '';
       } catch (error) {
         setService(false, '连接失败');
+        if ($('plugin-version')) $('plugin-version').textContent = '';
         $('nodes-body').innerHTML = '<tr><td colspan="9" class="error-state">' + esc(error.message) + '</td></tr>';
         if (!silent) toast(error.message, 'error');
       } finally {
@@ -416,7 +468,7 @@
       }
     }
     function render() {
-      renderMetrics(); renderNodes(); renderStatistics(); renderEvents(); renderPolicy();
+      renderMetrics(); renderNodes(); renderStatistics(); renderEvents(); renderPolicy(); renderClash();
     }
     function renderMetrics() {
       const status = state.status || {};
@@ -431,6 +483,12 @@
       $('metric-model').textContent = status.config?.model || '-';
       $('metric-enabled').textContent = enabled + ' / ' + state.nodes.length;
       $('metric-total').textContent = '已启用 / 全部 CPA 出口节点';
+      const clash = status.clash || {};
+      if (clash.enabled) {
+        $('nodes-freshness').textContent = (clash.reachable ? 'Clash 已连接 · 组 ' + (clash.group || '-') + ' · 当前 ' + (clash.now || '-') : 'Clash 未连通：' + (clash.message || '-')) + '；节点健康随请求审计或主动检测更新';
+      } else {
+        $('nodes-freshness').textContent = '页面每 15 秒刷新；未启用 Clash 对接时仍可手动管理代理节点';
+      }
       $('metric-quarantined').textContent = String(quarantined);
       $('metric-quarantined').className = 'metric-value ' + (quarantined ? 'tone-bad' : 'tone-good');
       $('metric-next').textContent = quarantined ? '等待真实模型复测' : '当前无隔离节点';
@@ -438,16 +496,19 @@
     function filteredNodes() {
       const query = state.search.trim().toLowerCase();
       if (!query) return state.nodes;
-      return state.nodes.filter((node) => [node.id,node.name,node.exitIp].some((value) => String(value || '').toLowerCase().includes(query)));
+      return state.nodes.filter((node) => [node.id,node.name,node.exitIp,node.clashName,node.clashGroup,node.source].some((value) => String(value || '').toLowerCase().includes(query)));
     }
     function nodeGuard(node) { return state.status?.nodes?.[node.id] || {}; }
     function nodeBadge(node, guard) {
       if (guard.disabled_by_guard) return '<span class="badge bad">已隔离</span>';
       if (!node.enabled) return '<span class="badge muted">已停用</span>';
-      if (guard.error_strikes) return '<span class="badge warn">检测失败</span>';
-      if (guard.last_classification === 'hard' || guard.last_classification === 'soft') return '<span class="badge warn">可疑</span>';
-      if (guard.last_classification === 'healthy') return '<span class="badge good">健康</span>';
-      return '<span class="badge muted">待检测</span>';
+      let extra = '';
+      if (node.source === 'clash' && (node.clashActive || guard.clash_active)) extra = '<span class="badge good">Clash 当前</span> ';
+      else if (node.source === 'clash') extra = '<span class="badge muted">Clash</span> ';
+      if (guard.error_strikes) return extra + '<span class="badge warn">检测失败</span>';
+      if (guard.last_classification === 'hard' || guard.last_classification === 'soft') return extra + '<span class="badge warn">可疑</span>';
+      if (guard.last_classification === 'healthy') return extra + '<span class="badge good">健康</span>';
+      return extra + '<span class="badge muted">待检测</span>';
     }
     function quarantineCountdown(guard) {
       const until = Number(guard.quarantined_until || 0);
@@ -470,8 +531,17 @@
       return Math.ceil(left / 60) + ' 分钟后主动检测';
     }
     function actionButtons(node) {
+      const guard = nodeGuard(node);
+      const clashBtn = node.source === 'clash'
+        ? '<button class="button" type="button" data-action="clash-select" title="通过 Clash API 切换策略组到该节点">切换</button>'
+        : '';
+      const quarantineBtn = guard.disabled_by_guard
+        ? '<button class="button" type="button" data-action="restore" title="清除降智隔离，恢复调度">恢复</button>'
+        : '<button class="button danger" type="button" data-action="quarantine" title="人工标记降智并隔离该出口">降智隔离</button>';
       return '<div class="row-actions">' +
-        '<button class="button" type="button" data-action="quality" title="真实模型质量检测">质量</button>' +
+        clashBtn +
+        quarantineBtn +
+        '<button class="button" type="button" data-action="quality" title="真实模型质量检测（Clash 节点会先切换）">质量</button>' +
         '<button class="button" type="button" data-action="connectivity" title="检查代理连通性">连通</button>' +
         '<button class="button ghost" type="button" data-action="accounts" title="查看绑定账号">账号</button>' +
         '<button class="button ghost" type="button" data-action="edit">编辑</button>' +
@@ -542,15 +612,38 @@
     function renderEvents() {
       const events = state.status?.recentEvents || [];
       if (!events.length) { $('events-list').innerHTML = '<div class="empty">暂无守护事件</div>'; return; }
-      const names = {node_quarantined:'节点已隔离',node_restored:'节点已恢复',quality_probe_completed:'质量检测完成',node_rotated:'出口 IP 已轮换',node_rotation_failed:'换 IP 失败',quarantine_suppressed:'隔离已抑制',accounts_migrated:'账号已迁移',accounts_migration_failed:'账号迁移失败'};
+      const names = {node_quarantined:'节点已隔离',node_restored:'节点已恢复',quality_probe_completed:'质量检测完成',node_rotated:'出口 IP 已轮换',node_rotation_failed:'换 IP 失败',quarantine_suppressed:'隔离已抑制',accounts_migrated:'账号已迁移',accounts_migration_failed:'账号迁移失败',clash_nodes_synced:'Clash 节点已同步',clash_sync_failed:'Clash 同步失败',clash_switched:'Clash 已切换',clash_switch_failed:'Clash 切换失败',keyword_isolated:'关键词隔离',manual_quarantine:'人工降智隔离'};
       $('events-list').innerHTML = events.slice().reverse().map((event) => '<div class="event"><div><strong>' + esc(names[event.event] || event.event || '守护事件') + ' · ' + esc(event.node_name || ('节点 ' + event.node_id)) + '</strong><small>' + esc(event.reason || event.classification || '-') + (event.output_tps ? ' · ' + Number(event.output_tps).toFixed(1) + ' Token/s' : '') + '</small></div><time>' + relative(event.ts) + '</time></div>').join('');
     }
     function renderPolicy() {
       const cfg = state.status?.config;
       $('edit-policy').disabled = !cfg;
       if (!cfg) { $('policy-view').innerHTML = '<div class="empty">策略状态不可用</div>'; return; }
-      const values = [['模式',modeName(cfg.mode)],['主动间隔',cfg.active_interval_seconds + ' 秒'],['被动轮询',cfg.passive_poll_seconds + ' 秒'],['软 / 硬阈值',cfg.soft_tps + ' / ' + cfg.hard_tps],['连续异常',cfg.consecutive_soft + ' / ' + cfg.consecutive_errors],['最短生成窗口',(cfg.min_generation_ms || 1000) + ' ms'],['最小判定 Token',cfg.min_output_tokens || 32],['隔离复测',cfg.quarantine_seconds + ' 秒'],['最低健康节点',cfg.min_healthy_nodes],['探测输出',(cfg.max_output_tokens || 384) + ' Token'],['模型',cfg.model],['迁移失败停用',cfg.disable_auth_on_hard ? '是' : '否']];
+      const keywords = Array.isArray(cfg.isolation_keywords) ? cfg.isolation_keywords.filter(Boolean) : [];
+      const values = [['模式',modeName(cfg.mode)],['主动间隔',cfg.active_interval_seconds + ' 秒'],['被动轮询',cfg.passive_poll_seconds + ' 秒'],['软 / 硬阈值',cfg.soft_tps + ' / ' + cfg.hard_tps],['连续异常',cfg.consecutive_soft + ' / ' + cfg.consecutive_errors],['最短生成窗口',(cfg.min_generation_ms || 1000) + ' ms'],['最小判定 Token',cfg.min_output_tokens || 32],['隔离复测',cfg.quarantine_seconds + ' 秒'],['最低健康节点',cfg.min_healthy_nodes],['探测输出',(cfg.max_output_tokens || 384) + ' Token'],['模型',cfg.model],['迁移失败停用',cfg.disable_auth_on_hard ? '是' : '否'],['关键词隔离',keywords.length ? (keywords.length + ' 条 · ' + keywords.slice(0, 3).join(' / ') + (keywords.length > 3 ? ' …' : '')) : '关闭']];
       $('policy-view').innerHTML = values.map((value) => '<div><dt>' + value[0] + '</dt><dd>' + esc(value[1]) + '</dd></div>').join('');
+    }
+    function renderClash() {
+      const clash = state.status?.clash || {};
+      const cfg = clash.config || {};
+      const reachable = Boolean(clash.reachable);
+      const enabled = Boolean(clash.enabled ?? cfg.enabled);
+      if ($('clash-summary')) {
+        $('clash-summary').textContent = enabled
+          ? ((reachable ? '已连接' : '未连通') + ' · 组 ' + (clash.group || cfg.group || '-') + ' · 当前 ' + (clash.now || '-') + (cfg.ui_override ? ' · 面板覆盖' : ''))
+          : '未启用；点「Clash 配置」填写 API 与策略组即可给朋友用';
+      }
+      if (!$('clash-view')) return;
+      const values = [
+        ['状态', enabled ? (reachable ? '已连接' : ('未连通：' + (clash.message || '-'))) : '未启用'],
+        ['策略组', clash.group || cfg.group || '-'],
+        ['当前出口', clash.now || '-'],
+        ['API 端点', clash.api_url || cfg.api_url || '-'],
+        ['本机代理', clash.proxy_url || cfg.proxy_url || '-'],
+        ['Secret', (clash.has_secret || cfg.has_secret) ? '已配置' : '未配置'],
+        ['覆盖来源', cfg.ui_override ? '面板' : 'YAML / 默认']
+      ];
+      $('clash-view').innerHTML = values.map((value) => '<div><dt>' + value[0] + '</dt><dd title="' + esc(value[1]) + '">' + esc(value[1]) + '</dd></div>').join('');
     }
     function openModal(id) { $(id).hidden = false; document.body.style.overflow = 'hidden'; $(id).querySelector('input,select,textarea,button')?.focus(); }
     function closeModal(id) {
@@ -578,6 +671,7 @@
       $('policy-mode').value = cfg.mode; $('policy-active').value = cfg.active_interval_seconds; $('policy-passive').value = cfg.passive_poll_seconds;
       $('policy-quarantine').value = cfg.quarantine_seconds; $('policy-soft').value = cfg.soft_tps; $('policy-hard').value = cfg.hard_tps;
       $('policy-soft-count').value = cfg.consecutive_soft; $('policy-error-count').value = cfg.consecutive_errors; $('policy-min-generation').value = cfg.min_generation_ms || 1000; $('policy-min-output').value = cfg.min_output_tokens || 32; $('policy-max-output').value = cfg.max_output_tokens || 384; $('policy-model').value = cfg.model || 'grok-4.5'; $('policy-disable-auth').checked = cfg.disable_auth_on_hard !== false; $('policy-min-healthy').value = cfg.min_healthy_nodes;
+      $('policy-isolation-keywords').value = Array.isArray(cfg.isolation_keywords) ? cfg.isolation_keywords.filter(Boolean).join('\n') : '';
       openModal('policy-modal');
     }
     function parseBulkNodes(raw) {
@@ -619,19 +713,43 @@
     function confirmAction(title, message, action) {
       $('confirm-title').textContent = title; $('confirm-message').textContent = message; state.confirm = action; openModal('confirm-modal');
     }
-    async function mutate(button, task, success) {
+    async function mutate(button, task, success, after) {
       busy(button, true);
-      try { await task(); toast(success); closeModal('confirm-modal'); await load(true); }
-      catch (error) { toast(error.message, 'error'); }
-      finally { busy(button, false); }
+      try {
+        await task();
+        toast(success);
+        closeModal('confirm-modal');
+        state.confirm = null;
+        if (typeof after === 'function') after();
+        await load(true, true);
+      } catch (error) {
+        toast(error.message, 'error');
+      } finally {
+        busy(button, false);
+      }
     }
     async function toggleNodes(ids, enabled, button) {
       await mutate(button, () => api('/nodes/batch', {method:'PATCH', body:{ids,enabled}}), (enabled ? '已启用 ' : '已停用 ') + ids.length + ' 个节点');
       state.selected.clear();
     }
     async function deleteNodes(ids, button) {
-      await mutate(button, () => api('/nodes', {method:'DELETE', body:{ids}}), '已删除 ' + ids.length + ' 个节点');
-      state.selected.clear();
+      const idSet = new Set(ids);
+      busy(button, true);
+      try {
+        await api('/nodes', {method:'DELETE', body:{ids}, timeoutMs: 15000});
+        state.nodes = state.nodes.filter((node) => !idSet.has(node.id));
+        state.selected = new Set([...state.selected].filter((id) => !idSet.has(id)));
+        render();
+        toast('已删除 ' + ids.length + ' 个节点');
+        closeModal('confirm-modal');
+        state.confirm = null;
+        // Background refresh; do not keep the confirm button spinning on host auth fan-out.
+        load(true, true).catch(() => {});
+      } catch (error) {
+        toast(error.message, 'error');
+      } finally {
+        busy(button, false);
+      }
     }
     async function testConnectivity(ids, button) {
       await mutate(button, () => api('/nodes/test', {method:'POST', body:{ids}}), '连通性检测完成');
@@ -665,6 +783,114 @@
       } catch (error) { toast(error.message, 'error'); }
       finally { busy(button, false); }
     }
+    async function selectClashNode(node, button) {
+      busy(button, true);
+      try {
+        const result = await api('/nodes/' + encodeURIComponent(node.id) + '/select', {method:'POST'});
+        const data = result.data || result;
+        toast('已切换 Clash 到：' + (data.now || node.clashName || node.name));
+        await load(true);
+      } catch (error) { toast(error.message, 'error'); }
+      finally { busy(button, false); }
+    }
+    async function quarantineNode(node, button) {
+      confirmAction('降智隔离', '将标记“' + node.name + '”为降智并隔离。Clash 节点会自动切到其他健康出口。', async (confirmButton) => {
+        await mutate(confirmButton, () => api('/nodes/' + encodeURIComponent(node.id) + '/quarantine', {method:'POST', body:{reason:'人工降智隔离'}}), '已降智隔离：' + node.name);
+      });
+    }
+    async function restoreNode(node, button) {
+      await mutate(button, () => api('/nodes/' + encodeURIComponent(node.id) + '/restore', {method:'POST'}), '已恢复：' + node.name);
+    }
+    async function syncClash(button) {
+      busy(button, true);
+      try {
+        const result = await api('/clash/sync', {method:'POST'});
+        const data = result.data || result;
+        toast('已同步 Clash 节点 ' + Number(data.leaf_count || 0) + ' 个（新建 ' + Number(data.created || 0) + '）· 组 ' + (data.group || ''));
+        await load(true);
+      } catch (error) { toast(error.message, 'error'); }
+      finally { busy(button, false); }
+    }
+    async function fillClashGroupOptions() {
+      const list = $('clash-group-options');
+      if (!list) return;
+      try {
+        const result = await api('/clash/groups');
+        const items = result.items || result.data?.items || [];
+        list.innerHTML = items.map((item) => {
+          const name = item.name || item;
+          const label = name + (item.type ? (' · ' + item.type) : '') + (item.now ? (' · 当前 ' + item.now) : '');
+          return '<option value="' + esc(name) + '">' + esc(label) + '</option>';
+        }).join('');
+        return items;
+      } catch (error) {
+        list.innerHTML = '';
+        throw error;
+      }
+    }
+    async function openClash() {
+      const clash = state.status?.clash || {};
+      const cfg = clash.config || {};
+      $('clash-enabled').checked = Boolean(clash.enabled ?? cfg.enabled);
+      $('clash-api-url').value = cfg.api_url || clash.api_url || '';
+      $('clash-group').value = cfg.group || clash.group || '';
+      // Do not re-fill redacted proxy secrets (***); leave blank to keep existing.
+      const proxyShown = cfg.proxy_url || clash.proxy_url || '';
+      $('clash-proxy-url').value = proxyShown.includes('***') ? '' : proxyShown;
+      $('clash-proxy-url').placeholder = proxyShown.includes('***') ? (proxyShown + '（留空保留）') : 'http://172.19.0.1:7890';
+      $('clash-secret').value = '';
+      $('clash-clear-secret').checked = false;
+      $('clash-secret-help').textContent = (clash.has_secret || cfg.has_secret)
+        ? '已配置 secret；留空表示保留，勾选清除则改回环境变量 / YAML'
+        : '尚未配置 secret；可填写或依赖主机环境变量';
+      openModal('clash-modal');
+      fillClashGroupOptions().catch(() => {});
+    }
+    $('sync-clash').addEventListener('click', (event) => syncClash(event.currentTarget));
+    $('edit-clash')?.addEventListener('click', () => openClash());
+    $('edit-clash-secondary')?.addEventListener('click', () => openClash());
+    $('refresh-clash-groups')?.addEventListener('click', async (event) => {
+      const button = event.currentTarget;
+      busy(button, true);
+      try {
+        const items = await fillClashGroupOptions();
+        toast('已拉取 ' + (items?.length || 0) + ' 个策略组');
+        openClash();
+      } catch (error) { toast(error.message, 'error'); }
+      finally { busy(button, false); }
+    });
+    $('load-clash-groups')?.addEventListener('click', async (event) => {
+      const button = event.currentTarget;
+      busy(button, true);
+      try {
+        const items = await fillClashGroupOptions();
+        toast('已拉取 ' + (items?.length || 0) + ' 个策略组，可在输入框下拉选择');
+      } catch (error) { toast(error.message, 'error'); }
+      finally { busy(button, false); }
+    });
+    $('clash-form')?.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const button = $('save-clash');
+      const body = {
+        enabled: $('clash-enabled').checked,
+        api_url: $('clash-api-url').value.trim(),
+        group: $('clash-group').value.trim(),
+        proxy_url: $('clash-proxy-url').value.trim(),
+        clear_secret: $('clash-clear-secret').checked
+      };
+      const secret = $('clash-secret').value.trim();
+      if (secret) body.secret = secret;
+      if (!body.api_url && body.enabled) { toast('请填写 Clash API 端点', 'error'); return; }
+      if (!body.group && body.enabled) { toast('请填写或选择策略组', 'error'); return; }
+      busy(button, true);
+      try {
+        await api('/clash/config', {method:'PUT', body});
+        toast('Clash 对接已保存');
+        closeModal('clash-modal');
+        await load(true, true);
+      } catch (error) { toast(error.message, 'error'); }
+      finally { busy(button, false); }
+    });
     $('refresh-button').addEventListener('click', () => load());
     $('theme-button').addEventListener('click', () => {
       const dark = document.documentElement.dataset.theme === 'dark';
@@ -703,6 +929,9 @@
       const node = state.nodes.find((item) => item.id === row.dataset.id); if (!node) return;
       const action = control.dataset.action;
       if (action === 'select') { control.checked ? state.selected.add(node.id) : state.selected.delete(node.id); renderNodes(); }
+      if (action === 'clash-select') selectClashNode(node, control);
+      if (action === 'quarantine') quarantineNode(node, control);
+      if (action === 'restore') restoreNode(node, control);
       if (action === 'edit') openNode(node);
       if (action === 'toggle') toggleNodes([node.id], !node.enabled, control);
       if (action === 'connectivity') testConnectivity([node.id], control);
@@ -753,7 +982,8 @@
     $('policy-form').addEventListener('submit', async (event) => {
       event.preventDefault();
       const button = $('save-policy');
-      const body = {mode:$('policy-mode').value,activeIntervalSeconds:Number($('policy-active').value),passivePollSeconds:Number($('policy-passive').value),softTPS:Number($('policy-soft').value),hardTPS:Number($('policy-hard').value),consecutiveSoft:Number($('policy-soft-count').value),consecutiveErrors:Number($('policy-error-count').value),minGenerationMs:Number($('policy-min-generation').value),minOutputTokens:Number($('policy-min-output').value),maxOutputTokens:Number($('policy-max-output').value),model:$('policy-model').value.trim(),disableAuthOnHard:$('policy-disable-auth').checked,quarantineSeconds:Number($('policy-quarantine').value),minHealthyNodes:Number($('policy-min-healthy').value)};
+      const isolationKeywords = ($('policy-isolation-keywords').value || '').split(/\r?\n|[,;]/).map((item) => item.trim()).filter(Boolean);
+      const body = {mode:$('policy-mode').value,activeIntervalSeconds:Number($('policy-active').value),passivePollSeconds:Number($('policy-passive').value),softTPS:Number($('policy-soft').value),hardTPS:Number($('policy-hard').value),consecutiveSoft:Number($('policy-soft-count').value),consecutiveErrors:Number($('policy-error-count').value),minGenerationMs:Number($('policy-min-generation').value),minOutputTokens:Number($('policy-min-output').value),maxOutputTokens:Number($('policy-max-output').value),model:$('policy-model').value.trim(),disableAuthOnHard:$('policy-disable-auth').checked,quarantineSeconds:Number($('policy-quarantine').value),minHealthyNodes:Number($('policy-min-healthy').value),isolationKeywords};
       if (body.softTPS >= body.hardTPS) { toast('软阈值必须低于硬阈值', 'error'); return; }
       busy(button, true);
       try { await api('/quality-guard/config', {method:'PUT', body}); toast('守护策略已保存'); closeModal('policy-modal'); await load(true); }
@@ -762,7 +992,7 @@
     });
     document.addEventListener('click', (event) => { const close = event.target.closest('[data-close]'); if (close) closeModal(close.dataset.close); });
     $('confirm-action').addEventListener('click', () => { if (state.confirm) state.confirm($('confirm-action')); });
-    document.addEventListener('keydown', (event) => { if (event.key === 'Escape') ['node-modal','bulk-node-modal','policy-modal','confirm-modal','accounts-modal'].forEach((id) => { if (!$(id).hidden) closeModal(id); }); });
+    document.addEventListener('keydown', (event) => { if (event.key === 'Escape') ['node-modal','bulk-node-modal','policy-modal','clash-modal','confirm-modal','accounts-modal'].forEach((id) => { if (!$(id).hidden) closeModal(id); }); });
     const savedTheme = localStorage.getItem('grok2api-egress-theme');
     document.documentElement.dataset.theme = savedTheme || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
     load();

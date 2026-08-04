@@ -22,8 +22,6 @@ func computeTPS(outputTokens, durationMs, firstTokenMs, minGenerationMs int64) f
 		return 0
 	}
 	denom := durationMs - firstTokenMs
-	// Short replies often have firstToken ≈ duration, which blows up TPS and
-	// false-triggers hard quarantine. Require a configurable generation window.
 	if minGenerationMs <= 0 {
 		minGenerationMs = 1000
 	}
@@ -33,11 +31,9 @@ func computeTPS(outputTokens, durationMs, firstTokenMs, minGenerationMs int64) f
 	if denom < minGenerationMs {
 		return 0
 	}
-	// Ignore tiny outputs for hard-class decisions upstream; still return TPS.
 	return float64(outputTokens) / (float64(denom) / 1000.0)
 }
 
-// authProxyCache maps auth id/index/name → proxy_url (refreshed periodically).
 var (
 	authProxyMu    sync.Mutex
 	authProxyCache map[string]string
@@ -100,17 +96,58 @@ func resolveNodeIDForAuth(store *stateStore, authKeys ...string) string {
 			proxy = p
 			break
 		}
-		// try host get as fallback
 		if a, err := getAuthFile(k); err == nil && a.ProxyURL != "" {
 			proxy = a.ProxyURL
 			break
 		}
 	}
 	if proxy == "" {
+		// Clash mode: even without per-auth proxy, attribute to the active leaf.
+		return activeClashNodeID(store)
+	}
+	matches := make([]*nodeRecord, 0)
+	for _, n := range store.listNodes() {
+		if n.ProxyURL == proxy {
+			matches = append(matches, n)
+		}
+	}
+	if len(matches) == 0 {
+		return activeClashNodeID(store)
+	}
+	if len(matches) == 1 {
+		return matches[0].ID
+	}
+	// Shared mixed-port (Clash): multiple nodes share one proxy_url. Attribute
+	// passive usage to the currently selected PerfectAI leaf.
+	for _, n := range matches {
+		if n.Source == nodeSourceClash && n.ClashActive && !n.DisabledByGuard {
+			return n.ID
+		}
+	}
+	for _, n := range matches {
+		if n.Source == nodeSourceClash && n.ClashActive {
+			return n.ID
+		}
+	}
+	for _, n := range matches {
+		if n.Enabled && !n.DisabledByGuard {
+			return n.ID
+		}
+	}
+	return matches[0].ID
+}
+
+func activeClashNodeID(store *stateStore) string {
+	if store == nil {
 		return ""
 	}
 	for _, n := range store.listNodes() {
-		if n.ProxyURL == proxy {
+		if n.Source == nodeSourceClash && n.ClashActive && n.Enabled && !n.DisabledByGuard {
+			return n.ID
+		}
+	}
+	for _, n := range store.listNodes() {
+		if n.Source == nodeSourceClash && n.ClashActive {
 			return n.ID
 		}
 	}
@@ -130,9 +167,6 @@ func classifyTPS(tps float64, soft, hard float64) string {
 	return "healthy"
 }
 
-// classifyQuality applies the minimum-evidence guard before TPS thresholds.
-// Tiny responses are not enough evidence to call an egress degraded: provider
-// usage fields can be missing or generation may have ended immediately.
 func classifyQuality(tps float64, outputTokens int64, pol policyConfig) string {
 	if outputTokens <= 0 || tps <= 0 {
 		return "unknown"
@@ -177,9 +211,6 @@ func maxInt64(values ...int64) int64 {
 	return result
 }
 
-// outputTokensFromUsage normalizes CPA/OpenAI-compatible aliases. In CPA's
-// xAI usage contract, completion_tokens/output_tokens are aliases and
-// reasoning_tokens is a detail bucket, so summing them double-counts output.
 func outputTokensFromUsage(usage map[string]any) int64 {
 	if usage == nil {
 		return 0
@@ -323,8 +354,6 @@ func rotateNodeIfConfigured(store *stateStore, node *nodeRecord) (bool, error) {
 }
 
 func applyGrokClientHeaders(req *http.Request, auth authFile) {
-	// Always force Grok CLI headers — missing X-XAI-Token-Auth yields
-	// upstream 401 "x_xai_token_auth=none / no auth context".
 	req.Header.Set("X-XAI-Token-Auth", "xai-grok-cli")
 	req.Header.Set("x-grok-client-version", "0.2.93")
 	req.Header.Set("x-grok-client-identifier", "grok-shell")
@@ -336,7 +365,6 @@ func applyGrokClientHeaders(req *http.Request, auth authFile) {
 			}
 		}
 	}
-	// Re-assert critical headers after auth map copy (auth may contain empty values).
 	if req.Header.Get("X-XAI-Token-Auth") == "" {
 		req.Header.Set("X-XAI-Token-Auth", "xai-grok-cli")
 	}
@@ -353,13 +381,11 @@ func isAuthExpired(auth authFile) bool {
 	if exp == "" {
 		return false
 	}
-	// accept RFC3339 / RFC3339Nano / trailing Z variants
 	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
 		if t, err := time.Parse(layout, exp); err == nil {
 			return time.Now().After(t.Add(-2 * time.Minute))
 		}
 	}
-	// bare "2026-08-02T05:04:09Z" already RFC3339
 	if t, err := time.Parse("2006-01-02T15:04:05Z07:00", exp); err == nil {
 		return time.Now().After(t.Add(-2 * time.Minute))
 	}
@@ -387,7 +413,6 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 		return res
 	}
 
-	// connectivity first for exit IP
 	if ip, _, errIP := probeConnectivity(node.ProxyURL); errIP == nil {
 		res.ExitIP = ip
 	}
@@ -435,7 +460,6 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 			continue
 		}
 		if isAuthExpired(auth) && i+1 < len(candidates) {
-			// Prefer non-expired accounts first; last candidate still tried.
 			continue
 		}
 		baseURL, _ := auth.Raw["base_url"].(string)
@@ -473,8 +497,6 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 			res.ErrorKind = classifyFailureKind(resp.StatusCode, string(b))
 			res.DurationMs = time.Since(start).Milliseconds()
 			if (res.ErrorKind == "account_error" || isAuthErrorRetryable(resp.StatusCode, string(b))) && i+1 < len(candidates) {
-				// Account/quota errors belong to the credential, not the egress.
-				// Try another account on the same channel before classifying it.
 				continue
 			}
 			res.Classification = "error"
@@ -544,8 +566,6 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 		if !firstTokenAt.IsZero() {
 			res.FirstTokenMs = firstTokenAt.Sub(start).Milliseconds()
 		}
-		// CPA's xAI usage contract treats reasoning tokens as a subset of output
-		// tokens. Prefer the authoritative total instead of adding the buckets.
 		outTokens := usageOut
 		if usageReason > outTokens {
 			outTokens = usageReason
@@ -662,9 +682,6 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 		return
 	}
 	if res.Classification == "ignored" {
-		// Account, quota, upstream and no-account failures are not evidence that
-		// the egress is degraded. Keep the observation for diagnostics, but never
-		// spend error strikes or quarantine the node for them.
 		store.bumpStat(source, "ignored", res.OutputTokens)
 		return
 	}
@@ -680,6 +697,16 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 }
 
 func quarantineNode(store *stateStore, nodeID, reason string, tps float64, class string) {
+	_, _ = quarantineNodeOpts(store, nodeID, reason, tps, class, false)
+}
+
+// quarantineNodeOpts isolates a node. When force is true (manual panel
+// "降智隔离"), MinHealthyNodes suppression is bypassed so operators can always
+// mark a degraded exit even if it is the last healthy one.
+func quarantineNodeOpts(store *stateStore, nodeID, reason string, tps float64, class string, force bool) (*nodeRecord, error) {
+	if store == nil {
+		return nil, fmt.Errorf("store 未初始化")
+	}
 	pol := store.policy()
 	enabledHealthy := 0
 	var target *nodeRecord
@@ -693,32 +720,62 @@ func quarantineNode(store *stateStore, nodeID, reason string, tps float64, class
 		}
 	}
 	if target == nil {
-		return
+		return nil, fmt.Errorf("节点不存在")
 	}
-	if enabledHealthy < pol.MinHealthyNodes {
+	if target.DisabledByGuard {
+		// Already quarantined — refresh reason / countdown for manual re-mark.
+		updated, err := store.updateNode(nodeID, func(n *nodeRecord) error {
+			n.QuarantinedUntil = float64(time.Now().Add(time.Duration(pol.QuarantineSec) * time.Second).Unix())
+			n.LastReason = reason
+			if class != "" {
+				n.LastClassification = class
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		return updated, nil
+	}
+	if !force && enabledHealthy < pol.MinHealthyNodes {
 		store.bumpAction("suppressed")
 		store.appendEvent(guardEvent{Event: "quarantine_suppressed", NodeID: target.ID, NodeName: target.Name, Reason: "低于最低健康节点数", OutputTPS: tps})
-		_, _ = store.updateNode(nodeID, func(n *nodeRecord) error {
+		updated, err := store.updateNode(nodeID, func(n *nodeRecord) error {
 			n.LastReason = "隔离已抑制: " + reason
 			return nil
 		})
-		return
+		if err != nil {
+			return nil, err
+		}
+		return updated, fmt.Errorf("隔离已抑制：健康节点数低于下限 %d", pol.MinHealthyNodes)
 	}
 	updated, err := store.updateNode(nodeID, func(n *nodeRecord) error {
 		n.DisabledByGuard = true
 		n.QuarantinedUntil = float64(time.Now().Add(time.Duration(pol.QuarantineSec) * time.Second).Unix())
 		n.LastReason = reason
+		if class != "" {
+			n.LastClassification = class
+		}
 		return nil
 	})
 	if err != nil || updated == nil {
-		return
+		if err == nil {
+			err = fmt.Errorf("隔离失败")
+		}
+		return nil, err
 	}
 	store.bumpAction("quarantined")
 	store.appendEvent(guardEvent{Event: "node_quarantined", NodeID: updated.ID, NodeName: updated.Name, Reason: reason, Classification: class, OutputTPS: tps})
-	// Move accounts off the bad channel synchronously. The first phase disables
-	// them, so no new request can continue using the quarantined egress while
-	// migration and post-save verification are in flight.
-	if err := migrateAuthsOffNode(store, updated); err != nil {
+	// Clash-sourced nodes share one mixed-port URL. The real recovery action is
+	// switching 🏜️ PerfectAI (or configured group) to another healthy leaf.
+	if updated.Source == nodeSourceClash {
+		if err := switchClashAwayFromNode(store, updated); err != nil {
+			store.appendEvent(guardEvent{Event: "clash_switch_failed", NodeID: updated.ID, NodeName: updated.Name, Reason: err.Error()})
+			if pol.DisableAuthOnHard {
+				_ = disableAuthsOnNode(store, updated, "egress-guard 降智隔离: "+reason)
+			}
+		}
+	} else if err := migrateAuthsOffNode(store, updated); err != nil {
 		store.appendEvent(guardEvent{Event: "accounts_migration_failed", NodeID: updated.ID, NodeName: updated.Name, Reason: err.Error()})
 		if pol.DisableAuthOnHard {
 			_ = disableAuthsOnNode(store, updated, "egress-guard 降智隔离: "+reason)
@@ -727,11 +784,60 @@ func quarantineNode(store *stateStore, nodeID, reason string, tps float64, class
 	if rotated, err := rotateNodeIfConfigured(store, updated); err != nil {
 		store.appendEvent(guardEvent{Event: "node_rotation_failed", NodeID: updated.ID, NodeName: updated.Name, Reason: err.Error()})
 	} else if rotated {
-		// A newly rotated IP gets exactly one real-model confirmation before it
-		// can leave quarantine. A healthy result restores the node; anomalies keep
-		// it isolated for the normal recovery worker.
 		_, _ = runNodeQuality(store, updated.ID)
 	}
+	return updated, nil
+}
+
+// manualQuarantineNode is the panel "降智隔离" action: always force-isolate.
+func manualQuarantineNode(store *stateStore, nodeID, reason string) (*nodeRecord, error) {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "人工降智隔离"
+	}
+	if len(reason) > 240 {
+		reason = reason[:240]
+	}
+	return quarantineNodeOpts(store, nodeID, reason, 0, "manual", true)
+}
+
+// restoreQuarantinedNode clears guard isolation so the node can be scheduled again.
+func restoreQuarantinedNode(store *stateStore, nodeID string) (*nodeRecord, error) {
+	if store == nil {
+		return nil, fmt.Errorf("store 未初始化")
+	}
+	n, ok := store.getNode(nodeID)
+	if !ok {
+		return nil, fmt.Errorf("节点不存在")
+	}
+	if !n.DisabledByGuard {
+		return n, nil
+	}
+	updated, err := store.updateNode(nodeID, func(node *nodeRecord) error {
+		node.DisabledByGuard = false
+		node.QuarantinedUntil = 0
+		node.SoftStrikes = 0
+		node.ErrorStrikes = 0
+		node.LastReason = "人工恢复"
+		node.LastClassification = "healthy"
+		return nil
+	})
+	if err != nil || updated == nil {
+		if err == nil {
+			err = fmt.Errorf("恢复失败")
+		}
+		return nil, err
+	}
+	store.bumpAction("restored")
+	store.appendEvent(guardEvent{
+		Event:          "node_restored",
+		NodeID:         updated.ID,
+		NodeName:       updated.Name,
+		Reason:         "人工恢复",
+		Classification: "healthy",
+	})
+	go func(nn nodeRecord) { _ = enableAuthsOnNode(&nn) }(*updated)
+	return updated, nil
 }
 
 func runNodeConnectivity(store *stateStore, id string) (map[string]any, error) {
@@ -769,7 +875,15 @@ func runNodeQuality(store *stateStore, id string) (map[string]any, error) {
 		return nil, fmt.Errorf("节点不存在")
 	}
 	if n.DisabledByGuard && n.QuarantinedUntil > float64(time.Now().Unix()) {
-		// still allow manual quality test for recovery
+	}
+	// Clash leaf quality only makes sense after PerfectAI points at that leaf.
+	if n.Source == nodeSourceClash && n.ClashName != "" {
+		if err := ensureClashSelectedForNode(store, n); err != nil {
+			return nil, fmt.Errorf("切换 Clash 节点失败: %w", err)
+		}
+		if fresh, ok := store.getNode(id); ok {
+			n = fresh
+		}
 	}
 	res := probeQuality(store, n)
 	if res.Classification == "error" && res.ErrorKind != "transport_error" {
@@ -798,7 +912,6 @@ func runNodeQuality(store *stateStore, id string) (map[string]any, error) {
 	}, nil
 }
 
-// handlePassiveUsage maps a CPA usage event onto a node by auth proxy_url.
 func handlePassiveUsage(store *stateStore, record map[string]any) {
 	pol := store.policy()
 	if pol.Mode == "active" {
@@ -833,7 +946,6 @@ func handlePassiveUsage(store *stateStore, record map[string]any) {
 	durMs = firstInt(record, "duration_ms", "DurationMs", "latency_ms")
 	if durMs == 0 {
 		if lat, ok := record["Latency"].(float64); ok {
-			// encoding/json decodes time.Duration as nanoseconds
 			if lat > 1e6 {
 				durMs = int64(lat / 1e6)
 			} else {
@@ -880,7 +992,6 @@ func handlePassiveUsage(store *stateStore, record map[string]any) {
 		class = classifyQuality(tps, outTokens, pol)
 	}
 
-	// On anomaly, force auth-proxy cache refresh so we don't miss mappings.
 	if class == "hard" || class == "soft" {
 		invalidateAuthProxyCache()
 	}
@@ -907,7 +1018,6 @@ func handlePassiveUsage(store *stateStore, record map[string]any) {
 		}
 		return
 	}
-	// Always apply observation for mapped nodes (quarantine on hard/soft).
 	applyObservation(store, nodeID, "passive", res)
 }
 
@@ -935,7 +1045,6 @@ func busiestEnabledNode(store *stateStore) string {
 	return bestID
 }
 
-// backgroundWorker periodically probes quarantined / active mode nodes.
 func startGuardWorker(ctx context.Context, store *stateStore) {
 	go func() {
 		t := time.NewTicker(30 * time.Second)
@@ -953,15 +1062,14 @@ func startGuardWorker(ctx context.Context, store *stateStore) {
 						continue
 					}
 					if pol.Mode == "active" || pol.Mode == "hybrid" {
-						// light active cadence per node via last probe
 						if n.Enabled && !n.DisabledByGuard && (n.LastProbeAt == 0 || now-n.LastProbeAt >= float64(pol.ActiveIntervalSec)) {
-							// don't stampede — one per tick
 							_, _ = runNodeQuality(store, n.ID)
 							break
 						}
 					}
 				}
-				refreshAssignedCounts(store)
+				// Counts are refreshed lazily from UI/status and after migrations.
+				// Doing a full auth fan-out every 30s is a major CPU/host-call cost.
 			}
 		}
 	}()

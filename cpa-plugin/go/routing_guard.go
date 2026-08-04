@@ -58,40 +58,20 @@ func handleSchedulerPick(request []byte) ([]byte, error) {
 		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
 	}
 
-	nodes := store.listNodes()
-	byProxy := make(map[string]*nodeRecord, len(nodes))
-	for _, node := range nodes {
-		if node.ProxyURL != "" {
-			byProxy[node.ProxyURL] = node
-		}
-	}
-	cache := refreshAuthProxyCache()
-	eligible := make([]string, 0, len(req.Candidates))
-	managed := false
-	nonXAIAvailable := false
-	for _, candidate := range req.Candidates {
-		if !isXAIProvider(candidate.Provider) {
-			nonXAIAvailable = true
-			continue
-		}
-		proxy := cache[candidate.ID]
-		if proxy == "" {
-			continue
-		}
-		node := byProxy[proxy]
-		if node == nil {
-			continue
-		}
-		managed = true
-		if !schedulerCandidateAvailable(candidate) {
-			continue
-		}
-		if node.Enabled && !node.DisabledByGuard {
-			eligible = append(eligible, candidate.ID)
-		}
-	}
+	// If PerfectAI currently points at a quarantined leaf, switch first so
+	// shared mixed-port auths become eligible again instead of hard-failing.
+	_, _ = ensureHealthyClashExit(store)
+
+	eligible, managed, nonXAIAvailable := collectEligibleSchedulerAuths(req)
 	if !managed {
 		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
+	}
+	if len(eligible) == 0 {
+		// One more recovery attempt for the race where quarantine landed after
+		// the first ensureHealthyClashExit call above.
+		if ok, err := ensureHealthyClashExit(store); ok && err == nil {
+			eligible, managed, nonXAIAvailable = collectEligibleSchedulerAuths(req)
+		}
 	}
 	if len(eligible) == 0 {
 		if strings.TrimSpace(req.Provider) == "" && nonXAIAvailable {
@@ -104,9 +84,81 @@ func handleSchedulerPick(request []byte) ([]byte, error) {
 	return okEnvelope(pluginapi.SchedulerPickResponse{Handled: true, AuthID: selected})
 }
 
-// handleRequestInterceptAfterAuth closes the small race between auth selection
-// and synchronous quarantine migration. A request selected during that window
-// receives a retryable response instead of reaching a known bad egress.
+func collectEligibleSchedulerAuths(req pluginapi.SchedulerPickRequest) (eligible []string, managed bool, nonXAIAvailable bool) {
+	nodes := store.listNodes()
+	byProxy := make(map[string][]*nodeRecord, len(nodes))
+	for _, node := range nodes {
+		if node.ProxyURL != "" {
+			byProxy[node.ProxyURL] = append(byProxy[node.ProxyURL], node)
+		}
+	}
+	cache := refreshAuthProxyCache()
+	activeClash := activeClashNodeID(store)
+	eligible = make([]string, 0, len(req.Candidates))
+	for _, candidate := range req.Candidates {
+		if !isXAIProvider(candidate.Provider) {
+			nonXAIAvailable = true
+			continue
+		}
+		proxy := cache[candidate.ID]
+		node := resolveSchedulerNode(proxy, byProxy, activeClash)
+		if node == nil {
+			continue
+		}
+		managed = true
+		if !schedulerCandidateAvailable(candidate) {
+			continue
+		}
+		if node.Enabled && !node.DisabledByGuard {
+			eligible = append(eligible, candidate.ID)
+		}
+	}
+	return eligible, managed, nonXAIAvailable
+}
+
+func resolveSchedulerNode(proxy string, byProxy map[string][]*nodeRecord, activeClash string) *nodeRecord {
+	if proxy != "" {
+		owners := byProxy[proxy]
+		if len(owners) == 1 {
+			return owners[0]
+		}
+		if len(owners) > 1 {
+			for _, o := range owners {
+				if o.ID == activeClash || (o.Source == nodeSourceClash && o.ClashActive) {
+					// Prefer active leaf only when it is still schedulable.
+					if o.Enabled && !o.DisabledByGuard {
+						return o
+					}
+					break
+				}
+			}
+			// Shared Clash proxy: pick any healthy clash leaf owner.
+			for _, o := range owners {
+				if o.Enabled && !o.DisabledByGuard {
+					return o
+				}
+			}
+			// Fall back to active (even if bad) so caller sees managed+empty eligible
+			// and can trigger ensureHealthyClashExit recovery.
+			for _, o := range owners {
+				if o.ID == activeClash || (o.Source == nodeSourceClash && o.ClashActive) {
+					return o
+				}
+			}
+			return owners[0]
+		}
+	}
+	if activeClash != "" {
+		if n, ok := store.getNode(activeClash); ok {
+			return n
+		}
+	}
+	return nil
+}
+
+// handleRequestIntercept closes the race between auth selection and quarantine
+// migration. Keyword isolation intentionally does NOT run here: operators want
+// response-body matches (model/tool output), not request-body matches.
 func handleRequestIntercept(request []byte, afterAuth bool) ([]byte, error) {
 	ensureStore()
 	var req pluginapi.RequestInterceptRequest
@@ -128,10 +180,152 @@ func handleRequestIntercept(request []byte, afterAuth bool) ([]byte, error) {
 	if !ok || !node.DisabledByGuard {
 		return okEnvelope(pluginapi.RequestInterceptResponse{})
 	}
+
+	// Clash shared mixed-port: switch PerfectAI to a healthy leaf and let the
+	// request continue on the same auth (proxy URL unchanged). Without this the
+	// panel shows healthy nodes but live traffic still 503s on the dead exit.
+	if node.Source == nodeSourceClash || activeClashNodeID(store) != "" {
+		if switched, err := ensureHealthyClashExit(store); err == nil && switched {
+			// Re-resolve: if attribution now lands on a healthy leaf, proceed.
+			if nextID := resolveNodeIDForAuth(store, selected); nextID != "" {
+				if next, ok := store.getNode(nextID); ok && next != nil && next.Enabled && !next.DisabledByGuard {
+					return okEnvelope(pluginapi.RequestInterceptResponse{})
+				}
+			}
+			// Even if attribution still points at the old leaf id, the real exit
+			// has been switched; shared-proxy requests are safe to continue.
+			if active := activeClashNodeID(store); active != "" {
+				if n, ok := store.getNode(active); ok && n != nil && n.Enabled && !n.DisabledByGuard {
+					return okEnvelope(pluginapi.RequestInterceptResponse{})
+				}
+			}
+		}
+	}
+
+	// Non-Clash exclusive proxy: try migrating this auth off the dead node.
+	if node.Source != nodeSourceClash && node.ProxyURL != "" {
+		if err := migrateAuthsOffNode(store, node); err == nil {
+			// Auth proxy may have changed; host already selected this auth for
+			// this request, so still ask client to retry with Retry-After.
+			return terminateQuarantinedRequest("egress_quarantined", "当前账号出口已迁移，请重试")
+		}
+	}
+	return terminateQuarantinedRequest("egress_quarantined", "当前账号出口正在隔离迁移，请重试")
+}
+
+// handleResponseIntercept scans the completed non-stream response body for
+// operator isolation keywords and quarantines the selected egress on hit.
+func handleResponseIntercept(request []byte) ([]byte, error) {
+	ensureStore()
+	keywords := store.policy().IsolationKeywords
+	if len(keywords) == 0 {
+		return okEnvelope(pluginapi.ResponseInterceptResponse{})
+	}
+	var req pluginapi.ResponseInterceptRequest
+	if err := json.Unmarshal(request, &req); err != nil {
+		return nil, fmt.Errorf("decode response interceptor request: %w", err)
+	}
+	if matched := matchIsolationKeyword(req.Body, keywords); matched != "" {
+		quarantineFromMetadata(req.Metadata, matched)
+	}
+	// Never rewrite successful response content; isolation is a side effect only.
+	return okEnvelope(pluginapi.ResponseInterceptResponse{})
+}
+
+// handleStreamChunkIntercept scans stream chunks (and recent history) for
+// isolation keywords. Streaming chat is the common path for Grok tool_use text.
+func handleStreamChunkIntercept(request []byte) ([]byte, error) {
+	ensureStore()
+	keywords := store.policy().IsolationKeywords
+	if len(keywords) == 0 {
+		return okEnvelope(pluginapi.StreamChunkInterceptResponse{})
+	}
+	var req pluginapi.StreamChunkInterceptRequest
+	if err := json.Unmarshal(request, &req); err != nil {
+		return nil, fmt.Errorf("decode stream chunk interceptor request: %w", err)
+	}
+	// Header-only init has no payload.
+	if len(req.Body) == 0 && len(req.HistoryChunks) == 0 {
+		return okEnvelope(pluginapi.StreamChunkInterceptResponse{})
+	}
+	// Prefer current chunk; fall back to a cheap join of recent history so a
+	// keyword split across chunks can still be detected without full buffering.
+	if matched := matchIsolationKeyword(req.Body, keywords); matched != "" {
+		quarantineFromMetadata(req.Metadata, matched)
+		return okEnvelope(pluginapi.StreamChunkInterceptResponse{})
+	}
+	if len(req.HistoryChunks) > 0 {
+		var b strings.Builder
+		// Cap history scan.
+		const maxHist = 64 << 10
+		n := 0
+		for i := len(req.HistoryChunks) - 1; i >= 0 && n < maxHist; i-- {
+			chunk := req.HistoryChunks[i]
+			if len(chunk) == 0 {
+				continue
+			}
+			take := chunk
+			if n+len(take) > maxHist {
+				take = take[len(take)-(maxHist-n):]
+			}
+			// Prepend in reverse so we keep the most recent bytes.
+			b.Write(take)
+			n += len(take)
+		}
+		if matched := matchIsolationKeyword([]byte(b.String()), keywords); matched != "" {
+			quarantineFromMetadata(req.Metadata, matched)
+		}
+	}
+	return okEnvelope(pluginapi.StreamChunkInterceptResponse{})
+}
+
+func quarantineFromMetadata(meta map[string]any, matched string) {
+	if matched == "" || len(meta) == 0 {
+		return
+	}
+	selected := firstString(meta, "selected_auth_id", "selectedAuthID", "auth_id", "authID")
+	if selected == "" {
+		return
+	}
+	nodeID := resolveNodeIDForAuth(store, selected)
+	if nodeID == "" {
+		return
+	}
+	node, ok := store.getNode(nodeID)
+	if !ok || node == nil || node.DisabledByGuard {
+		return
+	}
+	quarantineNode(store, nodeID, "响应关键词隔离: "+matched, 0, "keyword")
+}
+
+// matchIsolationKeyword returns the first configured keyword found as a
+// case-sensitive substring of body. Empty keywords are ignored.
+func matchIsolationKeyword(body []byte, keywords []string) string {
+	if len(body) == 0 || len(keywords) == 0 {
+		return ""
+	}
+	// Bound scan cost for oversized payloads.
+	const maxScan = 256 << 10 // 256 KiB
+	haystack := body
+	if len(haystack) > maxScan {
+		haystack = haystack[:maxScan]
+	}
+	for _, kw := range keywords {
+		if kw == "" {
+			continue
+		}
+		if strings.Contains(string(haystack), kw) {
+			return kw
+		}
+	}
+	return ""
+}
+
+func terminateQuarantinedRequest(errType, message string) ([]byte, error) {
 	body, _ := json.Marshal(map[string]any{
 		"error": map[string]any{
-			"type":    "egress_quarantined",
-			"message": "当前账号出口正在隔离迁移，请重试",
+			"type":    errType,
+			"message": message,
 		},
 	})
 	return okEnvelope(pluginapi.RequestInterceptResponse{

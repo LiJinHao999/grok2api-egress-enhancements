@@ -75,7 +75,7 @@ import (
 
 const (
 	pluginName          = "grok2api-egress"
-	pluginVersion       = "1.0.5"
+	pluginVersion       = "1.1.3"
 	resourcePath        = "/status"
 	managementAPIPath   = "/v0/management/grok2api-egress/api"
 	resourceContentType = "text/html; charset=utf-8"
@@ -109,6 +109,22 @@ type pluginConfig struct {
 	RotationTokenEnv   string   `yaml:"rotation_token_env" json:"rotation_token_env"`
 	RotationTimeoutSec int      `yaml:"rotation_timeout_seconds" json:"rotation_timeout_seconds"`
 	RotatableNodeIDs   []string `yaml:"rotatable_node_ids" json:"rotatable_node_ids"`
+
+	// Clash / Mihomo local controller integration.
+	// Nodes synced from Clash share one mixed-port proxy_url; the real exit is
+	// selected by PUT /proxies/{group} on quarantine / manual switch.
+	ClashEnabled          bool     `yaml:"clash_enabled" json:"clash_enabled"`
+	ClashAPIURL           string   `yaml:"clash_api_url" json:"clash_api_url"`
+	ClashUnixSocket       string   `yaml:"clash_unix_socket" json:"clash_unix_socket"`
+	ClashSecret           string   `yaml:"clash_secret" json:"clash_secret"` // prefer env; kept for local single-user setups
+	ClashSecretEnv        string   `yaml:"clash_secret_env" json:"clash_secret_env"`
+	ClashGroup            string   `yaml:"clash_group" json:"clash_group"`
+	ClashProxyURL         string   `yaml:"clash_proxy_url" json:"clash_proxy_url"`
+	ClashCloseConnections bool     `yaml:"clash_close_connections" json:"clash_close_connections"`
+	ClashSyncOnStart      bool     `yaml:"clash_sync_on_start" json:"clash_sync_on_start"`
+	ClashTimeoutSec       int      `yaml:"clash_timeout_seconds" json:"clash_timeout_seconds"`
+	ClashExcludeKeywords  []string `yaml:"clash_exclude_keywords" json:"clash_exclude_keywords"`
+	ClashPreferKeywords   []string `yaml:"clash_prefer_keywords" json:"clash_prefer_keywords"`
 }
 
 type registration struct {
@@ -118,10 +134,12 @@ type registration struct {
 }
 
 type registrationCapabilities struct {
-	ManagementAPI      bool `json:"management_api"`
-	UsagePlugin        bool `json:"usage_plugin"`
-	Scheduler          bool `json:"scheduler"`
-	RequestInterceptor bool `json:"request_interceptor"`
+	ManagementAPI           bool `json:"management_api"`
+	UsagePlugin             bool `json:"usage_plugin"`
+	Scheduler               bool `json:"scheduler"`
+	RequestInterceptor      bool `json:"request_interceptor"`
+	ResponseInterceptor     bool `json:"response_interceptor"`
+	StreamChunkInterceptor  bool `json:"stream_chunk_interceptor"`
 }
 
 type managementRegistration struct {
@@ -247,6 +265,10 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return handleRequestIntercept(request, false)
 	case pluginabi.MethodRequestInterceptAfter:
 		return handleRequestIntercept(request, true)
+	case pluginabi.MethodResponseInterceptAfter:
+		return handleResponseIntercept(request)
+	case pluginabi.MethodResponseInterceptStreamChunk:
+		return handleStreamChunkIntercept(request)
 	default:
 		return errorEnvelope("unknown_method", "unknown method: "+method), nil
 	}
@@ -271,7 +293,25 @@ func configure(raw []byte) error {
 	if cfg.RotationTimeoutSec <= 0 {
 		cfg.RotationTimeoutSec = 45
 	}
+	if cfg.ClashTimeoutSec <= 0 {
+		cfg.ClashTimeoutSec = 8
+	}
+	if strings.TrimSpace(cfg.ClashGroup) == "" {
+		cfg.ClashGroup = "🏜️ PerfectAI"
+	}
+	if strings.TrimSpace(cfg.ClashSecretEnv) == "" {
+		cfg.ClashSecretEnv = "CLASH_API_SECRET"
+	}
+	// Default close old connections after switch so sticky sessions pick the new exit.
+	if !cfg.ClashCloseConnections && (cfg.ClashEnabled || cfg.ClashAPIURL != "" || cfg.ClashProxyURL != "") {
+		cfg.ClashCloseConnections = true
+	}
 	currentConfig.Store(cfg)
+	// Drop cached Clash client so new credentials take effect.
+	clashMu.Lock()
+	clashCached = nil
+	clashCfgSnap = clashRuntimeConfig{}
+	clashMu.Unlock()
 	store = newStateStore(cfg.StateFile)
 	if workerCancel != nil {
 		workerCancel()
@@ -279,7 +319,14 @@ func configure(raw []byte) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	workerCancel = cancel
 	startGuardWorker(ctx, store)
-	refreshAssignedCounts(store)
+	refreshAssignedCountsAsync(store)
+	if loadClashRuntimeConfig().Enabled && cfg.ClashSyncOnStart {
+		go func() {
+			if _, err := syncClashNodes(store); err != nil {
+				store.appendEvent(guardEvent{Event: "clash_sync_failed", Reason: err.Error()})
+			}
+		}()
+	}
 	return nil
 }
 
@@ -297,9 +344,21 @@ func pluginRegistration() registration {
 				{Name: "rotation_token_env", Type: pluginapi.ConfigFieldTypeString, Description: "从 CPA 进程环境变量读取 Webhook Bearer Token，避免写入配置"},
 				{Name: "rotation_timeout_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "换 IP Webhook 超时（秒）"},
 				{Name: "rotatable_node_ids", Type: pluginapi.ConfigFieldTypeArray, Description: "允许自动换 IP 的节点 ID；留空时禁止自动换 IP"},
+				{Name: "clash_enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "启用本机 Clash/Mihomo 对接（节点列表与切换走 Clash API）"},
+				{Name: "clash_api_url", Type: pluginapi.ConfigFieldTypeString, Description: "Clash external-controller，例如 http://172.19.0.1:7888"},
+				{Name: "clash_unix_socket", Type: pluginapi.ConfigFieldTypeString, Description: "可选：Clash Unix Socket（仅 CPA 与 Clash 同机）"},
+				{Name: "clash_secret_env", Type: pluginapi.ConfigFieldTypeString, Description: "从环境变量读取 Clash secret（默认 CLASH_API_SECRET）"},
+				{Name: "clash_secret", Type: pluginapi.ConfigFieldTypeString, Description: "Clash secret（优先用 clash_secret_env）"},
+				{Name: "clash_group", Type: pluginapi.ConfigFieldTypeString, Description: "策略组名，默认 🏜️ PerfectAI"},
+				{Name: "clash_proxy_url", Type: pluginapi.ConfigFieldTypeString, Description: "CPA 统一走的本机代理，例如 http://172.19.0.1:7890"},
+				{Name: "clash_close_connections", Type: pluginapi.ConfigFieldTypeBoolean, Description: "切换后关闭旧连接"},
+				{Name: "clash_sync_on_start", Type: pluginapi.ConfigFieldTypeBoolean, Description: "启动时从 PerfectAI 同步节点"},
+				{Name: "clash_timeout_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "Clash API 超时（秒）"},
+				{Name: "clash_exclude_keywords", Type: pluginapi.ConfigFieldTypeArray, Description: "同步时排除名称包含这些词的节点"},
+				{Name: "clash_prefer_keywords", Type: pluginapi.ConfigFieldTypeArray, Description: "同步时优先这些关键词"},
 			},
 		},
-		Capabilities: registrationCapabilities{ManagementAPI: true, UsagePlugin: true, Scheduler: true, RequestInterceptor: true},
+		Capabilities: registrationCapabilities{ManagementAPI: true, UsagePlugin: true, Scheduler: true, RequestInterceptor: true, ResponseInterceptor: true, StreamChunkInterceptor: true},
 	}
 }
 
@@ -399,6 +458,12 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 			if v, ok := raw["disable_auth_on_hard"].(bool); ok {
 				p.DisableAuthOnHard = v
 			}
+			if v, ok := raw["disableAuthOnHard"].(bool); ok {
+				p.DisableAuthOnHard = v
+			}
+			if kws, ok := stringSlicePick(raw, "isolation_keywords", "isolationKeywords"); ok {
+				p.IsolationKeywords = kws
+			}
 			if err := store.updatePolicy(p); err != nil {
 				return managementJSON(http.StatusBadRequest, errMsg("invalidPolicy", err.Error()))
 			}
@@ -407,7 +472,7 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 
 	case path == "/nodes":
 		if method == http.MethodGet {
-			refreshAssignedCounts(store)
+			refreshAssignedCountsAsync(store)
 			items := store.listNodes()
 			out := make([]map[string]any, 0, len(items))
 			for _, n := range items {
@@ -442,19 +507,8 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 			var raw map[string]any
 			_ = json.Unmarshal(body, &raw)
 			ids := stringIDs(raw["ids"])
-			// unbind auths on those nodes first
-			for _, id := range ids {
-				if n, ok := store.getNode(id); ok {
-					auths, _ := listAuthFiles()
-					for _, a := range auths {
-						if a.ProxyURL == n.ProxyURL {
-							_ = setAuthProxyAndFlags(a, "", a.Disabled, "")
-						}
-					}
-				}
-			}
-			_ = store.deleteNodes(ids)
-			return managementJSON(http.StatusOK, map[string]any{"ok": true, "deleted": len(ids)})
+			deleted, _ := deleteManagedNodes(store, ids)
+			return managementJSON(http.StatusOK, map[string]any{"ok": true, "deleted": deleted})
 		}
 
 	case path == "/nodes/batch":
@@ -590,16 +644,11 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 			return managementJSON(http.StatusOK, map[string]any{"data": publicNode(n)})
 		}
 		if method == http.MethodDelete {
-			if n, ok := store.getNode(id); ok {
-				auths, _ := listAuthFiles()
-				for _, a := range auths {
-					if a.ProxyURL == n.ProxyURL {
-						_ = setAuthProxyAndFlags(a, "", a.Disabled, "")
-					}
-				}
+			deleted, _ := deleteManagedNodes(store, []string{id})
+			if deleted == 0 {
+				return managementJSON(http.StatusNotFound, errMsg("notFound", "not found"))
 			}
-			_ = store.deleteNodes([]string{id})
-			return managementJSON(http.StatusOK, map[string]any{"ok": true})
+			return managementJSON(http.StatusOK, map[string]any{"ok": true, "deleted": deleted})
 		}
 
 	case len(parts) == 3 && parts[0] == "nodes" && safeID(parts[1]) && parts[2] == "test":
@@ -640,6 +689,125 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 			}
 			return managementJSON(http.StatusOK, map[string]any{"data": r})
 		}
+
+	case path == "/clash" || path == "/clash/status":
+		if method != http.MethodGet {
+			return managementJSON(http.StatusMethodNotAllowed, errMsg("methodNotAllowed", "method not allowed"))
+		}
+		return managementJSON(http.StatusOK, map[string]any{"data": clashStatusPayload()})
+
+	case path == "/clash/config":
+		if method == http.MethodGet {
+			cfg := loadClashRuntimeConfig()
+			ui := store.clashUI()
+			return managementJSON(http.StatusOK, map[string]any{"data": publicClashUIConfig(ui, cfg), "ok": true})
+		}
+		if method == http.MethodPut || method == http.MethodPost {
+			var raw map[string]any
+			if len(body) > 0 {
+				if err := json.Unmarshal(body, &raw); err != nil {
+					return managementJSON(http.StatusBadRequest, errMsg("invalidBody", "invalid body"))
+				}
+			}
+			in := clashUIConfig{}
+			clearSecret := false
+			if v, ok := raw["enabled"].(bool); ok {
+				in.Enabled = &v
+			}
+			if v, ok := raw["api_url"].(string); ok {
+				in.APIURL = v
+			} else if v, ok := raw["apiUrl"].(string); ok {
+				in.APIURL = v
+			}
+			if v, ok := raw["group"].(string); ok {
+				in.Group = v
+			}
+			if v, ok := raw["proxy_url"].(string); ok {
+				in.ProxyURL = v
+			} else if v, ok := raw["proxyUrl"].(string); ok {
+				in.ProxyURL = v
+			}
+			if v, ok := raw["secret"].(string); ok {
+				in.Secret = v
+			}
+			if v, ok := raw["clear_secret"].(bool); ok && v {
+				clearSecret = true
+			} else if v, ok := raw["clearSecret"].(bool); ok && v {
+				clearSecret = true
+			}
+			updated, err := store.updateClashUI(in, clearSecret)
+			if err != nil {
+				return managementJSON(http.StatusBadRequest, errMsg("clashConfigFailed", err.Error()))
+			}
+			// Drop cached client so new endpoint/secret/group take effect immediately.
+			clashMu.Lock()
+			clashCached = nil
+			clashCfgSnap = clashRuntimeConfig{}
+			clashMu.Unlock()
+			runtime := loadClashRuntimeConfig()
+			return managementJSON(http.StatusOK, map[string]any{
+				"ok":   true,
+				"data": publicClashUIConfig(updated, runtime),
+			})
+		}
+		return managementJSON(http.StatusMethodNotAllowed, errMsg("methodNotAllowed", "method not allowed"))
+
+	case path == "/clash/groups":
+		if method != http.MethodGet {
+			return managementJSON(http.StatusMethodNotAllowed, errMsg("methodNotAllowed", "method not allowed"))
+		}
+		groups, err := listClashGroups()
+		if err != nil {
+			return managementJSON(http.StatusBadRequest, errMsg("clashGroupsFailed", err.Error()))
+		}
+		return managementJSON(http.StatusOK, map[string]any{"ok": true, "data": map[string]any{"items": groups}, "items": groups})
+
+	case path == "/clash/sync" || path == "/nodes/sync-clash":
+		if method != http.MethodPost {
+			return managementJSON(http.StatusMethodNotAllowed, errMsg("methodNotAllowed", "method not allowed"))
+		}
+		r, err := syncClashNodes(store)
+		if err != nil {
+			return managementJSON(http.StatusBadRequest, errMsg("clashSyncFailed", err.Error()))
+		}
+		refreshAssignedCountsAsync(store)
+		return managementJSON(http.StatusOK, map[string]any{"ok": true, "data": r})
+
+	case len(parts) == 3 && parts[0] == "nodes" && safeID(parts[1]) && (parts[2] == "select" || parts[2] == "clash-select"):
+		if method == http.MethodPost {
+			r, err := selectClashNodeAPI(store, parts[1])
+			if err != nil {
+				return managementJSON(http.StatusBadRequest, errMsg("clashSelectFailed", err.Error()))
+			}
+			return managementJSON(http.StatusOK, map[string]any{"ok": true, "data": r})
+		}
+
+	case len(parts) == 3 && parts[0] == "nodes" && safeID(parts[1]) && (parts[2] == "quarantine" || parts[2] == "degrade"):
+		if method == http.MethodPost {
+			reason := "人工降智隔离"
+			if len(body) > 0 {
+				var raw map[string]any
+				if json.Unmarshal(body, &raw) == nil {
+					if v, ok := raw["reason"].(string); ok && strings.TrimSpace(v) != "" {
+						reason = strings.TrimSpace(v)
+					}
+				}
+			}
+			n, err := manualQuarantineNode(store, parts[1], reason)
+			if err != nil {
+				return managementJSON(http.StatusBadRequest, errMsg("quarantineFailed", err.Error()))
+			}
+			return managementJSON(http.StatusOK, map[string]any{"ok": true, "data": publicNode(n)})
+		}
+
+	case len(parts) == 3 && parts[0] == "nodes" && safeID(parts[1]) && (parts[2] == "restore" || parts[2] == "unquarantine"):
+		if method == http.MethodPost {
+			n, err := restoreQuarantinedNode(store, parts[1])
+			if err != nil {
+				return managementJSON(http.StatusBadRequest, errMsg("restoreFailed", err.Error()))
+			}
+			return managementJSON(http.StatusOK, map[string]any{"ok": true, "data": publicNode(n)})
+		}
 	}
 
 	return managementJSON(http.StatusNotFound, errMsg("notFound", "not found"))
@@ -647,7 +815,7 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 
 func buildStatus() map[string]any {
 	ensureStore()
-	refreshAssignedCounts(store)
+	refreshAssignedCountsAsync(store)
 	nodes := store.listNodes()
 	nodeMap := map[string]any{}
 	for _, n := range nodes {
@@ -665,6 +833,10 @@ func buildStatus() map[string]any {
 			"last_source":         n.LastSource,
 			"last_observed_at":    n.LastObservedAt,
 			"last_probe_at":       n.LastProbeAt,
+			"source":              n.Source,
+			"clash_name":          n.ClashName,
+			"clash_group":         n.ClashGroup,
+			"clash_active":        n.ClashActive,
 		}
 	}
 	pol := store.policy()
@@ -681,7 +853,8 @@ func buildStatus() map[string]any {
 		"version":      pluginVersion,
 		"started_at":   startedAt.Format(time.RFC3339),
 		"engine":       "cpa-native",
-		"hint":         "纯 CPA 出口守护：节点代理写在账号 proxy_url，被动 Token/s 审计 + 主动质量探测，不依赖 Grok2API。",
+		"clash":        clashStatusPayload(),
+		"hint":         "纯 CPA 出口守护：可对接本机 Clash PerfectAI；降智时走 Clash API 切换叶子节点，账号统一走本机 mixed-port。",
 	}
 }
 
@@ -749,6 +922,46 @@ func stringIDs(v any) []string {
 		out = append(out, t...)
 	}
 	return out
+}
+
+// stringSlicePick extracts a string list from raw under any of the given keys.
+// ok is false when none of the keys are present, so callers can keep the previous value.
+func stringSlicePick(raw map[string]any, keys ...string) ([]string, bool) {
+	for _, k := range keys {
+		v, present := raw[k]
+		if !present {
+			continue
+		}
+		switch t := v.(type) {
+		case nil:
+			return nil, true
+		case []any:
+			out := make([]string, 0, len(t))
+			for _, x := range t {
+				if s, ok := x.(string); ok {
+					out = append(out, s)
+				} else if x != nil {
+					out = append(out, fmt.Sprint(x))
+				}
+			}
+			return out, true
+		case []string:
+			return append([]string{}, t...), true
+		case string:
+			// Allow newline / comma separated textareas.
+			parts := strings.FieldsFunc(t, func(r rune) bool {
+				return r == '\n' || r == '\r' || r == ',' || r == ';'
+			})
+			out := make([]string, 0, len(parts))
+			for _, p := range parts {
+				if s := strings.TrimSpace(p); s != "" {
+					out = append(out, s)
+				}
+			}
+			return out, true
+		}
+	}
+	return nil, false
 }
 
 func intPick(raw map[string]any, def int, keys ...string) int {

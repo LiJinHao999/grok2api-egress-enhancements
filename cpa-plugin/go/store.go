@@ -13,20 +13,23 @@ import (
 )
 
 type policyConfig struct {
-	Mode                 string  `json:"mode"`
-	ActiveIntervalSec    int     `json:"active_interval_seconds"`
-	PassivePollSec       int     `json:"passive_poll_seconds"`
-	QuarantineSec        int     `json:"quarantine_seconds"`
-	SoftTPS              float64 `json:"soft_tps"`
-	HardTPS              float64 `json:"hard_tps"`
-	ConsecutiveSoft      int     `json:"consecutive_soft"`
-	ConsecutiveErrors    int     `json:"consecutive_errors"`
-	MinHealthyNodes      int     `json:"min_healthy_nodes"`
-	MinGenerationMs      int64   `json:"min_generation_ms"`
-	MinOutputTokens      int64   `json:"min_output_tokens"`
-	Model                string  `json:"model"`
-	DisableAuthOnHard    bool    `json:"disable_auth_on_hard"`
-	MaxOutputTokensProbe int     `json:"max_output_tokens"`
+	Mode                 string   `json:"mode"`
+	ActiveIntervalSec    int      `json:"active_interval_seconds"`
+	PassivePollSec       int      `json:"passive_poll_seconds"`
+	QuarantineSec        int      `json:"quarantine_seconds"`
+	SoftTPS              float64  `json:"soft_tps"`
+	HardTPS              float64  `json:"hard_tps"`
+	ConsecutiveSoft      int      `json:"consecutive_soft"`
+	ConsecutiveErrors    int      `json:"consecutive_errors"`
+	MinHealthyNodes      int      `json:"min_healthy_nodes"`
+	MinGenerationMs      int64    `json:"min_generation_ms"`
+	MinOutputTokens      int64    `json:"min_output_tokens"`
+	Model                string   `json:"model"`
+	DisableAuthOnHard    bool     `json:"disable_auth_on_hard"`
+	MaxOutputTokensProbe int      `json:"max_output_tokens"`
+	// IsolationKeywords lists request-body substrings that quarantine the
+	// currently selected egress after auth. Empty disables keyword isolation.
+	IsolationKeywords []string `json:"isolation_keywords"`
 }
 
 type nodeRecord struct {
@@ -37,6 +40,10 @@ type nodeRecord struct {
 	Enabled              bool      `json:"enabled"`
 	ProxyPool            bool      `json:"proxy_pool"`
 	AccountCapacity      int       `json:"account_capacity"`
+	Source               string    `json:"source,omitempty"`       // manual | clash
+	ClashName            string    `json:"clash_name,omitempty"`  // leaf proxy name inside Clash group
+	ClashGroup           string    `json:"clash_group,omitempty"` // e.g. 🏜️ PerfectAI
+	ClashActive          bool      `json:"clash_active,omitempty"`
 	ExitIP               string    `json:"exit_ip,omitempty"`
 	ProbeStatus          string    `json:"probe_status,omitempty"`
 	ProbeLatencyMs       int64     `json:"probe_latency_ms,omitempty"`
@@ -100,9 +107,22 @@ type statistics struct {
 	Actions   actionStats `json:"actions"`
 }
 
+// clashUIConfig is panel-editable Clash connection settings.
+// Non-empty fields override the CPA plugin YAML config so friends can
+// set group / API endpoint without touching host config files.
+type clashUIConfig struct {
+	Enabled   *bool  `json:"enabled,omitempty"`
+	APIURL    string `json:"api_url,omitempty"`
+	Secret    string `json:"secret,omitempty"`
+	Group     string `json:"group,omitempty"`
+	ProxyURL  string `json:"proxy_url,omitempty"`
+	UpdatedAt float64 `json:"updated_at,omitempty"`
+}
+
 type guardState struct {
 	Version   int                    `json:"version"`
 	Policy    policyConfig           `json:"policy"`
+	ClashUI   clashUIConfig          `json:"clash_ui,omitempty"`
 	Nodes     map[string]*nodeRecord `json:"nodes"`
 	Events    []guardEvent           `json:"events"`
 	Stats     statistics             `json:"statistics"`
@@ -132,10 +152,44 @@ func defaultPolicy() policyConfig {
 		Model:                "grok-4.5",
 		DisableAuthOnHard:    true,
 		MaxOutputTokensProbe: 384,
+		IsolationKeywords:    nil,
 	}
 }
 
+func normalizeIsolationKeywords(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, raw := range in {
+		kw := strings.TrimSpace(raw)
+		if kw == "" {
+			continue
+		}
+		// Cap individual keyword length so operators cannot store multi-KB blobs.
+		if len(kw) > 128 {
+			kw = kw[:128]
+		}
+		if _, ok := seen[kw]; ok {
+			continue
+		}
+		seen[kw] = struct{}{}
+		out = append(out, kw)
+		if len(out) >= 64 {
+			break
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 func newStateStore(path string) *stateStore {
+	// Drop process-local auth caches so a fresh store never inherits bindings
+	// from a previous test or previous state_file path.
+	invalidateAuthListCache()
 	s := &stateStore{path: path}
 	s.data = guardState{
 		Version: 1,
@@ -181,6 +235,7 @@ func (s *stateStore) load() error {
 	if data.Policy.MaxOutputTokensProbe <= 0 {
 		data.Policy.MaxOutputTokensProbe = 384
 	}
+	data.Policy.IsolationKeywords = normalizeIsolationKeywords(data.Policy.IsolationKeywords)
 	if data.Policy.Mode == "" {
 		data.Policy.Mode = "hybrid"
 	}
@@ -196,6 +251,13 @@ func (s *stateStore) load() error {
 	// hydrate private proxy field
 	for _, n := range data.Nodes {
 		n.ProxyURL = n.ProxyURLStored
+		if n.Source == "" {
+			if n.ClashName != "" {
+				n.Source = nodeSourceClash
+			} else {
+				n.Source = nodeSourceManual
+			}
+		}
 	}
 	s.data = data
 	return nil
@@ -289,8 +351,71 @@ func (s *stateStore) updatePolicy(p policyConfig) error {
 	if p.MaxOutputTokensProbe < 16 || p.MaxOutputTokensProbe > 4096 {
 		return fmt.Errorf("主动探测最大输出需在 16 到 4096 Token 之间")
 	}
+	p.IsolationKeywords = normalizeIsolationKeywords(p.IsolationKeywords)
 	s.data.Policy = p
 	return s.persistLocked()
+}
+
+func (s *stateStore) clashUI() clashUIConfig {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.data.ClashUI
+}
+
+func (s *stateStore) updateClashUI(in clashUIConfig, clearSecret bool) (clashUIConfig, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur := s.data.ClashUI
+	if in.Enabled != nil {
+		cur.Enabled = in.Enabled
+	}
+	if v := strings.TrimSpace(in.APIURL); v != "" {
+		if !looksLikeHTTPURL(v) && !strings.HasPrefix(v, "unix://") {
+			return clashUIConfig{}, fmt.Errorf("Clash API 端点需为 http(s):// 地址")
+		}
+		if len(v) > 512 {
+			return clashUIConfig{}, fmt.Errorf("Clash API 端点过长")
+		}
+		cur.APIURL = v
+	}
+	if clearSecret {
+		cur.Secret = ""
+	} else if v := strings.TrimSpace(in.Secret); v != "" {
+		if len(v) > 256 {
+			return clashUIConfig{}, fmt.Errorf("Clash secret 过长")
+		}
+		cur.Secret = v
+	}
+	if v := strings.TrimSpace(in.Group); v != "" {
+		if len(v) > 200 {
+			return clashUIConfig{}, fmt.Errorf("策略组名过长")
+		}
+		cur.Group = v
+	}
+	if v := strings.TrimSpace(in.ProxyURL); v != "" {
+		if _, err := url.Parse(v); err != nil {
+			return clashUIConfig{}, fmt.Errorf("代理 URL 无效: %w", err)
+		}
+		if len(v) > 512 {
+			return clashUIConfig{}, fmt.Errorf("代理 URL 过长")
+		}
+		cur.ProxyURL = v
+	}
+	cur.UpdatedAt = float64(time.Now().Unix())
+	s.data.ClashUI = cur
+	if err := s.persistLocked(); err != nil {
+		return clashUIConfig{}, err
+	}
+	return cur, nil
+}
+
+func looksLikeHTTPURL(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" {
+		return false
+	}
+	scheme := strings.ToLower(u.Scheme)
+	return scheme == "http" || scheme == "https"
 }
 
 func (s *stateStore) listNodes() []*nodeRecord {
@@ -371,6 +496,7 @@ func (s *stateStore) createNodes(inputs []nodeCreateInput) ([]*nodeRecord, error
 			Enabled:         input.Enabled,
 			ProxyPool:       input.ProxyPool,
 			AccountCapacity: input.AccountCapacity,
+			Source:          nodeSourceManual,
 			ProbeStatus:     "unknown",
 			CreatedAt:       now,
 			UpdatedAt:       now,
@@ -528,12 +654,20 @@ func publicNode(n *nodeRecord) map[string]any {
 	if n == nil {
 		return nil
 	}
+	source := n.Source
+	if source == "" {
+		source = nodeSourceManual
+	}
 	return map[string]any{
 		"id":                   n.ID,
 		"name":                 n.Name,
 		"enabled":              n.Enabled,
 		"proxyPool":            n.ProxyPool,
 		"accountCapacity":      n.AccountCapacity,
+		"source":               source,
+		"clashName":            n.ClashName,
+		"clashGroup":           n.ClashGroup,
+		"clashActive":          n.ClashActive,
 		"exitIp":               n.ExitIP,
 		"probeStatus":          n.ProbeStatus,
 		"probeLatencyMs":       n.ProbeLatencyMs,

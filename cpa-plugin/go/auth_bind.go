@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
@@ -33,7 +34,29 @@ type authFile struct {
 	Raw      map[string]any
 }
 
+var (
+	authListMu    sync.Mutex
+	authListCache []authFile
+	authListAt    time.Time
+)
+
+func invalidateAuthListCache() {
+	authListMu.Lock()
+	authListCache = nil
+	authListAt = time.Time{}
+	authListMu.Unlock()
+	invalidateAuthProxyCache()
+}
+
 func listAuthFiles() ([]authFile, error) {
+	authListMu.Lock()
+	if authListCache != nil && time.Since(authListAt) < 60*time.Second {
+		out := append([]authFile(nil), authListCache...)
+		authListMu.Unlock()
+		return out, nil
+	}
+	authListMu.Unlock()
+
 	raw, err := hostCall(pluginabi.MethodHostAuthList, mustJSON(map[string]any{}))
 	if err != nil {
 		return nil, err
@@ -47,7 +70,7 @@ func listAuthFiles() ([]authFile, error) {
 		}
 		resp.Files = files
 	}
-	out := make([]authFile, 0, len(resp.Files))
+	candidates := make([]pluginapi.HostAuthFileEntry, 0, len(resp.Files))
 	for _, f := range resp.Files {
 		idx := strings.TrimSpace(f.AuthIndex)
 		if idx == "" {
@@ -64,24 +87,75 @@ func listAuthFiles() ([]authFile, error) {
 		if prov != "" && !strings.Contains(prov, "xai") {
 			continue
 		}
-		got, err := getAuthFile(idx)
-		if err != nil {
-			// try by name
-			if f.Name != "" {
-				got, err = getAuthFile(f.Name)
-			}
-			if err != nil {
-				continue
-			}
-		}
-		if t, _ := got.Raw["type"].(string); strings.ToLower(t) != "xai" && strings.ToLower(t) != "" {
-			if !strings.HasPrefix(strings.ToLower(got.Name), "xai-") {
-				continue
-			}
-		}
-		got.ID = strings.TrimSpace(f.ID)
-		out = append(out, got)
+		candidates = append(candidates, f)
 	}
+
+	// Fan out HostAuthGet; serial N+1 was taking ~10s on large account pools and
+	// froze the management UI (delete / refresh felt permanently stuck).
+	const workers = 4
+	type result struct {
+		file authFile
+		ok   bool
+	}
+	jobs := make(chan pluginapi.HostAuthFileEntry)
+	results := make(chan result, len(candidates))
+	var wg sync.WaitGroup
+	workerN := workers
+	if len(candidates) < workerN {
+		workerN = len(candidates)
+	}
+	if workerN < 1 {
+		workerN = 1
+	}
+	for i := 0; i < workerN; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for f := range jobs {
+				idx := strings.TrimSpace(f.AuthIndex)
+				if idx == "" {
+					idx = strings.TrimSpace(f.ID)
+				}
+				if idx == "" {
+					idx = strings.TrimSpace(f.Name)
+				}
+				got, err := getAuthFile(idx)
+				if err != nil && f.Name != "" {
+					got, err = getAuthFile(f.Name)
+				}
+				if err != nil {
+					results <- result{}
+					continue
+				}
+				if typ, _ := got.Raw["type"].(string); strings.ToLower(typ) != "xai" && strings.ToLower(typ) != "" {
+					if !strings.HasPrefix(strings.ToLower(got.Name), "xai-") {
+						results <- result{}
+						continue
+					}
+				}
+				got.ID = strings.TrimSpace(f.ID)
+				results <- result{file: got, ok: true}
+			}
+		}()
+	}
+	go func() {
+		for _, f := range candidates {
+			jobs <- f
+		}
+		close(jobs)
+		wg.Wait()
+		close(results)
+	}()
+	out := make([]authFile, 0, len(candidates))
+	for r := range results {
+		if r.ok {
+			out = append(out, r.file)
+		}
+	}
+	authListMu.Lock()
+	authListCache = append([]authFile(nil), out...)
+	authListAt = time.Now()
+	authListMu.Unlock()
 	return out, nil
 }
 
@@ -140,7 +214,7 @@ func saveAuthFile(name string, obj map[string]any) error {
 		"json": json.RawMessage(raw),
 	}))
 	if err == nil {
-		invalidateAuthProxyCache()
+		invalidateAuthListCache()
 	}
 	return err
 }
@@ -219,6 +293,57 @@ func rebalanceAuthsToNodes(store *stateStore) (map[string]int, error) {
 		return nil, err
 	}
 	nodes := store.listNodes()
+	// Clash mode: all accounts share the mixed-port URL; PerfectAI selection is
+	// orthogonal and controlled by ensureClashSelectedForNode / quarantine.
+	clashProxy := ""
+	var activeClash *nodeRecord
+	for _, n := range nodes {
+		if n.Source != nodeSourceClash || !n.Enabled || n.DisabledByGuard || n.ProxyURL == "" {
+			continue
+		}
+		if clashProxy == "" {
+			clashProxy = n.ProxyURL
+		}
+		if n.ClashActive {
+			activeClash = n
+		}
+	}
+	if clashProxy != "" {
+		if activeClash == nil {
+			for _, n := range nodes {
+				if n.Source == nodeSourceClash && n.Enabled && !n.DisabledByGuard && n.ClashName != "" {
+					activeClash = n
+					break
+				}
+			}
+		}
+		if activeClash != nil {
+			_ = ensureClashSelectedForNode(store, activeClash)
+		}
+		counts := map[string]int{}
+		activeID := ""
+		if activeClash != nil {
+			activeID = activeClash.ID
+		}
+		for _, a := range auths {
+			if a.Disabled {
+				continue
+			}
+			if a.ProxyURL != clashProxy {
+				if err := setAuthProxyAndFlags(a, clashProxy, false, ""); err != nil {
+					return counts, fmt.Errorf("绑定 %s 到 Clash 代理失败: %w", a.Name, err)
+				}
+				if err := verifyAuthBinding(a, clashProxy, false); err != nil {
+					return counts, fmt.Errorf("绑定 %s 校验失败: %w", a.Name, err)
+				}
+			}
+			if activeID != "" {
+				counts[activeID]++
+			}
+		}
+		store.setAssignedCounts(counts)
+		return counts, nil
+	}
 	// eligible nodes: enabled, not guard-quarantined, has proxy
 	eligible := make([]*nodeRecord, 0)
 	for _, n := range nodes {
@@ -281,17 +406,74 @@ func rebalanceAuthsToNodes(store *stateStore) (map[string]int, error) {
 	return counts, nil
 }
 
+var (
+	assignedRefreshMu   sync.Mutex
+	assignedRefreshAt   time.Time
+	assignedRefreshBusy bool
+)
+
+func refreshAssignedCountsAsync(store *stateStore) {
+	if store == nil {
+		return
+	}
+	assignedRefreshMu.Lock()
+	if assignedRefreshBusy || time.Since(assignedRefreshAt) < 30*time.Second {
+		assignedRefreshMu.Unlock()
+		return
+	}
+	assignedRefreshBusy = true
+	assignedRefreshMu.Unlock()
+	go func() {
+		defer func() {
+			assignedRefreshMu.Lock()
+			assignedRefreshBusy = false
+			assignedRefreshAt = time.Now()
+			assignedRefreshMu.Unlock()
+		}()
+		refreshAssignedCounts(store)
+	}()
+}
+
 func refreshAssignedCounts(store *stateStore) {
 	auths, err := listAuthFiles()
 	if err != nil {
 		return
 	}
 	nodes := store.listNodes()
-	byProxy := map[string]string{}
+	// Detect shared Clash mixed-port: many nodes, one proxy_url.
+	proxyOwners := map[string][]*nodeRecord{}
 	for _, n := range nodes {
-		if n.ProxyURL != "" {
-			byProxy[n.ProxyURL] = n.ID
+		if n.ProxyURL == "" {
+			continue
 		}
+		proxyOwners[n.ProxyURL] = append(proxyOwners[n.ProxyURL], n)
+	}
+	byProxy := map[string]string{}
+	for proxy, owners := range proxyOwners {
+		if len(owners) == 1 {
+			byProxy[proxy] = owners[0].ID
+			continue
+		}
+		// Shared URL → attribute to active Clash leaf.
+		chosen := ""
+		for _, n := range owners {
+			if n.Source == nodeSourceClash && n.ClashActive {
+				chosen = n.ID
+				break
+			}
+		}
+		if chosen == "" {
+			for _, n := range owners {
+				if n.Enabled && !n.DisabledByGuard {
+					chosen = n.ID
+					break
+				}
+			}
+		}
+		if chosen == "" {
+			chosen = owners[0].ID
+		}
+		byProxy[proxy] = chosen
 	}
 	counts := map[string]int{}
 	for _, a := range auths {
@@ -399,6 +581,93 @@ func listAuthsForNode(node *nodeRecord, limit int) ([]authFile, error) {
 		return nil, fmt.Errorf("没有可用的 CPA xAI 账号")
 	}
 	return out, nil
+}
+
+
+// deleteManagedNodes removes nodes immediately, then asynchronously clears proxy_url
+// only for proxies exclusively owned by the deleted set. Shared Clash mixed-port
+// URLs are left intact so deleting one leaf does not wipe every account binding.
+func deleteManagedNodes(store *stateStore, ids []string) (deleted int, exclusiveProxies []string) {
+	if store == nil || len(ids) == 0 {
+		return 0, nil
+	}
+	idSet := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			idSet[id] = struct{}{}
+		}
+	}
+	if len(idSet) == 0 {
+		return 0, nil
+	}
+
+	proxyOwners := map[string]int{}
+	victims := make([]*nodeRecord, 0, len(idSet))
+	for _, n := range store.listNodes() {
+		if n.ProxyURL != "" {
+			proxyOwners[n.ProxyURL]++
+		}
+		if _, ok := idSet[n.ID]; ok {
+			cp := *n
+			victims = append(victims, &cp)
+		}
+	}
+	if len(victims) == 0 {
+		return 0, nil
+	}
+
+	deleteIDs := make([]string, 0, len(victims))
+	victimShare := map[string]int{}
+	for _, v := range victims {
+		deleteIDs = append(deleteIDs, v.ID)
+		if v.ProxyURL != "" {
+			victimShare[v.ProxyURL]++
+		}
+	}
+	_ = store.deleteNodes(deleteIDs)
+	// Keep auth-list cache warm so the UI refresh after delete stays snappy.
+	// Exclusive proxy unbind still invalidates via saveAuthFile.
+	invalidateAuthProxyCache()
+
+	exclusive := make([]string, 0)
+	seen := map[string]struct{}{}
+	for proxy, share := range victimShare {
+		if proxyOwners[proxy] == share {
+			if _, ok := seen[proxy]; ok {
+				continue
+			}
+			seen[proxy] = struct{}{}
+			exclusive = append(exclusive, proxy)
+		}
+	}
+	if len(exclusive) > 0 {
+		proxies := append([]string(nil), exclusive...)
+		go unbindExclusiveProxies(proxies)
+	}
+	// Refresh counts without blocking the delete response.
+	go func() { refreshAssignedCounts(store) }()
+	return len(deleteIDs), exclusive
+}
+
+func unbindExclusiveProxies(proxies []string) {
+	if len(proxies) == 0 {
+		return
+	}
+	want := make(map[string]struct{}, len(proxies))
+	for _, p := range proxies {
+		want[p] = struct{}{}
+	}
+	auths, err := listAuthFiles()
+	if err != nil {
+		return
+	}
+	for _, a := range auths {
+		if _, ok := want[a.ProxyURL]; !ok {
+			continue
+		}
+		_ = setAuthProxyAndFlags(a, "", a.Disabled, "")
+	}
 }
 
 // listBoundAuthSummaries returns lightweight account info for a node (no secrets).

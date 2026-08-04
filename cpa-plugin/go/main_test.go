@@ -258,6 +258,104 @@ func TestRequestInterceptorRejectsQuarantinedAuth(t *testing.T) {
 	}
 }
 
+func TestMatchIsolationKeyword(t *testing.T) {
+	if got := matchIsolationKeyword([]byte(`{"name":"ListMcpResourcesTool"}`), []string{"ListMcpResourcesTool"}); got != "ListMcpResourcesTool" {
+		t.Fatalf("match=%q", got)
+	}
+	if got := matchIsolationKeyword([]byte(`{"name":"other"}`), []string{"ListMcpResourcesTool"}); got != "" {
+		t.Fatalf("unexpected match=%q", got)
+	}
+	if got := matchIsolationKeyword(nil, []string{"ListMcpResourcesTool"}); got != "" {
+		t.Fatalf("empty body match=%q", got)
+	}
+}
+
+func TestNormalizeIsolationKeywords(t *testing.T) {
+	got := normalizeIsolationKeywords([]string{"  ListMcpResourcesTool ", "", "ListMcpResourcesTool", "other"})
+	if len(got) != 2 || got[0] != "ListMcpResourcesTool" || got[1] != "other" {
+		t.Fatalf("normalize=%#v", got)
+	}
+}
+
+func TestResponseInterceptorKeywordIsolatesNode(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	if _, err := store.createNode("spare", "http://127.0.0.1:7950", true, false, 0); err != nil {
+		t.Fatal(err)
+	}
+	node, err := store.createNode("target", "http://127.0.0.1:7951", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pol := store.policy()
+	pol.IsolationKeywords = []string{"ListMcpResourcesTool"}
+	if err := store.updatePolicy(pol); err != nil {
+		t.Fatal(err)
+	}
+	authProxyMu.Lock()
+	authProxyCache = map[string]string{"auth-kw": node.ProxyURL}
+	authProxyAt = time.Now()
+	authProxyMu.Unlock()
+
+	// Request body must NOT quarantine.
+	reqRaw, _ := json.Marshal(pluginapi.RequestInterceptRequest{
+		Metadata: map[string]any{"selected_auth_id": "auth-kw"},
+		Body:     []byte(`{"content":[{"type":"tool_use","name":"ListMcpResourcesTool"}]}`),
+	})
+	if _, err := handleRequestIntercept(reqRaw, true); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := store.getNode(node.ID); n.DisabledByGuard {
+		t.Fatal("request body must not quarantine")
+	}
+
+	respRaw, _ := json.Marshal(pluginapi.ResponseInterceptRequest{
+		Metadata: map[string]any{"selected_auth_id": "auth-kw"},
+		Body:     []byte(`{"content":[{"type":"tool_use","name":"ListMcpResourcesTool"}]}`),
+	})
+	if _, err := handleResponseIntercept(respRaw); err != nil {
+		t.Fatal(err)
+	}
+	updated, ok := store.getNode(node.ID)
+	if !ok || !updated.DisabledByGuard {
+		t.Fatalf("node not quarantined: ok=%v node=%#v", ok, updated)
+	}
+	if !strings.Contains(updated.LastReason, "ListMcpResourcesTool") {
+		t.Fatalf("reason=%q", updated.LastReason)
+	}
+}
+
+func TestStreamChunkInterceptorKeywordIsolatesNode(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	if _, err := store.createNode("spare", "http://127.0.0.1:7950", true, false, 0); err != nil {
+		t.Fatal(err)
+	}
+	node, err := store.createNode("target", "http://127.0.0.1:7952", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pol := store.policy()
+	pol.IsolationKeywords = []string{"ListMcpResourcesTool"}
+	if err := store.updatePolicy(pol); err != nil {
+		t.Fatal(err)
+	}
+	authProxyMu.Lock()
+	authProxyCache = map[string]string{"auth-stream": node.ProxyURL}
+	authProxyAt = time.Now()
+	authProxyMu.Unlock()
+
+	raw, _ := json.Marshal(pluginapi.StreamChunkInterceptRequest{
+		Metadata: map[string]any{"selected_auth_id": "auth-stream"},
+		Body:     []byte(`data: {"delta":{"content":"ListMcpResourcesTool"}}`),
+	})
+	if _, err := handleStreamChunkIntercept(raw); err != nil {
+		t.Fatal(err)
+	}
+	updated, ok := store.getNode(node.ID)
+	if !ok || !updated.DisabledByGuard {
+		t.Fatalf("stream keyword did not quarantine: ok=%v %#v", ok, updated)
+	}
+}
+
 func TestClassifyTPS(t *testing.T) {
 	if classifyTPS(1200, 500, 1000) != "hard" {
 		t.Fatal("expected hard")
@@ -398,4 +496,72 @@ func TestDispatchNodesImportRedactsProxyURLs(t *testing.T) {
 	if len(store.listNodes()) != 2 {
 		t.Fatalf("node count=%d", len(store.listNodes()))
 	}
+}
+
+
+func TestDeleteManagedNodesIsImmediate(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	// Two Clash-like leaves sharing one proxy must not block delete on host auth I/O.
+	shared := "http://127.0.0.1:7890"
+	a, err := store.createNode("leaf-a", shared, true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := store.createNode("leaf-b", shared, true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = store.updateNode(a.ID, func(n *nodeRecord) error {
+		n.Source = nodeSourceClash
+		n.ClashName = "A"
+		return nil
+	})
+	_, _ = store.updateNode(b.ID, func(n *nodeRecord) error {
+		n.Source = nodeSourceClash
+		n.ClashName = "B"
+		return nil
+	})
+
+	// Delete itself must stay host-free. Async unbind/count refresh may touch host
+	// later; those calls must not block the delete path under test.
+	orig := hostCall
+	hostCalls := 0
+	defer func() { hostCall = orig }()
+	hostCall = func(method string, payload []byte) (json.RawMessage, error) {
+		hostCalls++
+		return nil, fmt.Errorf("host disabled in delete test: %s", method)
+	}
+
+	deleted, exclusive := deleteManagedNodes(store, []string{a.ID})
+	if hostCalls != 0 {
+		t.Fatalf("delete path issued %d host calls", hostCalls)
+	}
+	if deleted != 1 {
+		t.Fatalf("deleted=%d", deleted)
+	}
+	if len(exclusive) != 0 {
+		t.Fatalf("shared proxy must not unbind exclusively: %#v", exclusive)
+	}
+	if _, ok := store.getNode(a.ID); ok {
+		t.Fatal("node a still present")
+	}
+	if _, ok := store.getNode(b.ID); !ok {
+		t.Fatal("node b should remain")
+	}
+
+	// Exclusive manual proxy is scheduled for async unbind, but delete itself stays host-free.
+	manual, err := store.createNode("manual", "http://127.0.0.1:7951", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleted, exclusive = deleteManagedNodes(store, []string{manual.ID})
+	if deleted != 1 || len(exclusive) != 1 || exclusive[0] != "http://127.0.0.1:7951" {
+		t.Fatalf("deleted=%d exclusive=%#v", deleted, exclusive)
+	}
+	if _, ok := store.getNode(manual.ID); ok {
+		t.Fatal("manual node still present after exclusive delete")
+	}
+	// Async unbind / assigned-count refresh may touch host after return; that is
+	// intentional and must not be asserted as a synchronous delete-path failure.
+	time.Sleep(20 * time.Millisecond)
 }
