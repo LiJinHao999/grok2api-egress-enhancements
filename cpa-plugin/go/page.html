@@ -38,9 +38,20 @@
     .button.danger:hover { background: var(--danger-surface); }
     .button.icon { width: 2.25rem; padding: 0; font-size: var(--text-lg); font-weight: 400; }
     .button.busy::before { content: ""; width: 0.75rem; height: 0.75rem; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin 0.7s linear infinite; }
-    .metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); overflow: hidden; border: var(--rule-hairline) solid var(--border); border-radius: var(--radius-md); background: var(--card); }
+    .metrics { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); overflow: hidden; border: var(--rule-hairline) solid var(--border); border-radius: var(--radius-md); background: var(--card); }
     .metric { min-width: 0; min-height: 5.25rem; padding: var(--space-sm); border-right: var(--rule-hairline) solid var(--border); }
     .metric:last-child { border-right: 0; }
+    .queue-banner {
+      display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-sm);
+      padding: var(--space-xs) var(--space-sm);
+      border: var(--rule-hairline) solid var(--border); border-radius: var(--radius-md);
+      background: color-mix(in oklch, var(--warning-surface) 70%, var(--card));
+    }
+    .queue-banner[data-idle="1"] { background: var(--card); }
+    .queue-banner strong { font-size: var(--text-sm); }
+    .queue-banner p { margin: var(--space-3xs) 0 0; color: var(--muted-foreground); font-size: var(--text-xs); }
+    .queue-list { margin: var(--space-3xs) 0 0; padding-left: 1.1rem; color: var(--muted-foreground); font-size: var(--text-2xs); }
+    .queue-list li + li { margin-top: 0.15rem; }
     .metric-label { color: var(--muted-foreground); font-size: var(--text-xs); }
     .metric-value { margin-top: var(--space-3xs); font-size: var(--text-lg); font-weight: 650; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
     .metric-detail { margin-top: var(--space-3xs); color: var(--muted-foreground); font-size: var(--text-2xs); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -170,6 +181,23 @@
       .row-actions { width: 100%; }
       .row-actions .button { flex: 1; }
     }
+
+    .panel-tabs { display:flex; gap: var(--space-2xs); margin-top: var(--space-xs); flex-wrap: wrap; }
+    .panel-tab.active { background: var(--primary); color: var(--primary-foreground); border-color: var(--primary); }
+    .panel-view[hidden] { display:none !important; }
+    .analytics-grid { display:grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: var(--space-sm); }
+    .analytics-card { border: var(--rule-hairline) solid var(--border); border-radius: var(--radius-md); background: var(--card); padding: var(--space-sm); }
+    .analytics-card h3 { margin:0 0 var(--space-2xs); font-size: var(--text-sm); }
+    .analytics-bar { display:flex; height: 0.55rem; border-radius: 999px; overflow:hidden; background: var(--muted); margin: var(--space-2xs) 0; }
+    .analytics-bar > span { display:block; height:100%; }
+    .bar-healthy { background: var(--success); }
+    .bar-soft { background: var(--warning); }
+    .bar-hard { background: var(--destructive); }
+    .bar-error { background: color-mix(in oklch, var(--destructive) 60%, var(--muted)); }
+    .bar-ignored { background: var(--muted-foreground); opacity:0.45; }
+    .node-stat-row { display:flex; justify-content:space-between; gap: var(--space-sm); padding: 0.2rem 0; border-bottom: var(--rule-hairline) solid var(--border); font-size: var(--text-2xs); }
+    .node-stat-row:last-child { border-bottom:0; }
+    @media (max-width: 900px) { .analytics-grid { grid-template-columns: 1fr; } }
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after { animation-duration: 1ms !important; animation-iteration-count: 1 !important; transition-duration: 1ms !important; }
     }
@@ -181,6 +209,10 @@
       <div>
         <h1>出口守护</h1>
         <p>纯 CPA 实现 · 可对接本机 Clash PerfectAI · 降智时 API 切换节点 · 质量检测</p>
+        <div class="panel-tabs" role="tablist" aria-label="面板切换">
+          <button type="button" class="button panel-tab active" data-panel="ops" role="tab" aria-selected="true">运维节点</button>
+          <button type="button" class="button panel-tab" data-panel="analytics" role="tab" aria-selected="false">数据统计</button>
+        </div>
       </div>
       <div class="head-actions">
         <span class="status-line"><span id="service-dot" class="status-dot"></span><span id="service-text">正在连接</span><span id="plugin-version" style="margin-left:0.35rem;opacity:0.75"></span></span>
@@ -194,8 +226,19 @@
       <div class="metric"><div class="metric-label">运行模式</div><div id="metric-mode" class="metric-value">-</div><div id="metric-model" class="metric-detail">-</div></div>
       <div class="metric"><div class="metric-label">可调度节点</div><div id="metric-enabled" class="metric-value">-</div><div id="metric-total" class="metric-detail">-</div></div>
       <div class="metric"><div class="metric-label">已隔离</div><div id="metric-quarantined" class="metric-value">-</div><div id="metric-next" class="metric-detail">严格质量恢复</div></div>
+      <div class="metric"><div class="metric-label">测试队列</div><div id="metric-queue" class="metric-value">空闲</div><div id="metric-queue-detail" class="metric-detail">质量检测全局串行</div></div>
     </section>
 
+    <section id="queue-banner" class="queue-banner" data-idle="1" aria-label="质量检测排队">
+      <div>
+        <strong id="queue-title">质量检测队列空闲</strong>
+        <p id="queue-summary">真实模型探测全局串行；Clash 出口一次只测一个，避免切换交叉。</p>
+        <ol id="queue-list" class="queue-list" hidden></ol>
+      </div>
+      <div class="status-line"><span id="queue-dot" class="status-dot"></span><span id="queue-state-text">空闲</span></div>
+    </section>
+
+    <div id="panel-ops" class="panel-view stack" data-panel-view="ops">
     <section class="section" aria-labelledby="nodes-title">
       <div class="section-head">
         <div><h2 id="nodes-title">出口节点</h2><p id="nodes-freshness">页面每 15 秒刷新；节点健康状态随请求审计或主动检测更新，代理凭据不会回显</p></div>
@@ -221,9 +264,9 @@
         <table>
           <thead><tr>
             <th class="check-cell"><input id="select-all" type="checkbox" aria-label="选择所有节点"></th>
-            <th>节点</th><th>状态</th><th>出口 IP</th><th class="numeric">输出 Token/s</th><th class="numeric">首字</th><th>账号</th><th>最近观测</th><th class="actions-col">操作</th>
+            <th>节点</th><th>状态</th><th>可用性</th><th>出口 IP</th><th class="numeric">输出 Token/s</th><th class="numeric">首字</th><th>账号</th><th>最近观测</th><th class="actions-col">操作</th>
           </tr></thead>
-          <tbody id="nodes-body"><tr><td colspan="9" class="loading">正在加载节点</td></tr></tbody>
+          <tbody id="nodes-body"><tr><td colspan="10" class="loading">正在加载节点</td></tr></tbody>
         </table>
       </div>
       <div id="node-cards" class="node-cards" aria-label="节点卡片"></div>
@@ -258,6 +301,22 @@
       </div>
       <dl id="clash-view" class="policy"></dl>
     </section>
+
+    </div>
+    <div id="panel-analytics" class="panel-view stack" data-panel-view="analytics" hidden>
+      <section class="section">
+        <div class="section-head"><div><h2>总览</h2><p>主动探测 / 被动审计 / 降智隔离汇总</p></div></div>
+        <div id="analytics-summary" class="analytics-grid" style="padding:var(--space-sm)"></div>
+      </section>
+      <section class="section">
+        <div class="section-head"><div><h2>节点探测与降智</h2><p>按节点汇总质量评分、可用/降智时长、Token/s</p></div></div>
+        <div id="analytics-nodes" style="padding:var(--space-sm); max-height:28rem; overflow:auto"></div>
+      </section>
+      <section class="section">
+        <div class="section-head"><div><h2>最近降智 / 复测事件</h2><p>隔离、恢复、thinking 复测、测试组切换</p></div></div>
+        <div id="analytics-events" class="events" style="padding:var(--space-sm)"></div>
+      </section>
+    </div>
   </main>
 
   <div id="node-modal" class="modal-layer" hidden>
@@ -295,8 +354,10 @@
         <div class="modal-body form-grid">
           <div class="field full check-row"><label for="clash-enabled">启用 Clash 对接</label><input id="clash-enabled" type="checkbox"></div>
           <div class="field full"><label for="clash-api-url">Clash API 端点</label><input id="clash-api-url" type="url" autocomplete="off" placeholder="http://172.19.0.1:7888"><p class="help">external-controller 地址；保存后立即生效</p></div>
-          <div class="field"><label for="clash-group">策略组</label><input id="clash-group" list="clash-group-options" autocomplete="off" placeholder="🏜️ PerfectAI" maxlength="200"><datalist id="clash-group-options"></datalist><p class="help">可手填，或点「拉取策略组」后从列表选</p></div>
-          <div class="field"><label for="clash-proxy-url">本机代理 URL</label><input id="clash-proxy-url" type="text" autocomplete="off" placeholder="http://172.19.0.1:7890"><p class="help">账号统一走的 mixed-port</p></div>
+          <div class="field"><label for="clash-group">生产策略组</label><input id="clash-group" list="clash-group-options" autocomplete="off" placeholder="🏜️ PerfectAI" maxlength="200"><datalist id="clash-group-options"></datalist><p class="help">账号真实流量；隔离/手动切换走这组</p></div>
+          <div class="field"><label for="clash-proxy-url">生产代理 URL</label><input id="clash-proxy-url" type="text" autocomplete="off" placeholder="http://172.19.0.1:7890"><p class="help">账号统一走的 mixed-port</p></div>
+          <div class="field"><label for="clash-test-group">质量探测策略组</label><input id="clash-test-group" list="clash-group-options" autocomplete="off" placeholder="➖ PerfectAI_TestPort" maxlength="200"><p class="help">手动/自动/复测只切这组，不碰生产</p></div>
+          <div class="field"><label for="clash-test-proxy-url">质量探测代理 URL</label><input id="clash-test-proxy-url" type="text" autocomplete="off" placeholder="http://172.19.0.1:7953"><p class="help">探测流量走此端口，与 7890 隔离</p></div>
           <div class="field full"><label for="clash-secret">API Secret</label><input id="clash-secret" type="password" autocomplete="new-password" placeholder="留空保留现有 secret"><p id="clash-secret-help" class="help">优先使用面板 secret；也可依赖主机环境变量</p></div>
           <div class="field full check-row"><div><label for="clash-clear-secret">清除面板 secret</label><p class="help">勾选后改回使用环境变量 / YAML</p></div><input id="clash-clear-secret" type="checkbox"></div>
         </div>
@@ -326,6 +387,9 @@
           <div class="field"><label for="policy-min-output">最小判定 Token 数</label><input id="policy-min-output" type="number" min="1" max="10000"></div>
           <div class="field"><label for="policy-max-output">主动探测最大输出 Token</label><input id="policy-max-output" type="number" min="16" max="4096"></div>
           <div class="field"><label for="policy-model">主动探测模型</label><input id="policy-model" maxlength="120" autocomplete="off"></div>
+          <div class="field full"><label for="policy-probe-api-base">质量探测 API 端点</label><input id="policy-probe-api-base" type="url" autocomplete="off" placeholder="http://192.168.0.109:1493/v1"><p class="help">OpenAI 兼容 base（含 /v1）。走正规网关才能正确记 free 额度冷却；留空则回退 cli-chat-proxy</p></div>
+          <div class="field full"><label for="policy-probe-api-key">质量探测 API Key</label><input id="policy-probe-api-key" type="password" autocomplete="new-password" placeholder="留空保留现有 Key"><p id="policy-probe-api-key-help" class="help">探测专用 Key；不会在状态接口回显</p></div>
+          <div class="field full check-row"><div><label for="policy-probe-api-key-clear">清除探测 API Key</label><p class="help">勾选后改回 cli-chat-proxy / 账号 token 模式</p></div><input id="policy-probe-api-key-clear" type="checkbox"></div>
           <div class="field"><label for="policy-min-healthy">最低健康节点数</label><input id="policy-min-healthy" type="number" min="1" max="1000"></div>
           <div class="field full check-row"><div><label for="policy-disable-auth">迁移失败时停用原节点账号</label><p class="help">启用可防止坏出口继续接收请求；手动停用账号不会被自动恢复</p></div><input id="policy-disable-auth" type="checkbox"></div>
           <div class="field full"><label for="policy-isolation-keywords">响应关键词隔离</label><textarea id="policy-isolation-keywords" rows="4" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="ListMcpResourcesTool&#10;sensitive-tool-name"></textarea><p class="help">每行一个关键词；上游响应（含流式 chunk）命中任一关键词时，隔离当前出口。不检查请求 Body。留空关闭。</p></div>
@@ -356,7 +420,7 @@
     'use strict';
     const PLUGIN_BASE = '/v0/resource/plugins/grok2api-egress';
     const MANAGEMENT_API = '/v0/management/grok2api-egress/api';
-    const state = { status: null, nodes: [], selected: new Set(), search: '', editing: null, confirm: null, loading: false, autoTimer: 0 };
+    const state = { status: null, nodes: [], selected: new Set(), search: '', editing: null, confirm: null, loading: false, autoTimer: 0, panel: 'ops' };
     const $ = (id) => document.getElementById(id);
     const esc = (value) => String(value ?? '').replace(/[&<>'"]/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]));
     const number = (value) => new Intl.NumberFormat('zh-CN').format(Number(value || 0));
@@ -402,7 +466,7 @@
       const key = managementKey();
       if (!key) throw new Error('CPA 管理密钥未持久化，请重新登录管理面板并勾选“记住密码”');
       const controller = new AbortController();
-      const timeoutMs = Number(options.timeoutMs) > 0 ? Number(options.timeoutMs) : 20000;
+      const timeoutMs = Number(options.timeoutMs) > 0 ? Number(options.timeoutMs) : 60000;
       const timer = window.setTimeout(() => controller.abort(), timeoutMs);
       let response;
       try {
@@ -460,7 +524,7 @@
       } catch (error) {
         setService(false, '连接失败');
         if ($('plugin-version')) $('plugin-version').textContent = '';
-        $('nodes-body').innerHTML = '<tr><td colspan="9" class="error-state">' + esc(error.message) + '</td></tr>';
+        $('nodes-body').innerHTML = '<tr><td colspan="10" class="error-state">' + esc(error.message) + '</td></tr>';
         if (!silent) toast(error.message, 'error');
       } finally {
         state.loading = false;
@@ -468,7 +532,121 @@
       }
     }
     function render() {
-      renderMetrics(); renderNodes(); renderStatistics(); renderEvents(); renderPolicy(); renderClash();
+      renderMetrics(); renderQueue(); renderNodes(); renderStatistics(); renderEvents(); renderPolicy(); renderClash(); renderAnalytics();
+    }
+    function switchPanel(name) {
+      state.panel = name === 'analytics' ? 'analytics' : 'ops';
+      document.querySelectorAll('.panel-tab').forEach((btn) => {
+        const on = btn.dataset.panel === state.panel;
+        btn.classList.toggle('active', on);
+        btn.setAttribute('aria-selected', on ? 'true' : 'false');
+      });
+      document.querySelectorAll('[data-panel-view]').forEach((el) => {
+        el.hidden = el.dataset.panelView !== state.panel;
+      });
+      if (state.panel === 'analytics') renderAnalytics();
+    }
+    function renderAnalytics() {
+      const stats = state.status?.statistics || {active:{},passive:{},actions:{}};
+      const a = stats.active || {}, p = stats.passive || {}, act = stats.actions || {};
+      const sum = (k) => Number(a[k]||0) + Number(p[k]||0);
+      const total = sum('total') || 1;
+      const parts = [
+        ['healthy', sum('healthy'), 'bar-healthy'],
+        ['soft', sum('soft'), 'bar-soft'],
+        ['hard', sum('hard'), 'bar-hard'],
+        ['errors', sum('errors'), 'bar-error'],
+        ['ignored', sum('ignored'), 'bar-ignored']
+      ];
+      const bar = parts.map(([k,v,cls]) => '<span class="' + cls + '" style="width:' + Math.max(0, v/total*100).toFixed(1) + '%" title="' + k + ':' + v + '"></span>').join('');
+      if ($('analytics-summary')) {
+        $('analytics-summary').innerHTML = [
+          ['主动探测', a.total||0, '健康 ' + (a.healthy||0) + ' · 软 ' + (a.soft||0) + ' · 硬 ' + (a.hard||0)],
+          ['被动审计', p.total||0, '健康 ' + (p.healthy||0) + ' · 软 ' + (p.soft||0) + ' · 硬 ' + (p.hard||0)],
+          ['降智操作', act.quarantined||0, '恢复 ' + (act.restored||0) + ' · 抑制 ' + (act.suppressed||0)],
+          ['输出 Token', (a.output_tokens||0)+(p.output_tokens||0), '主动 ' + (a.output_tokens||0) + ' · 被动 ' + (p.output_tokens||0)]
+        ].map((row) => '<div class="analytics-card"><h3>' + row[0] + '</h3><div class="metric-value">' + number(row[1]) + '</div><div class="metric-detail">' + esc(row[2]) + '</div></div>').join('')
+          + '<div class="analytics-card" style="grid-column:1/-1"><h3>分类占比</h3><div class="analytics-bar">' + bar + '</div><div class="metric-detail">绿健康 · 黄软阈值 · 红硬/降智 · 灰忽略</div></div>';
+      }
+      const guardNodes = state.status?.nodes || {};
+      const rows = (state.nodes||[]).map((node) => {
+        const g = guardNodes[node.id] || {};
+        const avail = nodeAvailability(node, g);
+        return {node, g, tps: Number(g.last_output_tps||0), cls: g.last_classification||'', q: !!g.disabled_by_guard, avail};
+      }).sort((x,y) => {
+        const sx = x.avail.score == null ? -1 : x.avail.score;
+        const sy = y.avail.score == null ? -1 : y.avail.score;
+        return (y.q - x.q) || (sy - sx) || (y.tps - x.tps);
+      });
+      if ($('analytics-nodes')) {
+        if (!rows.length) $('analytics-nodes').innerHTML = '<div class="empty">暂无节点</div>';
+        else $('analytics-nodes').innerHTML = rows.map(({node,g,tps,cls,q,avail}) =>
+          '<div class="node-stat-row"><div><strong>' + esc(node.name) + '</strong> · ' + (q?'<span class="badge bad">已隔离</span>':'<span class="badge muted">' + esc(cls||'待测') + '</span>') + ' ' + qualityBadge(avail.score) +
+          '<div class="subtext" title="' + esc(g.last_reason||'') + '">' + esc(availabilityLine(node, g)) + '</div>' +
+          '<div class="subtext" title="' + esc(g.last_reason||'') + '">' + esc(g.last_reason || node.exitIp || '-') + '</div></div>' +
+          '<div class="numeric">' + (tps?tps.toFixed(1):'-') + ' t/s<div class="subtext">正常 ' + number(avail.healthyObs) + '/' + number(avail.healthyObs+avail.degradedObs) + ' · 使用 ' + formatDurationMs(avail.totalActive) + ' · 降智 ' + formatDurationMs(avail.totalQ) + '</div></div></div>'
+        ).join('');
+      }
+      const events = state.status?.recentEvents || [];
+      const interesting = new Set(['node_quarantined','node_restored','thinking_recheck_queued','quality_probe_completed','clash_switched','clash_test_switched','quarantine_suppressed']);
+      const filtered = events.filter((e) => interesting.has(e.event) || e.classification==='hard' || e.classification==='soft').slice().reverse().slice(0,40);
+      if ($('analytics-events')) {
+        if (!filtered.length) $('analytics-events').innerHTML = '<div class="empty">暂无事件</div>';
+        else $('analytics-events').innerHTML = filtered.map((e) => '<div class="event"><div><strong>' + esc(e.event) + ' · ' + esc(e.node_name||e.node_id||'-') + '</strong><small>' + esc(e.reason||e.classification||'-') + (e.output_tps?(' · '+Number(e.output_tps).toFixed(1)+' t/s'):'') + '</small></div><time>' + relative(e.ts) + '</time></div>').join('');
+      }
+    }
+    document.addEventListener('click', (event) => {
+      const tab = event.target.closest('.panel-tab');
+      if (tab && tab.dataset.panel) switchPanel(tab.dataset.panel);
+    });
+
+    function qualityQueue() {
+      return state.status?.quality_queue || state.status?.qualityQueue || {};
+    }
+    function renderQueue() {
+      const q = qualityQueue();
+      const active = q.active || null;
+      const pending = Array.isArray(q.pending) ? q.pending : [];
+      const total = Number(q.total || ((active ? 1 : 0) + pending.length));
+      const busy = !!q.busy || !!active || pending.length > 0;
+      const banner = $('queue-banner');
+      const list = $('queue-list');
+      if (!banner || !list) return;
+      banner.dataset.idle = busy ? '0' : '1';
+      $('metric-queue').textContent = busy ? String(total) : '空闲';
+      $('metric-queue').className = 'metric-value ' + (busy ? 'tone-warn' : 'tone-good');
+      if (!busy) {
+        $('metric-queue-detail').textContent = '质量检测全局串行';
+        $('queue-title').textContent = '质量检测队列空闲';
+        $('queue-summary').textContent = '真实模型探测全局串行；Clash 出口一次只测一个，避免切换交叉。';
+        $('queue-state-text').textContent = '空闲';
+        $('queue-dot').className = 'status-dot good';
+        list.hidden = true;
+        list.innerHTML = '';
+        return;
+      }
+      const activeName = active ? (active.node_name || active.node_id || '-') : '-';
+      const activeSource = active ? (active.source_label || active.source || '检测') : '';
+      $('metric-queue-detail').textContent = active
+        ? ('执行中 ' + activeName + (pending.length ? (' · 排队 ' + pending.length) : ''))
+        : ('排队 ' + pending.length);
+      $('queue-title').textContent = active
+        ? ('正在检测：' + activeName + (activeSource ? '（' + activeSource + '）' : ''))
+        : ('排队中：' + pending.length + ' 个任务');
+      $('queue-summary').textContent = pending.length
+        ? ('后面还有 ' + pending.length + ' 个任务等待；不会并发切换 Clash。')
+        : '当前仅这一项在执行，完成后自动接下一项。';
+      $('queue-state-text').textContent = active ? '执行中' : '排队中';
+      $('queue-dot').className = 'status-dot ' + (active ? 'bad' : 'good');
+      const rows = [];
+      if (active) {
+        rows.push('<li><strong>执行中</strong> · ' + esc(activeName) + ' · ' + esc(activeSource || '检测') + '</li>');
+      }
+      pending.forEach((item, index) => {
+        rows.push('<li>排队 #' + (index + 1) + ' · ' + esc(item.node_name || item.node_id || '-') + ' · ' + esc(item.source_label || item.source || '检测') + '</li>');
+      });
+      list.innerHTML = rows.join('');
+      list.hidden = rows.length === 0;
     }
     function renderMetrics() {
       const status = state.status || {};
@@ -485,9 +663,9 @@
       $('metric-total').textContent = '已启用 / 全部 CPA 出口节点';
       const clash = status.clash || {};
       if (clash.enabled) {
-        $('nodes-freshness').textContent = (clash.reachable ? 'Clash 已连接 · 组 ' + (clash.group || '-') + ' · 当前 ' + (clash.now || '-') : 'Clash 未连通：' + (clash.message || '-')) + '；节点健康随请求审计或主动检测更新';
+        $('nodes-freshness').textContent = (clash.reachable ? 'Clash 已连接 · 组 ' + (clash.group || '-') + ' · 当前 ' + (clash.now || '-') : 'Clash 未连通：' + (clash.message || '-')) + '；节点健康随请求审计或主动检测更新；质量检测全局串行';
       } else {
-        $('nodes-freshness').textContent = '页面每 15 秒刷新；未启用 Clash 对接时仍可手动管理代理节点';
+        $('nodes-freshness').textContent = '页面每 15 秒刷新；质量检测全局串行排队，避免 Clash 出口交叉';
       }
       $('metric-quarantined').textContent = String(quarantined);
       $('metric-quarantined').className = 'metric-value ' + (quarantined ? 'tone-bad' : 'tone-good');
@@ -517,6 +695,69 @@
       if (left <= 0) return '复测到期';
       if (left < 60) return left + ' 秒后复测';
       return Math.ceil(left / 60) + ' 分钟后复测';
+    }
+    function formatDurationMs(ms) {
+      const value = Number(ms || 0);
+      if (!value || value < 0) return '-';
+      const sec = Math.floor(value / 1000);
+      if (sec < 60) return sec + ' 秒';
+      const min = Math.floor(sec / 60);
+      if (min < 60) return min + ' 分钟';
+      const hour = Math.floor(min / 60);
+      if (hour < 48) {
+        const remMin = min % 60;
+        return remMin ? (hour + ' 小时 ' + remMin + ' 分') : (hour + ' 小时');
+      }
+      const day = Math.floor(hour / 24);
+      const remHour = hour % 24;
+      return remHour ? (day + ' 天 ' + remHour + ' 小时') : (day + ' 天');
+    }
+    function nodeAvailability(node, guard) {
+      const g = guard || {};
+      const n = node || {};
+      const pick = (key) => (g[key] != null ? g[key] : n[key]);
+      const currentActive = Number(pick('current_active_ms') || 0);
+      const totalActive = Number(pick('total_active_ms') || 0);
+      const lastActive = Number(pick('last_active_duration_ms') || 0);
+      const currentQ = Number(pick('current_quarantined_ms') || 0);
+      const totalQ = Number(pick('total_quarantined_ms') || 0);
+      const lastQ = Number(pick('last_quarantine_duration_ms') || 0);
+      const selectedMs = Number(pick('current_selected_ms') || 0);
+      const healthyObs = Number(pick('healthy_obs_count') || 0);
+      const degradedObs = Number(pick('degraded_obs_count') || 0);
+      const sessions = Number(pick('active_sessions') || 0);
+      const qCount = Number(pick('quarantine_count') || 0);
+      const scoreRaw = pick('quality_score');
+      const score = scoreRaw == null || scoreRaw === '' ? null : Number(scoreRaw);
+      // Healthy side is real observation usage, not idle selected wall-clock.
+      const serviceMs = currentActive || lastActive || totalActive;
+      const quarantineMs = currentQ || lastQ || totalQ;
+      return { currentActive, totalActive, lastActive, currentQ, totalQ, lastQ, selectedMs, healthyObs, degradedObs, sessions, qCount, score, serviceMs, quarantineMs };
+    }
+    function qualityBadge(score) {
+      if (score == null || Number.isNaN(score)) return '<span class="badge muted">质量 —</span>';
+      const tone = score >= 80 ? 'good' : score >= 50 ? 'warn' : 'bad';
+      return '<span class="badge ' + tone + '" title="健康时长占比">质量 ' + score.toFixed(1) + '</span>';
+    }
+    function availabilityLine(node, guard) {
+      const a = nodeAvailability(node, guard);
+      const parts = [];
+      if (a.healthyObs || a.degradedObs) {
+        parts.push('正常 ' + a.healthyObs + ' / 降智观测 ' + a.degradedObs);
+      }
+      if (a.serviceMs > 0) {
+        parts.push('实际使用 ' + formatDurationMs(a.serviceMs));
+      }
+      if (a.quarantineMs > 0) {
+        parts.push((a.currentQ > 0 ? '降智中 ' : '曾降智 ') + formatDurationMs(a.quarantineMs));
+      }
+      if (a.selectedMs > 0 && a.serviceMs === 0) {
+        parts.push('已选中(空闲) ' + formatDurationMs(a.selectedMs));
+      }
+      if (a.sessions || a.qCount) {
+        parts.push('切换 ' + a.sessions + ' · 隔离 ' + a.qCount + ' 次');
+      }
+      return parts.join(' · ') || '尚无可用性样本';
     }
     function nextObservation(node, guard) {
       const cfg = state.status?.config || {};
@@ -556,7 +797,7 @@
       $('select-all').checked = nodes.length > 0 && nodes.every((node) => state.selected.has(node.id));
       $('select-all').indeterminate = !($('select-all').checked) && nodes.some((node) => state.selected.has(node.id));
       if (!nodes.length) {
-        $('nodes-body').innerHTML = '<tr><td colspan="9" class="empty">' + (state.search ? '没有匹配的节点' : '暂无出口节点') + '</td></tr>';
+        $('nodes-body').innerHTML = '<tr><td colspan="10" class="empty">' + (state.search ? '没有匹配的节点' : '暂无出口节点') + '</td></tr>';
         $('node-cards').innerHTML = '<div class="empty">' + (state.search ? '没有匹配的节点' : '暂无出口节点') + '</div>';
         return;
       }
@@ -567,10 +808,12 @@
         const observed = guard.last_observed_at || guard.last_probe_at;
         const reason = guard.last_reason || node.probeStatus || '-';
         const cd = quarantineCountdown(guard);
+        const avail = nodeAvailability(node, guard);
         return '<tr data-id="' + esc(node.id) + '">' +
           '<td class="check-cell"><input type="checkbox" data-action="select" ' + (state.selected.has(node.id) ? 'checked' : '') + ' aria-label="选择 ' + esc(node.name) + '"></td>' +
           '<td><div class="node-name" title="' + esc(node.name) + '">' + esc(node.name) + '</div><div class="subtext">ID ' + esc(node.id) + ' · ' + (node.proxyPool ? '代理池' : '固定代理') + '</div></td>' +
-          '<td>' + nodeBadge(node, guard) + '<div class="subtext" title="' + esc(reason) + '">' + esc(reason) + (cd ? ' · ' + cd : '') + '</div></td>' +
+          '<td>' + nodeBadge(node, guard) + ' ' + qualityBadge(avail.score) + '<div class="subtext" title="' + esc(reason) + '">' + esc(reason) + (cd ? ' · ' + cd : '') + '</div></td>' +
+          '<td><div title="真实健康响应累计使用时长（不含空闲选中）">' + (avail.serviceMs ? formatDurationMs(avail.serviceMs) : '-') + '<div class="subtext">正常 ' + number(avail.healthyObs) + ' · 降智观测 ' + number(avail.degradedObs) + '</div></div><div class="subtext" title="降智墙钟时长">' + (avail.quarantineMs ? ('降智 ' + formatDurationMs(avail.quarantineMs)) : '无降智记录') + (avail.totalActive ? (' · 累计使用 ' + formatDurationMs(avail.totalActive)) : '') + '</div></td>' +
           '<td><div>' + esc(node.exitIp || '-') + '</div><div class="subtext">' + esc(node.probeStatus || 'unknown') + ' · ' + number(node.probeLatencyMs) + ' ms</div></td>' +
           '<td class="numeric ' + tpsClass + '">' + (observed ? Number(guard.last_output_tps || 0).toFixed(1) : '-') + '</td>' +
           '<td class="numeric">' + (guard.last_first_token_ms ? number(guard.last_first_token_ms) + ' ms' : '-') + '</td>' +
@@ -583,13 +826,18 @@
         const observed = guard.last_observed_at || guard.last_probe_at;
         const reason = guard.last_reason || node.probeStatus || '-';
         const cd = quarantineCountdown(guard);
+        const avail = nodeAvailability(node, guard);
         return '<article class="node-card" data-id="' + esc(node.id) + '">' +
           '<div class="node-card-head"><div><label><input type="checkbox" data-action="select" ' + (state.selected.has(node.id) ? 'checked' : '') + '> <strong>' + esc(node.name) + '</strong></label>' +
           '<div class="subtext">ID ' + esc(node.id) + ' · ' + (node.proxyPool ? '代理池' : '固定代理') + '</div></div>' + nodeBadge(node, guard) + '</div>' +
           '<div class="subtext" title="' + esc(reason) + '">' + esc(reason) + (cd ? ' · ' + cd : '') + '</div>' +
+          '<div class="subtext">' + qualityBadge(avail.score) + ' · ' + esc(availabilityLine(node, guard)) + '</div>' +
           '<div class="node-card-meta">' +
             '<div><span>出口 IP</span><strong>' + esc(node.exitIp || '-') + '</strong></div>' +
             '<div><span>Token/s</span><strong>' + (observed ? Number(guard.last_output_tps || 0).toFixed(1) : '-') + '</strong></div>' +
+            '<div><span>实际使用</span><strong>' + (avail.serviceMs ? formatDurationMs(avail.serviceMs) : '-') + '</strong></div>' +
+            '<div><span>降智时长</span><strong>' + (avail.quarantineMs ? formatDurationMs(avail.quarantineMs) : '-') + '</strong></div>' +
+            '<div><span>正常/降智观测</span><strong>' + number(avail.healthyObs) + ' / ' + number(avail.degradedObs) + '</strong></div>' +
             '<div><span>首字</span><strong>' + (guard.last_first_token_ms ? number(guard.last_first_token_ms) + ' ms' : '-') + '</strong></div>' +
             '<div><span>账号</span><strong>' + number(node.assignedAccountCount) + ' / ' + (node.accountCapacity || '∞') + '</strong></div>' +
           '</div>' + actionButtons(node) + '</article>';
@@ -612,7 +860,7 @@
     function renderEvents() {
       const events = state.status?.recentEvents || [];
       if (!events.length) { $('events-list').innerHTML = '<div class="empty">暂无守护事件</div>'; return; }
-      const names = {node_quarantined:'节点已隔离',node_restored:'节点已恢复',quality_probe_completed:'质量检测完成',node_rotated:'出口 IP 已轮换',node_rotation_failed:'换 IP 失败',quarantine_suppressed:'隔离已抑制',accounts_migrated:'账号已迁移',accounts_migration_failed:'账号迁移失败',clash_nodes_synced:'Clash 节点已同步',clash_sync_failed:'Clash 同步失败',clash_switched:'Clash 已切换',clash_switch_failed:'Clash 切换失败',keyword_isolated:'关键词隔离',manual_quarantine:'人工降智隔离'};
+      const names = {node_quarantined:'节点已隔离',node_restored:'节点已恢复',quality_probe_completed:'质量检测完成',thinking_recheck_queued:'软阈值→thinking 复测',node_rotated:'出口 IP 已轮换',node_rotation_failed:'换 IP 失败',quarantine_suppressed:'隔离已抑制',accounts_migrated:'账号已迁移',accounts_migration_failed:'账号迁移失败',clash_nodes_synced:'Clash 节点已同步',clash_sync_failed:'Clash 同步失败',clash_switched:'Clash 已切换',clash_switch_failed:'Clash 切换失败',clash_test_switched:'测试组已切换',clash_test_switch_failed:'测试组切换失败',keyword_isolated:'关键词隔离',manual_quarantine:'人工降智隔离'};
       $('events-list').innerHTML = events.slice().reverse().map((event) => '<div class="event"><div><strong>' + esc(names[event.event] || event.event || '守护事件') + ' · ' + esc(event.node_name || ('节点 ' + event.node_id)) + '</strong><small>' + esc(event.reason || event.classification || '-') + (event.output_tps ? ' · ' + Number(event.output_tps).toFixed(1) + ' Token/s' : '') + '</small></div><time>' + relative(event.ts) + '</time></div>').join('');
     }
     function renderPolicy() {
@@ -636,10 +884,12 @@
       if (!$('clash-view')) return;
       const values = [
         ['状态', enabled ? (reachable ? '已连接' : ('未连通：' + (clash.message || '-'))) : '未启用'],
-        ['策略组', clash.group || cfg.group || '-'],
-        ['当前出口', clash.now || '-'],
+        ['生产策略组', clash.group || cfg.group || '-'],
+        ['生产当前出口', clash.now || '-'],
+        ['质量探测组', clash.test_group || cfg.test_group || '-'],
         ['API 端点', clash.api_url || cfg.api_url || '-'],
-        ['本机代理', clash.proxy_url || cfg.proxy_url || '-'],
+        ['生产代理', clash.proxy_url || cfg.proxy_url || '-'],
+        ['探测代理', clash.test_proxy_url || cfg.test_proxy_url || '-'],
         ['Secret', (clash.has_secret || cfg.has_secret) ? '已配置' : '未配置'],
         ['覆盖来源', cfg.ui_override ? '面板' : 'YAML / 默认']
       ];
@@ -670,7 +920,13 @@
       if (!cfg) return;
       $('policy-mode').value = cfg.mode; $('policy-active').value = cfg.active_interval_seconds; $('policy-passive').value = cfg.passive_poll_seconds;
       $('policy-quarantine').value = cfg.quarantine_seconds; $('policy-soft').value = cfg.soft_tps; $('policy-hard').value = cfg.hard_tps;
-      $('policy-soft-count').value = cfg.consecutive_soft; $('policy-error-count').value = cfg.consecutive_errors; $('policy-min-generation').value = cfg.min_generation_ms || 1000; $('policy-min-output').value = cfg.min_output_tokens || 32; $('policy-max-output').value = cfg.max_output_tokens || 384; $('policy-model').value = cfg.model || 'grok-4.5'; $('policy-disable-auth').checked = cfg.disable_auth_on_hard !== false; $('policy-min-healthy').value = cfg.min_healthy_nodes;
+      $('policy-soft-count').value = cfg.consecutive_soft; $('policy-error-count').value = cfg.consecutive_errors; $('policy-min-generation').value = cfg.min_generation_ms || 1000; $('policy-min-output').value = cfg.min_output_tokens || 32; $('policy-max-output').value = cfg.max_output_tokens || 384; $('policy-model').value = cfg.model || 'grok-4.5';
+      $('policy-probe-api-base').value = cfg.probe_api_base || '';
+      $('policy-probe-api-key').value = '';
+      $('policy-probe-api-key-clear').checked = false;
+      $('policy-probe-api-key-help').textContent = cfg.probe_api_key_set
+        ? '已配置探测 Key；留空表示保留，勾选清除则回退 cli-chat-proxy'
+        : '尚未配置；填写后质量探测走正规 API（可记 free 冷却）'; $('policy-disable-auth').checked = cfg.disable_auth_on_hard !== false; $('policy-min-healthy').value = cfg.min_healthy_nodes;
       $('policy-isolation-keywords').value = Array.isArray(cfg.isolation_keywords) ? cfg.isolation_keywords.filter(Boolean).join('\n') : '';
       openModal('policy-modal');
     }
@@ -775,13 +1031,26 @@
     }
     async function qualityTest(node, button) {
       busy(button, true);
+      toast(node.name + '：已进入质量检测队列（全局串行）');
+      // Keep queue banner live while this request may wait behind others.
+      const poll = window.setInterval(() => { if (document.visibilityState === 'visible') load(true).catch(() => {}); }, 3000);
       try {
-        const result = await api('/quality-guard/nodes/' + encodeURIComponent(node.id) + '/test', {method:'POST'});
+        const result = await api('/quality-guard/nodes/' + encodeURIComponent(node.id) + '/test', {method:'POST', timeoutMs: 180000});
         const data = result.data || result;
-        toast(node.name + '：' + (data.classification || '-') + ' · ' + Number(data.tps || 0).toFixed(1) + ' Token/s');
-        await load(true);
+        let detail = (data.classification || '-') + ' · ' + Number(data.tps || 0).toFixed(1) + ' Token/s';
+        if (data.hasThinking === false || data.errorKind === 'missing_thinking') {
+          detail += ' · 无 thinking';
+        } else if (data.hasThinking) {
+          detail += ' · 有 thinking';
+        }
+        if (data.error) detail += ' · ' + data.error;
+        toast(node.name + '：' + detail, (data.classification === 'hard' || data.classification === 'error') ? 'error' : 'success');
+        await load(true, true);
       } catch (error) { toast(error.message, 'error'); }
-      finally { busy(button, false); }
+      finally {
+        window.clearInterval(poll);
+        busy(button, false);
+      }
     }
     async function selectClashNode(node, button) {
       busy(button, true);
@@ -838,6 +1107,10 @@
       const proxyShown = cfg.proxy_url || clash.proxy_url || '';
       $('clash-proxy-url').value = proxyShown.includes('***') ? '' : proxyShown;
       $('clash-proxy-url').placeholder = proxyShown.includes('***') ? (proxyShown + '（留空保留）') : 'http://172.19.0.1:7890';
+      $('clash-test-group').value = cfg.test_group || clash.test_group || '';
+      const testProxyShown = cfg.test_proxy_url || clash.test_proxy_url || '';
+      $('clash-test-proxy-url').value = testProxyShown.includes('***') ? '' : testProxyShown;
+      $('clash-test-proxy-url').placeholder = testProxyShown.includes('***') ? (testProxyShown + '（留空保留）') : 'http://172.19.0.1:7953';
       $('clash-secret').value = '';
       $('clash-clear-secret').checked = false;
       $('clash-secret-help').textContent = (clash.has_secret || cfg.has_secret)
@@ -876,6 +1149,8 @@
         api_url: $('clash-api-url').value.trim(),
         group: $('clash-group').value.trim(),
         proxy_url: $('clash-proxy-url').value.trim(),
+        test_group: $('clash-test-group').value.trim(),
+        test_proxy_url: $('clash-test-proxy-url').value.trim(),
         clear_secret: $('clash-clear-secret').checked
       };
       const secret = $('clash-secret').value.trim();
@@ -983,7 +1258,11 @@
       event.preventDefault();
       const button = $('save-policy');
       const isolationKeywords = ($('policy-isolation-keywords').value || '').split(/\r?\n|[,;]/).map((item) => item.trim()).filter(Boolean);
-      const body = {mode:$('policy-mode').value,activeIntervalSeconds:Number($('policy-active').value),passivePollSeconds:Number($('policy-passive').value),softTPS:Number($('policy-soft').value),hardTPS:Number($('policy-hard').value),consecutiveSoft:Number($('policy-soft-count').value),consecutiveErrors:Number($('policy-error-count').value),minGenerationMs:Number($('policy-min-generation').value),minOutputTokens:Number($('policy-min-output').value),maxOutputTokens:Number($('policy-max-output').value),model:$('policy-model').value.trim(),disableAuthOnHard:$('policy-disable-auth').checked,quarantineSeconds:Number($('policy-quarantine').value),minHealthyNodes:Number($('policy-min-healthy').value),isolationKeywords};
+      const body = {mode:$('policy-mode').value,activeIntervalSeconds:Number($('policy-active').value),passivePollSeconds:Number($('policy-passive').value),softTPS:Number($('policy-soft').value),hardTPS:Number($('policy-hard').value),consecutiveSoft:Number($('policy-soft-count').value),consecutiveErrors:Number($('policy-error-count').value),minGenerationMs:Number($('policy-min-generation').value),minOutputTokens:Number($('policy-min-output').value),maxOutputTokens:Number($('policy-max-output').value),model:$('policy-model').value.trim(),disableAuthOnHard:$('policy-disable-auth').checked,quarantineSeconds:Number($('policy-quarantine').value),minHealthyNodes:Number($('policy-min-healthy').value),isolationKeywords,
+        probe_api_base: $('policy-probe-api-base').value.trim(),
+        probe_api_key: $('policy-probe-api-key').value.trim(),
+        probe_api_key_clear: $('policy-probe-api-key-clear').checked
+      };
       if (body.softTPS >= body.hardTPS) { toast('软阈值必须低于硬阈值', 'error'); return; }
       busy(button, true);
       try { await api('/quality-guard/config', {method:'PUT', body}); toast('守护策略已保存'); closeModal('policy-modal'); await load(true); }

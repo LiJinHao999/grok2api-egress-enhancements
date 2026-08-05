@@ -5,13 +5,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -269,15 +272,180 @@ func probeConnectivity(proxyURL string) (exitIP string, latencyMs int64, err err
 }
 
 type qualityResult struct {
-	Classification string  `json:"classification"`
-	TPS            float64 `json:"tps"`
-	OutputTokens   int64   `json:"output_tokens"`
-	DurationMs     int64   `json:"duration_ms"`
-	FirstTokenMs   int64   `json:"first_token_ms"`
-	ExitIP         string  `json:"exit_ip,omitempty"`
-	Error          string  `json:"error,omitempty"`
-	ErrorKind      string  `json:"error_kind,omitempty"`
-	Model          string  `json:"model,omitempty"`
+	Classification  string  `json:"classification"`
+	TPS             float64 `json:"tps"`
+	OutputTokens    int64   `json:"output_tokens"`
+	DurationMs      int64   `json:"duration_ms"`
+	FirstTokenMs    int64   `json:"first_token_ms"`
+	ExitIP          string  `json:"exit_ip,omitempty"`
+	Error           string  `json:"error,omitempty"`
+	ErrorKind       string  `json:"error_kind,omitempty"`
+	Model           string  `json:"model,omitempty"`
+	HasThinking     bool    `json:"has_thinking,omitempty"`
+	ReasoningTokens int64   `json:"reasoning_tokens,omitempty"`
+}
+
+// qualityProbePrompt is intentionally a short common-sense question that still
+// elicits a thinking/reasoning block on healthy Grok exits. Downgraded exits
+// typically answer without any thinking block.
+const qualityProbePrompt = "我要去洗车，但洗车店离我家只有5m,我应该走路去还是开车去？请思考后直接给出答案"
+
+const missingThinkingReason = "探测响应缺少 thinking（疑似降智）"
+const probeTimeoutReason = "探测超时（按降智处理）"
+const probeUnstableReason = "不一定降智，但节点断流不稳定，标记为降智，暂不使用"
+
+func isProbeTimeoutErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "client.timeout") ||
+		strings.Contains(msg, "context deadline exceeded") ||
+		strings.Contains(msg, "context canceled") ||
+		strings.Contains(msg, "i/o timeout") ||
+		(strings.Contains(msg, "timeout") && strings.Contains(msg, "waiting for"))
+}
+
+// Transport flakiness that often means the exit is unusable even if not "dumb".
+func isProbeUnstableErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isProbeTimeoutErr(err) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	markers := []string{
+		"unexpected eof", "eof", "connection reset", "connection refused",
+		"broken pipe", "stream error", "http2: stream", "server closed idle connection",
+		"tls:", "tls handshake", "use of closed network connection",
+	}
+	for _, m := range markers {
+		if strings.Contains(msg, m) {
+			return true
+		}
+	}
+	return false
+}
+
+func probeAPIConfigured(pol policyConfig) bool {
+	return strings.TrimSpace(pol.ProbeAPIBase) != "" && strings.TrimSpace(pol.ProbeAPIKey) != ""
+}
+
+// deltaHasThinking reports whether a streamed delta/message carries any
+// thinking / reasoning signal. Downgraded nodes answer without these fields.
+func deltaHasThinking(delta map[string]any) bool {
+	if delta == nil {
+		return false
+	}
+	for _, key := range []string{
+		"reasoning_content", "reasoningContent",
+		"thinking", "thinking_content", "thinkingContent",
+		"reasoning", "reasoning_text", "reasoningText",
+	} {
+		switch v := delta[key].(type) {
+		case string:
+			if strings.TrimSpace(v) != "" {
+				return true
+			}
+		case map[string]any:
+			if deltaHasThinking(v) {
+				return true
+			}
+		}
+	}
+	// Nested details used by some OpenAI-compatible gateways.
+	for _, key := range []string{"reasoning_details", "reasoningDetails"} {
+		if nested, ok := delta[key].(map[string]any); ok && deltaHasThinking(nested) {
+			return true
+		}
+	}
+	// Anthropic-style content blocks: [{type:"thinking", thinking:"..."}]
+	if blocks, ok := delta["content"].([]any); ok {
+		for _, raw := range blocks {
+			block, _ := raw.(map[string]any)
+			if block == nil {
+				continue
+			}
+			typ := strings.ToLower(strings.TrimSpace(fmt.Sprint(block["type"])))
+			if typ == "thinking" || typ == "reasoning" || typ == "reasoning_content" {
+				return true
+			}
+			for _, key := range []string{"thinking", "reasoning", "text", "reasoning_content"} {
+				if s, ok := block[key].(string); ok && strings.TrimSpace(s) != "" && (typ == "thinking" || typ == "reasoning" || key != "text") {
+					if typ == "thinking" || typ == "reasoning" || key == "thinking" || key == "reasoning" || key == "reasoning_content" {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+func usageReasoningTokens(u map[string]any) int64 {
+	if u == nil {
+		return 0
+	}
+	total := maxInt64(
+		anyInt(u["reasoning_tokens"]),
+		anyInt(u["reasoningTokens"]),
+		anyInt(u["ReasoningTokens"]),
+	)
+	for _, key := range []string{
+		"completion_tokens_details", "completionTokensDetails",
+		"output_tokens_details", "outputTokensDetails",
+	} {
+		if details, ok := u[key].(map[string]any); ok {
+			total = maxInt64(total,
+				anyInt(details["reasoning_tokens"]),
+				anyInt(details["reasoningTokens"]),
+				anyInt(details["ReasoningTokens"]),
+			)
+		}
+	}
+	return total
+}
+
+func chunkDebugSummary(chunk map[string]any) string {
+	if chunk == nil {
+		return "{}"
+	}
+	keys := make([]string, 0, len(chunk))
+	for k := range chunk {
+		keys = append(keys, k)
+	}
+	summary := "keys=" + strings.Join(keys, ",")
+	if choices, ok := chunk["choices"].([]any); ok && len(choices) > 0 {
+		if cm, ok := choices[0].(map[string]any); ok {
+			if delta, ok := cm["delta"].(map[string]any); ok {
+				dk := make([]string, 0, len(delta))
+				for k, v := range delta {
+					switch t := v.(type) {
+					case string:
+						dk = append(dk, fmt.Sprintf("%s(str:%d)", k, len(t)))
+					default:
+						dk = append(dk, fmt.Sprintf("%s(%T)", k, v))
+					}
+				}
+				summary += " delta=[" + strings.Join(dk, ",") + "]"
+			}
+			if msg, ok := cm["message"].(map[string]any); ok {
+				mk := make([]string, 0, len(msg))
+				for k := range msg {
+					mk = append(mk, k)
+				}
+				summary += " message=[" + strings.Join(mk, ",") + "]"
+			}
+		}
+	}
+	if u, ok := chunk["usage"].(map[string]any); ok {
+		summary += fmt.Sprintf(" usage(reason=%d out=%d)", usageReasoningTokens(u), outputTokensFromUsage(u))
+	}
+	return summary
 }
 
 func rotationAllowed(cfg pluginConfig, nodeID string) bool {
@@ -403,7 +571,42 @@ func isAuthErrorRetryable(status int, body string) bool {
 		strings.Contains(lower, "x_xai_token_auth=none")
 }
 
+// free-usage / quota exhaustion is an account problem, never a node degradation.
+// Always try another CPA xAI account before giving up the probe.
+func isAccountQuotaExhausted(status int, body string) bool {
+	lower := strings.ToLower(body)
+	if strings.Contains(lower, "free-usage-exhausted") ||
+		strings.Contains(lower, "free_usage_exhausted") ||
+		strings.Contains(lower, "subscription:free-usage") ||
+		strings.Contains(lower, "included free usage") {
+		return true
+	}
+	if status == http.StatusTooManyRequests && (strings.Contains(lower, "quota") || strings.Contains(lower, "usage") || strings.Contains(lower, "rate")) {
+		return true
+	}
+	return strings.Contains(lower, "quota") && strings.Contains(lower, "exhaust")
+}
+
+func shouldRetryProbeWithNextAuth(status int, body, kind string, hasMore bool) bool {
+	if !hasMore {
+		return false
+	}
+	if isAccountQuotaExhausted(status, body) {
+		return true
+	}
+	return kind == "account_error" || isAuthErrorRetryable(status, body)
+}
+
+const qualityProbeTimeout = 75 * time.Second
+
 func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
+	return probeQualityContext(context.Background(), store, node)
+}
+
+func probeQualityContext(ctx context.Context, store *stateStore, node *nodeRecord) qualityResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	pol := store.policy()
 	res := qualityResult{Model: pol.Model}
 	if node == nil || node.ProxyURL == "" {
@@ -415,21 +618,33 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 
 	if ip, _, errIP := probeConnectivity(node.ProxyURL); errIP == nil {
 		res.ExitIP = ip
+	} else {
+		log.Printf("egress-guard: quality connectivity warn node=%s err=%v", node.ID, errIP)
 	}
 
-	candidates, err := listAuthsForNode(node, 8)
-	if err != nil || len(candidates) == 0 {
-		res.Classification = "error"
-		res.ErrorKind = "no_account"
-		if err != nil {
-			res.Error = err.Error()
-		} else {
-			res.Error = "没有可用的 CPA xAI 账号"
+	usePublicAPI := probeAPIConfigured(pol)
+	var candidates []authFile
+	var err error
+	if usePublicAPI {
+		// Public gateway records free-usage cooling itself; one synthetic auth slot.
+		candidates = []authFile{{Name: "probe-api", Raw: map[string]any{"access_token": pol.ProbeAPIKey, "base_url": pol.ProbeAPIBase}}}
+	} else {
+		// Prefer several accounts so free-usage-exhausted can rotate. Timeout /
+		// missing-thinking / unstable EOF still return as node verdicts.
+		candidates, err = listAuthsForNode(node, 5)
+		if err != nil || len(candidates) == 0 {
+			res.Classification = "error"
+			res.ErrorKind = "no_account"
+			if err != nil {
+				res.Error = err.Error()
+			} else {
+				res.Error = "没有可用的 CPA xAI 账号"
+			}
+			return res
 		}
-		return res
 	}
 
-	client, err := httpClientThroughProxy(node.ProxyURL, 90*time.Second)
+	client, err := httpClientThroughProxy(node.ProxyURL, qualityProbeTimeout)
 	if err != nil {
 		res.Classification = "error"
 		res.ErrorKind = "transport_error"
@@ -444,31 +659,49 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 	payload := map[string]any{
 		"model": pol.Model,
 		"messages": []map[string]string{
-			{"role": "user", "content": "Write a detailed technical explanation of how TCP slow start works, at least 12 sentences, plain text only."},
+			{"role": "user", "content": qualityProbePrompt},
 		},
 		"stream":      true,
 		"max_tokens":  maxTok,
 		"temperature": 0.7,
 	}
 	body, _ := json.Marshal(payload)
+	mode := "cli-chat-proxy"
+	if usePublicAPI {
+		mode = "public-api"
+	}
+	log.Printf("egress-guard: quality probe begin node=%s name=%q model=%s mode=%s base=%s candidates=%d max_tokens=%d",
+		node.ID, node.Name, pol.Model, mode, pol.ProbeAPIBase, len(candidates), maxTok)
 
 	var lastErr string
 	for i, auth := range candidates {
+		if err := ctx.Err(); err != nil {
+			res.Classification = "error"
+			res.ErrorKind = "transport_error"
+			res.Error = "探测已取消: " + err.Error()
+			return res
+		}
 		token, _ := auth.Raw["access_token"].(string)
 		if strings.TrimSpace(token) == "" {
 			lastErr = "账号缺少 access_token"
 			continue
 		}
-		if isAuthExpired(auth) && i+1 < len(candidates) {
+		if !usePublicAPI && isAuthExpired(auth) && i+1 < len(candidates) {
 			continue
 		}
 		baseURL, _ := auth.Raw["base_url"].(string)
-		if baseURL == "" {
+		if usePublicAPI {
+			baseURL = pol.ProbeAPIBase
+		} else if baseURL == "" {
 			baseURL = "https://cli-chat-proxy.grok.com/v1"
 		}
 		baseURL = strings.TrimRight(baseURL, "/")
+		authLabel := firstNonEmpty(auth.Email, auth.Name, auth.ID, auth.Index)
+		if usePublicAPI {
+			authLabel = "probe-api"
+		}
 
-		req, errReq := http.NewRequest(http.MethodPost, baseURL+"/chat/completions", bytes.NewReader(body))
+		req, errReq := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/chat/completions", bytes.NewReader(body))
 		if errReq != nil {
 			res.Classification = "error"
 			res.ErrorKind = "request_error"
@@ -478,14 +711,36 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 		req.Header.Set("Authorization", "Bearer "+token)
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "text/event-stream")
-		applyGrokClientHeaders(req, auth)
+		if !usePublicAPI {
+			applyGrokClientHeaders(req, auth)
+		} else {
+			req.Header.Set("User-Agent", "CPA-egress-guard/1.1")
+		}
 
 		start := time.Now()
+		log.Printf("egress-guard: quality request node=%s auth=%s mode=%s url=%s/chat/completions", node.ID, authLabel, mode, baseURL)
 		resp, errDo := client.Do(req)
 		if errDo != nil {
-			lastErr = "模型探测请求失败: " + truncate(errDo.Error(), 120)
-			res.ErrorKind = "transport_error"
 			res.DurationMs = time.Since(start).Milliseconds()
+			log.Printf("egress-guard: quality request failed node=%s auth=%s dur=%dms err=%v", node.ID, authLabel, res.DurationMs, errDo)
+			if isProbeTimeoutErr(errDo) || isProbeTimeoutErr(ctx.Err()) {
+				res.Classification = "hard"
+				res.ErrorKind = "probe_timeout"
+				res.Error = probeTimeoutReason
+				res.HasThinking = false
+				log.Printf("egress-guard: quality TIMEOUT -> hard node=%s auth=%s dur=%dms", node.ID, authLabel, res.DurationMs)
+				return res
+			}
+			if isProbeUnstableErr(errDo) {
+				res.Classification = "hard"
+				res.ErrorKind = "probe_unstable"
+				res.Error = probeUnstableReason + " (" + truncate(errDo.Error(), 80) + ")"
+				res.HasThinking = false
+				log.Printf("egress-guard: quality UNSTABLE EOF/reset -> hard node=%s auth=%s err=%v", node.ID, authLabel, errDo)
+				return res
+			}
+			lastErr = "模型探测请求失败: " + truncate(errDo.Error(), 160)
+			res.ErrorKind = "transport_error"
 			continue
 		}
 
@@ -496,8 +751,22 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 			lastErr = msg
 			res.ErrorKind = classifyFailureKind(resp.StatusCode, string(b))
 			res.DurationMs = time.Since(start).Milliseconds()
-			if (res.ErrorKind == "account_error" || isAuthErrorRetryable(resp.StatusCode, string(b))) && i+1 < len(candidates) {
+			bodyText := string(b)
+			log.Printf("egress-guard: quality upstream error node=%s auth=%s status=%d kind=%s body=%q", node.ID, authLabel, resp.StatusCode, res.ErrorKind, truncate(bodyText, 200))
+			hasMore := i+1 < len(candidates)
+			if shouldRetryProbeWithNextAuth(resp.StatusCode, bodyText, res.ErrorKind, hasMore) {
+				if isAccountQuotaExhausted(resp.StatusCode, bodyText) {
+					log.Printf("egress-guard: quality free-usage exhausted -> retry next auth node=%s auth=%s remain=%d", node.ID, authLabel, len(candidates)-i-1)
+				}
 				continue
+			}
+			// Quota exhausted on the last candidate is still an account problem: ignored, not node hard.
+			if isAccountQuotaExhausted(resp.StatusCode, bodyText) {
+				res.Classification = "ignored"
+				res.ErrorKind = "account_quota"
+				res.Error = "账号 free 额度耗尽，已无更多可切换账号: " + truncate(bodyText, 120)
+				log.Printf("egress-guard: quality free-usage exhausted, no more auths node=%s", node.ID)
+				return res
 			}
 			res.Classification = "error"
 			res.Error = msg
@@ -505,14 +774,27 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 		}
 
 		var (
-			firstTokenAt time.Time
-			contentLen   int
-			usageOut     int64
-			usageReason  int64
+			firstTokenAt   time.Time
+			contentLen     int
+			reasoningLen   int
+			usageOut       int64
+			usageReason    int64
+			hasThinking    bool
+			chunkCount     int
+			sampleLogged   int
+			lastChunkDebug string
 		)
 		scanner := bufio.NewScanner(resp.Body)
 		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 		for scanner.Scan() {
+			if err := ctx.Err(); err != nil {
+				_ = resp.Body.Close()
+				res.Classification = "error"
+				res.ErrorKind = "transport_error"
+				res.Error = "探测已取消: " + err.Error()
+				res.DurationMs = time.Since(start).Milliseconds()
+				return res
+			}
 			line := scanner.Text()
 			if !strings.HasPrefix(line, "data:") {
 				continue
@@ -528,24 +810,48 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 			if json.Unmarshal([]byte(data), &chunk) != nil {
 				continue
 			}
+			chunkCount++
+			if sampleLogged < 4 {
+				lastChunkDebug = chunkDebugSummary(chunk)
+				log.Printf("egress-guard: quality chunk sample node=%s auth=%s n=%d %s raw=%q",
+					node.ID, authLabel, chunkCount, lastChunkDebug, truncate(data, 240))
+				sampleLogged++
+			}
 			if u, ok := chunk["usage"].(map[string]any); ok {
 				usageOut = maxInt64(usageOut, outputTokensFromUsage(u))
-				usageReason = maxInt64(usageReason, anyInt(u["reasoning_tokens"]), anyInt(u["reasoningTokens"]))
+				usageReason = maxInt64(usageReason, usageReasoningTokens(u))
+				if usageReason > 0 {
+					hasThinking = true
+				}
 			}
 			choices, _ := chunk["choices"].([]any)
 			for _, c := range choices {
 				cm, _ := c.(map[string]any)
+				if cm == nil {
+					continue
+				}
+				if msg, ok := cm["message"].(map[string]any); ok {
+					if deltaHasThinking(msg) {
+						hasThinking = true
+					}
+				}
 				delta, _ := cm["delta"].(map[string]any)
 				if delta == nil {
 					continue
 				}
-				if t, ok := delta["content"].(string); ok && t != "" {
+				if deltaHasThinking(delta) {
+					hasThinking = true
 					if firstTokenAt.IsZero() {
 						firstTokenAt = time.Now()
 					}
-					contentLen += len([]rune(t))
+					for _, key := range []string{"reasoning_content", "reasoningContent", "thinking", "thinking_content", "reasoning"} {
+						if t, ok := delta[key].(string); ok && t != "" {
+							reasoningLen += len([]rune(t))
+							contentLen += len([]rune(t))
+						}
+					}
 				}
-				if t, ok := delta["reasoning_content"].(string); ok && t != "" {
+				if t, ok := delta["content"].(string); ok && t != "" {
 					if firstTokenAt.IsZero() {
 						firstTokenAt = time.Now()
 					}
@@ -555,10 +861,36 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 		}
 		_ = resp.Body.Close()
 		if scanErr := scanner.Err(); scanErr != nil {
-			lastErr = "模型探测流读取失败: " + truncate(scanErr.Error(), 120)
-			res.ErrorKind = "transport_error"
 			res.DurationMs = time.Since(start).Milliseconds()
+			log.Printf("egress-guard: quality stream read failed node=%s auth=%s err=%v", node.ID, authLabel, scanErr)
+			if isProbeTimeoutErr(scanErr) || isProbeTimeoutErr(ctx.Err()) {
+				res.Classification = "hard"
+				res.ErrorKind = "probe_timeout"
+				res.Error = probeTimeoutReason
+				res.HasThinking = false
+				log.Printf("egress-guard: quality stream TIMEOUT -> hard node=%s auth=%s dur=%dms", node.ID, authLabel, res.DurationMs)
+				return res
+			}
+			if isProbeUnstableErr(scanErr) {
+				res.Classification = "hard"
+				res.ErrorKind = "probe_unstable"
+				res.Error = probeUnstableReason + " (" + truncate(scanErr.Error(), 80) + ")"
+				res.HasThinking = false
+				log.Printf("egress-guard: quality stream UNSTABLE -> hard node=%s auth=%s err=%v", node.ID, authLabel, scanErr)
+				return res
+			}
+			lastErr = "模型探测流读取失败: " + truncate(scanErr.Error(), 160)
+			res.ErrorKind = "transport_error"
 			continue
+		}
+		if err := ctx.Err(); isProbeTimeoutErr(err) {
+			res.DurationMs = time.Since(start).Milliseconds()
+			res.Classification = "hard"
+			res.ErrorKind = "probe_timeout"
+			res.Error = probeTimeoutReason
+			res.HasThinking = false
+			log.Printf("egress-guard: quality ctx TIMEOUT -> hard node=%s auth=%s dur=%dms", node.ID, authLabel, res.DurationMs)
+			return res
 		}
 
 		duration := time.Since(start)
@@ -577,13 +909,40 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 			}
 		}
 		res.OutputTokens = outTokens
+		res.ReasoningTokens = usageReason
+		res.HasThinking = hasThinking || usageReason > 0 || reasoningLen > 0
 		res.TPS = computeTPS(outTokens, res.DurationMs, res.FirstTokenMs, pol.MinGenerationMs)
-		res.Classification = classifyQuality(res.TPS, outTokens, pol)
-		if res.Classification == "unknown" && outTokens == 0 {
+		// Thinking probe verdict first. MinOutputTokens only applies to TPS soft/hard,
+		// not to "has thinking => healthy" for this short car-wash prompt.
+		if !res.HasThinking {
+			res.Classification = "hard"
+			res.Error = missingThinkingReason
+			res.ErrorKind = "missing_thinking"
+			log.Printf("egress-guard: quality MISSING thinking node=%s auth=%s class=hard chunks=%d out_tokens=%d sample=%s",
+				node.ID, authLabel, chunkCount, outTokens, lastChunkDebug)
+			return res
+		}
+		if outTokens == 0 {
 			lastErr = "探测无输出"
 			res.ErrorKind = "no_output"
+			res.Classification = "error"
+			log.Printf("egress-guard: quality no output node=%s auth=%s", node.ID, authLabel)
 			continue
 		}
+		// Has thinking: node is not degraded. Keep TPS class only for diagnostics;
+		// never ignore a successful thinking probe as "too few tokens".
+		tpsClass := classifyQuality(res.TPS, outTokens, pol)
+		if tpsClass == "ignored" || tpsClass == "unknown" || tpsClass == "" {
+			res.Classification = "healthy"
+		} else if tpsClass == "soft" || tpsClass == "hard" {
+			// Still has thinking, so do not isolate on TPS alone from active probe.
+			res.Classification = "healthy"
+			log.Printf("egress-guard: quality thinking present, TPS class=%s ignored for isolation node=%s tps=%.1f", tpsClass, node.ID, res.TPS)
+		} else {
+			res.Classification = tpsClass
+		}
+		log.Printf("egress-guard: quality stream done node=%s auth=%s chunks=%d thinking=true reason_tokens=%d reason_chars=%d content_chars=%d out_tokens=%d tps=%.1f class=%s dur=%dms sample=%s",
+			node.ID, authLabel, chunkCount, usageReason, reasoningLen, contentLen, outTokens, res.TPS, res.Classification, res.DurationMs, lastChunkDebug)
 		res.Error = ""
 		res.ErrorKind = ""
 		return res
@@ -625,6 +984,7 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 	var (
 		doRestore     bool
 		doQuarantine  bool
+		queueThinking bool
 		quarantineWhy string
 		nodeCopy      nodeRecord
 	)
@@ -651,24 +1011,57 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 		case "healthy":
 			n.SoftStrikes = 0
 			n.ErrorStrikes = 0
-			if n.DisabledByGuard && (source == "active" || pol.Mode == "passive") {
+			// Restore only when the probe actually saw thinking. A "healthy" TPS
+			// without thinking is rewritten to hard in probeQuality.
+			if n.DisabledByGuard && res.HasThinking && (source == "active" || pol.Mode == "passive") {
+				markNodeRestored(n, now)
 				n.DisabledByGuard = false
 				n.QuarantinedUntil = 0
 				doRestore = true
 			}
+			// Credit real healthy usage (not idle selected wall-clock).
+			if !n.DisabledByGuard {
+				recordHealthyObservation(n, res.DurationMs)
+			}
 		case "soft":
+			// Soft TPS is only a suspicion. Do NOT isolate on soft alone.
+			// Queue a thinking probe; only missing thinking becomes hard isolation.
 			n.SoftStrikes++
-			if n.SoftStrikes >= pol.ConsecutiveSoft && !n.DisabledByGuard {
-				doQuarantine = true
-				quarantineWhy = fmt.Sprintf("连续软阈值 Token/s=%.1f", res.TPS)
+			if n.DisabledByGuard {
+				n.LastReason = fmt.Sprintf("软阈值 Token/s=%.1f · 已隔离，等待 thinking 复测", res.TPS)
+			} else {
+				n.LastReason = fmt.Sprintf("软阈值 Token/s=%.1f · 排队 thinking 复测确认", res.TPS)
+				queueThinking = true
+				// Soft still means the exit produced a usable response; count as
+				// non-degraded observation until hard/thinking confirms otherwise.
+				recordHealthyObservation(n, res.DurationMs)
 			}
 		case "hard":
+			if strings.TrimSpace(res.Error) != "" {
+				quarantineWhy = res.Error
+			} else if res.ErrorKind == "probe_timeout" {
+				quarantineWhy = probeTimeoutReason
+			} else if res.ErrorKind == "probe_unstable" {
+				quarantineWhy = probeUnstableReason
+			} else if res.ErrorKind == "missing_thinking" || !res.HasThinking {
+				quarantineWhy = missingThinkingReason
+			} else {
+				quarantineWhy = fmt.Sprintf("硬阈值 Token/s=%.1f", res.TPS)
+			}
+			recordDegradedObservation(n)
 			if !n.DisabledByGuard {
 				doQuarantine = true
-				quarantineWhy = fmt.Sprintf("硬阈值 Token/s=%.1f", res.TPS)
+			} else {
+				// Already isolated: refresh countdown + reason so recovery retests
+				// keep the operator-visible thinking verdict.
+				n.QuarantinedUntil = float64(time.Now().Add(time.Duration(pol.QuarantineSec) * time.Second).Unix())
+				n.LastReason = quarantineWhy
+				n.LastClassification = "hard"
 			}
 		case "error":
 			n.ErrorStrikes++
+			// Transport/node-side errors count as degraded observations.
+			recordDegradedObservation(n)
 			if n.ErrorStrikes >= pol.ConsecutiveErrors && !n.DisabledByGuard {
 				doQuarantine = true
 				quarantineWhy = "连续探测错误: " + res.Error
@@ -692,6 +1085,19 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 	}
 	if doQuarantine {
 		quarantineNode(store, nodeCopy.ID, quarantineWhy, res.TPS, res.Classification)
+	}
+	if queueThinking {
+		store.appendEvent(guardEvent{
+			Event:          "thinking_recheck_queued",
+			NodeID:         nodeCopy.ID,
+			NodeName:       nodeCopy.Name,
+			Classification: "soft",
+			OutputTPS:      res.TPS,
+			Reason:         fmt.Sprintf("软阈值 Token/s=%.1f，排队 thinking 复测；无 thinking 才隔离", res.TPS),
+		})
+		log.Printf("egress-guard: soft TPS -> queue thinking recheck node=%s name=%q tps=%.1f source=%s",
+			nodeCopy.ID, nodeCopy.Name, res.TPS, source)
+		_, _ = queueNodeQuality(store, nodeCopy.ID, "soft-recheck", false)
 	}
 	store.bumpStat(source, res.Classification, res.OutputTokens)
 }
@@ -724,11 +1130,15 @@ func quarantineNodeOpts(store *stateStore, nodeID, reason string, tps float64, c
 	}
 	if target.DisabledByGuard {
 		// Already quarantined — refresh reason / countdown for manual re-mark.
+		// Keep original LastQuarantinedAt so continuous quarantine duration is accurate.
 		updated, err := store.updateNode(nodeID, func(n *nodeRecord) error {
 			n.QuarantinedUntil = float64(time.Now().Add(time.Duration(pol.QuarantineSec) * time.Second).Unix())
 			n.LastReason = reason
 			if class != "" {
 				n.LastClassification = class
+			}
+			if n.LastQuarantinedAt <= 0 {
+				markNodeQuarantined(n, float64(time.Now().Unix()))
 			}
 			return nil
 		})
@@ -750,6 +1160,8 @@ func quarantineNodeOpts(store *stateStore, nodeID, reason string, tps float64, c
 		return updated, fmt.Errorf("隔离已抑制：健康节点数低于下限 %d", pol.MinHealthyNodes)
 	}
 	updated, err := store.updateNode(nodeID, func(n *nodeRecord) error {
+		nowUnix := float64(time.Now().Unix())
+		markNodeQuarantined(n, nowUnix)
 		n.DisabledByGuard = true
 		n.QuarantinedUntil = float64(time.Now().Add(time.Duration(pol.QuarantineSec) * time.Second).Unix())
 		n.LastReason = reason
@@ -784,7 +1196,7 @@ func quarantineNodeOpts(store *stateStore, nodeID, reason string, tps float64, c
 	if rotated, err := rotateNodeIfConfigured(store, updated); err != nil {
 		store.appendEvent(guardEvent{Event: "node_rotation_failed", NodeID: updated.ID, NodeName: updated.Name, Reason: err.Error()})
 	} else if rotated {
-		_, _ = runNodeQuality(store, updated.ID)
+		_, _ = queueNodeQuality(store, updated.ID, "rotate", false)
 	}
 	return updated, nil
 }
@@ -814,6 +1226,7 @@ func restoreQuarantinedNode(store *stateStore, nodeID string) (*nodeRecord, erro
 		return n, nil
 	}
 	updated, err := store.updateNode(nodeID, func(node *nodeRecord) error {
+		markNodeRestored(node, float64(time.Now().Unix()))
 		node.DisabledByGuard = false
 		node.QuarantinedUntil = 0
 		node.SoftStrikes = 0
@@ -869,47 +1282,410 @@ func runNodeConnectivity(store *stateStore, id string) (map[string]any, error) {
 	return out, nil
 }
 
-func runNodeQuality(store *stateStore, id string) (map[string]any, error) {
+// executeNodeQuality runs one real-model quality probe. Callers that may race
+// Clash group selection must go through queueNodeQuality instead.
+func executeNodeQuality(store *stateStore, id, source string) (map[string]any, error) {
+	if strings.TrimSpace(source) == "" {
+		source = "manual"
+	}
+	// Observation source controls restore/strike bookkeeping. Recovery/rotate/
+	// manual/active probes all need the same "active" accounting so LastProbeAt
+	// advances and thinking-based hard hits apply.
+	obsSource := "active"
+
 	n, ok := store.getNode(id)
 	if !ok {
 		return nil, fmt.Errorf("节点不存在")
 	}
-	if n.DisabledByGuard && n.QuarantinedUntil > float64(time.Now().Unix()) {
-	}
-	// Clash leaf quality only makes sense after PerfectAI points at that leaf.
-	if n.Source == nodeSourceClash && n.ClashName != "" {
-		if err := ensureClashSelectedForNode(store, n); err != nil {
-			return nil, fmt.Errorf("切换 Clash 节点失败: %w", err)
+	log.Printf("egress-guard: quality start source=%s node=%s name=%q clash=%v leaf=%q quarantined=%v",
+		source, id, n.Name, n.Source == nodeSourceClash, n.ClashName, n.DisabledByGuard)
+
+	// Quality probes always go internal cli-chat-proxy with CPA xAI tokens, via
+	// TestPort + :7953 so production PerfectAI/:7890 is undisturbed.
+	// (Optional public probe_api_* remains supported if operator sets it later.)
+	probeNode := *n
+	testGroup := ""
+	pol := store.policy()
+	usePublic := probeAPIConfigured(pol)
+	if usePublic {
+		// Explicit public API only: dial direct, no clash proxy.
+		probeNode.ProxyURL = ""
+		log.Printf("egress-guard: quality public-api direct dial base=%s node=%s", pol.ProbeAPIBase, id)
+	} else {
+		if n.Source == nodeSourceClash && n.ClashName != "" {
+			g, err := ensureClashSelectedForQuality(store, n)
+			testGroup = g
+			if err != nil {
+				log.Printf("egress-guard: quality test-group switch failed node=%s leaf=%q group=%q err=%v", id, n.ClashName, g, err)
+				return nil, fmt.Errorf("切换测试策略组失败: %w", err)
+			}
+			log.Printf("egress-guard: quality test-group switch ok node=%s leaf=%q group=%q", id, n.ClashName, g)
 		}
-		if fresh, ok := store.getNode(id); ok {
-			n = fresh
+		if proxy := qualityProbeProxyURL(n); proxy != "" {
+			probeNode.ProxyURL = proxy
+			log.Printf("egress-guard: quality dial proxy=%s (test path / cli-chat-proxy) node=%s", redactProxyURL(proxy), id)
 		}
 	}
-	res := probeQuality(store, n)
+
+	// Hard deadline so one hung upstream stream cannot freeze the whole queue.
+	probeCtx, cancel := context.WithTimeout(context.Background(), qualityProbeTimeout+15*time.Second)
+	defer cancel()
+	res := probeQualityContext(probeCtx, store, &probeNode)
 	if res.Classification == "error" && res.ErrorKind != "transport_error" {
 		res.Classification = "ignored"
 	}
-	applyObservation(store, id, "active", res)
+
+	reason := strings.TrimSpace(res.Error)
+	if reason == "" {
+		if res.HasThinking {
+			reason = fmt.Sprintf("thinking=有 · class=%s · tps=%.1f · tokens=%d · reason_tokens=%d · dur=%dms · source=%s",
+				res.Classification, res.TPS, res.OutputTokens, res.ReasoningTokens, res.DurationMs, source)
+		} else {
+			reason = fmt.Sprintf("thinking=无 · class=%s · tps=%.1f · tokens=%d · dur=%dms · source=%s",
+				res.Classification, res.TPS, res.OutputTokens, res.DurationMs, source)
+		}
+	} else if !strings.Contains(strings.ToLower(reason), "thinking") {
+		think := "无"
+		if res.HasThinking {
+			think = "有"
+		}
+		reason = fmt.Sprintf("%s · thinking=%s · class=%s · source=%s", reason, think, res.Classification, source)
+	}
+
+	applyObservation(store, id, obsSource, res)
 	store.appendEvent(guardEvent{
 		Event:          "quality_probe_completed",
 		NodeID:         id,
 		NodeName:       n.Name,
 		Classification: res.Classification,
 		OutputTPS:      res.TPS,
-		Reason:         res.Error,
+		Reason:         reason,
 	})
-	return map[string]any{
-		"id":             id,
-		"classification": res.Classification,
-		"tps":            res.TPS,
-		"outputTokens":   res.OutputTokens,
-		"durationMs":     res.DurationMs,
-		"firstTokenMs":   res.FirstTokenMs,
-		"exitIp":         res.ExitIP,
-		"error":          res.Error,
-		"errorKind":      res.ErrorKind,
-		"model":          res.Model,
-	}, nil
+	log.Printf("egress-guard: quality done source=%s node=%s name=%q class=%s thinking=%v reason_tokens=%d tps=%.1f tokens=%d dur=%dms kind=%s err=%q",
+		source, id, n.Name, res.Classification, res.HasThinking, res.ReasoningTokens, res.TPS, res.OutputTokens, res.DurationMs, res.ErrorKind, res.Error)
+
+	out := map[string]any{
+		"id":              id,
+		"classification":  res.Classification,
+		"tps":             res.TPS,
+		"outputTokens":    res.OutputTokens,
+		"durationMs":      res.DurationMs,
+		"firstTokenMs":    res.FirstTokenMs,
+		"exitIp":          res.ExitIP,
+		"error":           res.Error,
+		"errorKind":       res.ErrorKind,
+		"model":           res.Model,
+		"hasThinking":     res.HasThinking,
+		"reasoningTokens": res.ReasoningTokens,
+		"source":          source,
+		"reason":          reason,
+		"testGroup":       testGroup,
+		"testProxy":       redactProxyURL(probeNode.ProxyURL),
+	}
+	return out, nil
+}
+
+// runNodeQuality is the panel/API entry: enqueue and wait for the serial slot.
+func runNodeQuality(store *stateStore, id string) (map[string]any, error) {
+	return queueNodeQuality(store, id, "manual", true)
+}
+
+type qualityOutcome struct {
+	data map[string]any
+	err  error
+}
+
+type qualityJob struct {
+	id         int64
+	nodeID     string
+	nodeName   string
+	source     string
+	enqueuedAt time.Time
+	startedAt  time.Time
+	waiters    []chan qualityOutcome
+}
+
+// qualityScheduler serializes all real-model probes. Clash PerfectAI can only
+// point at one leaf at a time; concurrent quality tests would cross-wire exits.
+//
+// The worker loop is process-lifetime: CPA reconfigure fires many times at
+// startup and must NOT tear down / respawn the queue worker, or jobs freeze
+// mid-flight and multiple workers race Clash selection.
+type qualityScheduler struct {
+	mu      sync.Mutex
+	cond    *sync.Cond
+	nextID  int64
+	active  *qualityJob
+	pending []*qualityJob
+	started bool
+	stop    context.CancelFunc
+}
+
+var qualitySched = func() *qualityScheduler {
+	s := &qualityScheduler{}
+	s.cond = sync.NewCond(&s.mu)
+	return s
+}()
+
+func qualitySourceLabel(source string) string {
+	switch source {
+	case "manual":
+		return "手动"
+	case "active":
+		return "主动"
+	case "recovery":
+		return "隔离复测"
+	case "rotate":
+		return "换 IP 复测"
+	case "soft-recheck":
+		return "软阈值复测"
+	default:
+		if source == "" {
+			return "检测"
+		}
+		return source
+	}
+}
+
+func (s *qualityScheduler) snapshot() map[string]any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pending := make([]map[string]any, 0, len(s.pending))
+	for i, job := range s.pending {
+		if job == nil {
+			continue
+		}
+		pending = append(pending, map[string]any{
+			"position":     i + 1,
+			"node_id":      job.nodeID,
+			"node_name":    job.nodeName,
+			"source":       job.source,
+			"source_label": qualitySourceLabel(job.source),
+			"enqueued_at":  float64(job.enqueuedAt.Unix()),
+		})
+	}
+	out := map[string]any{
+		"pending":       pending,
+		"pending_count": len(pending),
+		"total":         len(pending),
+		"busy":          s.active != nil || len(pending) > 0,
+	}
+	if s.active != nil {
+		out["active"] = map[string]any{
+			"position":     0,
+			"node_id":      s.active.nodeID,
+			"node_name":    s.active.nodeName,
+			"source":       s.active.source,
+			"source_label": qualitySourceLabel(s.active.source),
+			"enqueued_at":  float64(s.active.enqueuedAt.Unix()),
+			"started_at":   float64(s.active.startedAt.Unix()),
+		}
+		out["total"] = len(pending) + 1
+	}
+	return out
+}
+
+func (s *qualityScheduler) findLocked(nodeID string) *qualityJob {
+	if s.active != nil && s.active.nodeID == nodeID {
+		return s.active
+	}
+	for _, job := range s.pending {
+		if job != nil && job.nodeID == nodeID {
+			return job
+		}
+	}
+	return nil
+}
+
+// queueNodeQuality enqueues a quality probe. When wait is true the caller blocks
+// until this node's job finishes (attaching to an in-flight/pending job if any).
+// When wait is false, duplicate node IDs are deduped and the call returns immediately.
+func queueNodeQuality(store *stateStore, nodeID, source string, wait bool) (map[string]any, error) {
+	if store == nil {
+		return nil, fmt.Errorf("store 未初始化")
+	}
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return nil, fmt.Errorf("节点 ID 为空")
+	}
+	n, ok := store.getNode(nodeID)
+	if !ok {
+		return nil, fmt.Errorf("节点不存在")
+	}
+	if strings.TrimSpace(source) == "" {
+		source = "manual"
+	}
+
+	s := qualitySched
+	s.mu.Lock()
+	if existing := s.findLocked(nodeID); existing != nil {
+		if !wait {
+			s.mu.Unlock()
+			return map[string]any{
+				"id":      nodeID,
+				"queued":  true,
+				"deduped": true,
+				"status":  "already_queued",
+			}, nil
+		}
+		ch := make(chan qualityOutcome, 1)
+		existing.waiters = append(existing.waiters, ch)
+		s.mu.Unlock()
+		out := <-ch
+		return out.data, out.err
+	}
+
+	s.nextID++
+	job := &qualityJob{
+		id:         s.nextID,
+		nodeID:     nodeID,
+		nodeName:   n.Name,
+		source:     source,
+		enqueuedAt: time.Now(),
+	}
+	var ch chan qualityOutcome
+	if wait {
+		ch = make(chan qualityOutcome, 1)
+		job.waiters = []chan qualityOutcome{ch}
+	}
+	s.pending = append(s.pending, job)
+	s.cond.Signal()
+	s.mu.Unlock()
+
+	if !wait {
+		return map[string]any{
+			"id":     nodeID,
+			"queued": true,
+			"status": "queued",
+		}, nil
+	}
+	out := <-ch
+	return out.data, out.err
+}
+
+func startQualityWorker(_ context.Context, _ *stateStore) {
+	s := qualitySched
+	s.mu.Lock()
+	if s.started {
+		s.mu.Unlock()
+		return
+	}
+	lifeCtx, lifeCancel := context.WithCancel(context.Background())
+	s.stop = lifeCancel
+	s.started = true
+	s.mu.Unlock()
+
+	go func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("egress-guard: quality worker panic: %v\n%s", rec, debug.Stack())
+			}
+			s.mu.Lock()
+			s.started = false
+			active := s.active
+			s.active = nil
+			pendingLeft := len(s.pending)
+			s.stop = nil
+			s.mu.Unlock()
+			if active != nil {
+				for _, w := range active.waiters {
+					w <- qualityOutcome{err: fmt.Errorf("质量检测 worker 异常退出")}
+				}
+			}
+			// Only auto-restart on unexpected panic while the plugin is still up.
+			// Explicit stopQualityWorker cancels lifeCtx and must not respawn.
+			if lifeCtx.Err() == nil && pendingLeft > 0 {
+				log.Printf("egress-guard: quality worker restarting after panic pending=%d", pendingLeft)
+				startQualityWorker(context.Background(), nil)
+			}
+		}()
+
+		log.Printf("egress-guard: quality worker started (process lifetime)")
+		for {
+			s.mu.Lock()
+			for len(s.pending) == 0 && lifeCtx.Err() == nil {
+				s.cond.Wait()
+			}
+			if lifeCtx.Err() != nil {
+				// Plugin shutdown: fail waiters, keep pending list for diagnostics.
+				leftover := append([]*qualityJob{}, s.pending...)
+				if s.active != nil {
+					leftover = append(leftover, s.active)
+				}
+				s.pending = nil
+				s.active = nil
+				s.mu.Unlock()
+				for _, job := range leftover {
+					for _, w := range job.waiters {
+						w <- qualityOutcome{err: fmt.Errorf("质量检测队列已停止")}
+					}
+				}
+				log.Printf("egress-guard: quality worker stopped")
+				return
+			}
+			job := s.pending[0]
+			s.pending = s.pending[1:]
+			job.startedAt = time.Now()
+			s.active = job
+			pendingAfter := len(s.pending)
+			s.mu.Unlock()
+
+			// Always use the live global store — reconfigure swaps it under us.
+			live := store
+			log.Printf("egress-guard: quality dequeue source=%s node=%s name=%q pending_left=%d",
+				job.source, job.nodeID, job.nodeName, pendingAfter)
+
+			var (
+				data map[string]any
+				err  error
+			)
+			func() {
+				defer func() {
+					if rec := recover(); rec != nil {
+						err = fmt.Errorf("质量检测 panic: %v", rec)
+						log.Printf("egress-guard: quality job panic source=%s node=%s: %v\n%s",
+							job.source, job.nodeID, rec, debug.Stack())
+					}
+				}()
+				if live == nil {
+					err = fmt.Errorf("store 未初始化")
+					return
+				}
+				data, err = executeNodeQuality(live, job.nodeID, job.source)
+			}()
+
+			s.mu.Lock()
+			if s.active == job {
+				s.active = nil
+			}
+			waiters := job.waiters
+			job.waiters = nil
+			nextPending := len(s.pending)
+			s.mu.Unlock()
+			if err != nil {
+				log.Printf("egress-guard: quality finish ERR source=%s node=%s name=%q err=%v pending_left=%d",
+					job.source, job.nodeID, job.nodeName, err, nextPending)
+			} else {
+				class, _ := data["classification"].(string)
+				log.Printf("egress-guard: quality finish OK source=%s node=%s name=%q class=%s pending_left=%d",
+					job.source, job.nodeID, job.nodeName, class, nextPending)
+			}
+			for _, w := range waiters {
+				w <- qualityOutcome{data: data, err: err}
+			}
+		}
+	}()
+}
+
+func stopQualityWorker() {
+	s := qualitySched
+	s.mu.Lock()
+	stop := s.stop
+	s.mu.Unlock()
+	if stop != nil {
+		stop()
+	}
+	s.cond.Broadcast()
 }
 
 func handlePassiveUsage(store *stateStore, record map[string]any) {
@@ -1046,6 +1822,7 @@ func busiestEnabledNode(store *stateStore) string {
 }
 
 func startGuardWorker(ctx context.Context, store *stateStore) {
+	startQualityWorker(ctx, store)
 	go func() {
 		t := time.NewTicker(30 * time.Second)
 		defer t.Stop()
@@ -1056,14 +1833,16 @@ func startGuardWorker(ctx context.Context, store *stateStore) {
 			case <-t.C:
 				pol := store.policy()
 				now := float64(time.Now().Unix())
+				// Enqueue only — never run probes inline. Clash leaf selection is
+				// global; the quality scheduler keeps PerfectAI switches serial.
 				for _, n := range store.listNodes() {
 					if n.DisabledByGuard && n.QuarantinedUntil > 0 && now >= n.QuarantinedUntil {
-						_, _ = runNodeQuality(store, n.ID)
+						_, _ = queueNodeQuality(store, n.ID, "recovery", false)
 						continue
 					}
 					if pol.Mode == "active" || pol.Mode == "hybrid" {
 						if n.Enabled && !n.DisabledByGuard && (n.LastProbeAt == 0 || now-n.LastProbeAt >= float64(pol.ActiveIntervalSec)) {
-							_, _ = runNodeQuality(store, n.ID)
+							_, _ = queueNodeQuality(store, n.ID, "active", false)
 							break
 						}
 					}

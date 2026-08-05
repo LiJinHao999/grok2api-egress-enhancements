@@ -32,12 +32,15 @@ var (
 )
 
 type clashRuntimeConfig struct {
-	Enabled          bool
-	APIURL           string
-	Secret           string
-	UnixSocket       string
-	Group            string
-	ProxyURL         string
+	Enabled    bool
+	APIURL     string
+	Secret     string
+	UnixSocket string
+	Group      string
+	ProxyURL   string
+	// TestGroup/TestProxyURL isolate quality probes from production traffic.
+	TestGroup        string
+	TestProxyURL     string
 	CloseConnections bool
 	SyncOnStart      bool
 	ExcludeKeywords  []string
@@ -83,6 +86,8 @@ func loadClashRuntimeConfig() clashRuntimeConfig {
 		UnixSocket:       strings.TrimSpace(cfg.ClashUnixSocket),
 		Group:            strings.TrimSpace(cfg.ClashGroup),
 		ProxyURL:         strings.TrimSpace(cfg.ClashProxyURL),
+		TestGroup:        strings.TrimSpace(cfg.ClashTestGroup),
+		TestProxyURL:     strings.TrimSpace(cfg.ClashTestProxyURL),
 		CloseConnections: cfg.ClashCloseConnections,
 		SyncOnStart:      cfg.ClashSyncOnStart,
 		ExcludeKeywords:  append([]string{}, cfg.ClashExcludeKeywords...),
@@ -110,12 +115,24 @@ func loadClashRuntimeConfig() clashRuntimeConfig {
 	if v := strings.TrimSpace(ui.ProxyURL); v != "" {
 		out.ProxyURL = v
 	}
+	if v := strings.TrimSpace(ui.TestGroup); v != "" {
+		out.TestGroup = v
+	}
+	if v := strings.TrimSpace(ui.TestProxyURL); v != "" {
+		out.TestProxyURL = v
+	}
 
 	if out.Group == "" {
 		out.Group = "🏜️ PerfectAI"
 	}
 	if out.ProxyURL == "" {
 		out.ProxyURL = "http://172.19.0.1:7890"
+	}
+	if out.TestGroup == "" {
+		out.TestGroup = "➖ PerfectAI_TestPort"
+	}
+	if out.TestProxyURL == "" {
+		out.TestProxyURL = "http://172.19.0.1:7953"
 	}
 	if out.APIURL == "" && out.UnixSocket == "" {
 		out.APIURL = "http://172.19.0.1:7888"
@@ -152,14 +169,16 @@ func publicClashUIConfig(ui clashUIConfig, runtime clashRuntimeConfig) map[strin
 		enabled = *ui.Enabled
 	}
 	return map[string]any{
-		"enabled":          enabled,
-		"api_url":          firstNonEmpty(strings.TrimSpace(ui.APIURL), runtime.APIURL),
-		"group":            firstNonEmpty(strings.TrimSpace(ui.Group), runtime.Group),
-		"proxy_url":        firstNonEmpty(strings.TrimSpace(ui.ProxyURL), redactProxyURL(runtime.ProxyURL)),
-		"has_secret":       strings.TrimSpace(ui.Secret) != "" || strings.TrimSpace(runtime.Secret) != "",
-		"ui_override":      ui.APIURL != "" || ui.Group != "" || ui.ProxyURL != "" || ui.Secret != "" || ui.Enabled != nil,
-		"updated_at":       ui.UpdatedAt,
-		"unix_socket":      runtime.UnixSocket != "",
+		"enabled":           enabled,
+		"api_url":           firstNonEmpty(strings.TrimSpace(ui.APIURL), runtime.APIURL),
+		"group":             firstNonEmpty(strings.TrimSpace(ui.Group), runtime.Group),
+		"proxy_url":         firstNonEmpty(strings.TrimSpace(ui.ProxyURL), redactProxyURL(runtime.ProxyURL)),
+		"test_group":        firstNonEmpty(strings.TrimSpace(ui.TestGroup), runtime.TestGroup),
+		"test_proxy_url":    firstNonEmpty(strings.TrimSpace(ui.TestProxyURL), redactProxyURL(runtime.TestProxyURL)),
+		"has_secret":        strings.TrimSpace(ui.Secret) != "" || strings.TrimSpace(runtime.Secret) != "",
+		"ui_override":       ui.APIURL != "" || ui.Group != "" || ui.ProxyURL != "" || ui.TestGroup != "" || ui.TestProxyURL != "" || ui.Secret != "" || ui.Enabled != nil,
+		"updated_at":        ui.UpdatedAt,
+		"unix_socket":       runtime.UnixSocket != "",
 		"close_connections": runtime.CloseConnections,
 	}
 }
@@ -233,6 +252,15 @@ func ensureHealthyClashExit(store *stateStore) (bool, error) {
 	}
 	// Active leaf is bad — switch away.
 	if err := switchClashAwayFromNode(store, active); err != nil {
+		// switchClashAwayFromNode may fail when candidates list is empty or Clash API
+		// flaps; fall through to a direct pick of any healthy leaf.
+		for _, n := range store.listNodes() {
+			if n.Source == nodeSourceClash && n.Enabled && !n.DisabledByGuard && n.ClashName != "" && n.ID != active.ID {
+				if err2 := ensureClashSelectedForNode(store, n); err2 == nil {
+					return true, nil
+				}
+			}
+		}
 		return false, err
 	}
 	return true, nil
@@ -245,6 +273,8 @@ func clashCfgEqual(a, b clashRuntimeConfig) bool {
 		a.UnixSocket == b.UnixSocket &&
 		a.Group == b.Group &&
 		a.ProxyURL == b.ProxyURL &&
+		a.TestGroup == b.TestGroup &&
+		a.TestProxyURL == b.TestProxyURL &&
 		a.TimeoutSec == b.TimeoutSec &&
 		a.CloseConnections == b.CloseConnections
 }
@@ -537,10 +567,12 @@ func clashStatusPayload() map[string]any {
 		"unix_socket":       cfg.UnixSocket != "",
 		"group":             cfg.Group,
 		"proxy_url":         redactProxyURL(cfg.ProxyURL),
+		"test_group":        cfg.TestGroup,
+		"test_proxy_url":    redactProxyURL(cfg.TestProxyURL),
 		"close_connections": cfg.CloseConnections,
 		"sync_on_start":     cfg.SyncOnStart,
 		"has_secret":        strings.TrimSpace(cfg.Secret) != "",
-		"ui_override":       ui.APIURL != "" || ui.Group != "" || ui.ProxyURL != "" || ui.Secret != "" || ui.Enabled != nil,
+		"ui_override":       ui.APIURL != "" || ui.Group != "" || ui.ProxyURL != "" || ui.TestGroup != "" || ui.TestProxyURL != "" || ui.Secret != "" || ui.Enabled != nil,
 		"config":            publicClashUIConfig(ui, cfg),
 	}
 	if !cfg.Enabled {
@@ -686,15 +718,16 @@ func syncClashNodes(store *stateStore) (map[string]any, error) {
 		})
 	}
 
-	// Mark which node is currently selected in Clash.
+	// Mark which node is currently selected in Clash and track service sessions.
 	if nowSel != "" {
+		nowUnix := float64(time.Now().Unix())
 		for _, n := range store.listNodes() {
 			if n.Source != nodeSourceClash {
 				continue
 			}
 			active := n.ClashName == nowSel
 			_, _ = store.updateNode(n.ID, func(node *nodeRecord) error {
-				node.ClashActive = active
+				applyClashActiveTransition(node, active, nowUnix)
 				return nil
 			})
 		}
@@ -717,6 +750,78 @@ func syncClashNodes(store *stateStore) (map[string]any, error) {
 	}, nil
 }
 
+// qualityProbeProxyURL is the proxy quality probes dial. Prefer the dedicated
+// test mixed-port so probes never share production :7890 sticky sessions.
+func qualityProbeProxyURL(node *nodeRecord) string {
+	cfg := loadClashRuntimeConfig()
+	if v := strings.TrimSpace(cfg.TestProxyURL); v != "" {
+		return v
+	}
+	if node != nil && strings.TrimSpace(node.ProxyURL) != "" {
+		return node.ProxyURL
+	}
+	return strings.TrimSpace(cfg.ProxyURL)
+}
+
+// ensureClashSelectedForQuality switches the TEST selector group to the node
+// leaf. Production PerfectAI is never touched. Connections are not bulk-closed.
+func ensureClashSelectedForQuality(store *stateStore, node *nodeRecord) (string, error) {
+	if node == nil || node.Source != nodeSourceClash || node.ClashName == "" {
+		return "", nil
+	}
+	cfg := loadClashRuntimeConfig()
+	group := strings.TrimSpace(cfg.TestGroup)
+	if group == "" {
+		group = strings.TrimSpace(cfg.Group)
+	}
+	if group == "" {
+		return "", fmt.Errorf("未配置质量探测策略组")
+	}
+	client, err := getClashClient()
+	if err != nil {
+		return group, err
+	}
+	client.cfg.Group = group
+	client.cfg.CloseConnections = false
+
+	now, err := client.currentGroupSelection()
+	if err != nil {
+		return group, err
+	}
+	if now == node.ClashName {
+		if store != nil {
+			store.appendEvent(guardEvent{
+				Event:    "clash_test_switched",
+				NodeID:   node.ID,
+				NodeName: node.Name,
+				Reason:   fmt.Sprintf("测试组 %s 已在 %s", group, now),
+			})
+		}
+		return group, nil
+	}
+	after, err := client.switchTo(node.ClashName)
+	if err != nil {
+		if store != nil {
+			store.appendEvent(guardEvent{
+				Event:    "clash_test_switch_failed",
+				NodeID:   node.ID,
+				NodeName: node.Name,
+				Reason:   fmt.Sprintf("测试组 %s: %s", group, err.Error()),
+			})
+		}
+		return group, err
+	}
+	if store != nil {
+		store.appendEvent(guardEvent{
+			Event:    "clash_test_switched",
+			NodeID:   node.ID,
+			NodeName: node.Name,
+			Reason:   fmt.Sprintf("测试组 %s: %s → %s", group, now, after),
+		})
+	}
+	return group, nil
+}
+
 // ensureClashSelectedForNode switches the Clash group to the node's leaf when
 // the node is Clash-sourced. Shared mixed-port proxy_url alone is not enough —
 // the real exit is whatever PerfectAI currently points to.
@@ -735,9 +840,10 @@ func ensureClashSelectedForNode(store *stateStore, node *nodeRecord) error {
 	if err != nil {
 		return err
 	}
+	nowUnix := float64(time.Now().Unix())
 	if now == node.ClashName {
 		_, _ = store.updateNode(node.ID, func(n *nodeRecord) error {
-			n.ClashActive = true
+			applyClashActiveTransition(n, true, nowUnix)
 			return nil
 		})
 		return nil
@@ -758,7 +864,7 @@ func ensureClashSelectedForNode(store *stateStore, node *nodeRecord) error {
 		}
 		active := n.ClashName == after
 		_, _ = store.updateNode(n.ID, func(node *nodeRecord) error {
-			node.ClashActive = active
+			applyClashActiveTransition(node, active, nowUnix)
 			if active {
 				node.LastReason = "Clash 已切换到该节点"
 			}
@@ -819,13 +925,14 @@ func switchClashAwayFromNode(store *stateStore, bad *nodeRecord) error {
 		})
 		return err
 	}
+	nowUnix := float64(time.Now().Unix())
 	for _, n := range store.listNodes() {
 		if n.Source != nodeSourceClash {
 			continue
 		}
 		active := n.ClashName == after
 		_, _ = store.updateNode(n.ID, func(node *nodeRecord) error {
-			node.ClashActive = active
+			applyClashActiveTransition(node, active, nowUnix)
 			return nil
 		})
 	}

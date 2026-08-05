@@ -75,7 +75,7 @@ import (
 
 const (
 	pluginName          = "grok2api-egress"
-	pluginVersion       = "1.1.3"
+	pluginVersion       = "1.1.16"
 	resourcePath        = "/status"
 	managementAPIPath   = "/v0/management/grok2api-egress/api"
 	resourceContentType = "text/html; charset=utf-8"
@@ -113,13 +113,17 @@ type pluginConfig struct {
 	// Clash / Mihomo local controller integration.
 	// Nodes synced from Clash share one mixed-port proxy_url; the real exit is
 	// selected by PUT /proxies/{group} on quarantine / manual switch.
-	ClashEnabled          bool     `yaml:"clash_enabled" json:"clash_enabled"`
-	ClashAPIURL           string   `yaml:"clash_api_url" json:"clash_api_url"`
-	ClashUnixSocket       string   `yaml:"clash_unix_socket" json:"clash_unix_socket"`
-	ClashSecret           string   `yaml:"clash_secret" json:"clash_secret"` // prefer env; kept for local single-user setups
-	ClashSecretEnv        string   `yaml:"clash_secret_env" json:"clash_secret_env"`
-	ClashGroup            string   `yaml:"clash_group" json:"clash_group"`
-	ClashProxyURL         string   `yaml:"clash_proxy_url" json:"clash_proxy_url"`
+	ClashEnabled    bool   `yaml:"clash_enabled" json:"clash_enabled"`
+	ClashAPIURL     string `yaml:"clash_api_url" json:"clash_api_url"`
+	ClashUnixSocket string `yaml:"clash_unix_socket" json:"clash_unix_socket"`
+	ClashSecret     string `yaml:"clash_secret" json:"clash_secret"` // prefer env; kept for local single-user setups
+	ClashSecretEnv  string `yaml:"clash_secret_env" json:"clash_secret_env"`
+	ClashGroup      string `yaml:"clash_group" json:"clash_group"`
+	ClashProxyURL   string `yaml:"clash_proxy_url" json:"clash_proxy_url"`
+	// Quality probes switch TestGroup and dial TestProxyURL so production traffic
+	// on ClashGroup + ClashProxyURL is never disturbed.
+	ClashTestGroup        string   `yaml:"clash_test_group" json:"clash_test_group"`
+	ClashTestProxyURL     string   `yaml:"clash_test_proxy_url" json:"clash_test_proxy_url"`
 	ClashCloseConnections bool     `yaml:"clash_close_connections" json:"clash_close_connections"`
 	ClashSyncOnStart      bool     `yaml:"clash_sync_on_start" json:"clash_sync_on_start"`
 	ClashTimeoutSec       int      `yaml:"clash_timeout_seconds" json:"clash_timeout_seconds"`
@@ -134,12 +138,12 @@ type registration struct {
 }
 
 type registrationCapabilities struct {
-	ManagementAPI           bool `json:"management_api"`
-	UsagePlugin             bool `json:"usage_plugin"`
-	Scheduler               bool `json:"scheduler"`
-	RequestInterceptor      bool `json:"request_interceptor"`
-	ResponseInterceptor     bool `json:"response_interceptor"`
-	StreamChunkInterceptor  bool `json:"stream_chunk_interceptor"`
+	ManagementAPI          bool `json:"management_api"`
+	UsagePlugin            bool `json:"usage_plugin"`
+	Scheduler              bool `json:"scheduler"`
+	RequestInterceptor     bool `json:"request_interceptor"`
+	ResponseInterceptor    bool `json:"response_interceptor"`
+	StreamChunkInterceptor bool `json:"stream_chunk_interceptor"`
 }
 
 type managementRegistration struct {
@@ -241,6 +245,7 @@ func cliproxyPluginShutdown() {
 	if workerCancel != nil {
 		workerCancel()
 	}
+	stopQualityWorker()
 }
 
 func handleMethod(method string, request []byte) ([]byte, error) {
@@ -349,9 +354,11 @@ func pluginRegistration() registration {
 				{Name: "clash_unix_socket", Type: pluginapi.ConfigFieldTypeString, Description: "可选：Clash Unix Socket（仅 CPA 与 Clash 同机）"},
 				{Name: "clash_secret_env", Type: pluginapi.ConfigFieldTypeString, Description: "从环境变量读取 Clash secret（默认 CLASH_API_SECRET）"},
 				{Name: "clash_secret", Type: pluginapi.ConfigFieldTypeString, Description: "Clash secret（优先用 clash_secret_env）"},
-				{Name: "clash_group", Type: pluginapi.ConfigFieldTypeString, Description: "策略组名，默认 🏜️ PerfectAI"},
-				{Name: "clash_proxy_url", Type: pluginapi.ConfigFieldTypeString, Description: "CPA 统一走的本机代理，例如 http://172.19.0.1:7890"},
-				{Name: "clash_close_connections", Type: pluginapi.ConfigFieldTypeBoolean, Description: "切换后关闭旧连接"},
+				{Name: "clash_group", Type: pluginapi.ConfigFieldTypeString, Description: "生产策略组（账号流量），默认 🏜️ PerfectAI"},
+				{Name: "clash_proxy_url", Type: pluginapi.ConfigFieldTypeString, Description: "生产 mixed-port，例如 http://172.19.0.1:7890"},
+				{Name: "clash_test_group", Type: pluginapi.ConfigFieldTypeString, Description: "质量探测专用策略组，例如 ➖ PerfectAI_TestPort"},
+				{Name: "clash_test_proxy_url", Type: pluginapi.ConfigFieldTypeString, Description: "质量探测专用代理，例如 http://172.19.0.1:7953"},
+				{Name: "clash_close_connections", Type: pluginapi.ConfigFieldTypeBoolean, Description: "生产组切换后关闭旧连接"},
 				{Name: "clash_sync_on_start", Type: pluginapi.ConfigFieldTypeBoolean, Description: "启动时从 PerfectAI 同步节点"},
 				{Name: "clash_timeout_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "Clash API 超时（秒）"},
 				{Name: "clash_exclude_keywords", Type: pluginapi.ConfigFieldTypeArray, Description: "同步时排除名称包含这些词的节点"},
@@ -428,7 +435,7 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 
 	case path == "/policy" || path == "/quality-guard/config":
 		if method == http.MethodGet {
-			return managementJSON(http.StatusOK, map[string]any{"data": store.policy(), "config": store.policy()})
+			return managementJSON(http.StatusOK, map[string]any{"data": publicPolicy(store.policy()), "config": publicPolicy(store.policy())})
 		}
 		if method == http.MethodPut || method == http.MethodPost {
 			var p policyConfig
@@ -455,6 +462,25 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 			if v, ok := raw["model"].(string); ok && v != "" {
 				p.Model = v
 			}
+			if v, ok := raw["probe_api_base"].(string); ok {
+				p.ProbeAPIBase = v
+			} else if v, ok := raw["probeApiBase"].(string); ok {
+				p.ProbeAPIBase = v
+			}
+			if v, ok := raw["probe_api_key"].(string); ok {
+				if strings.TrimSpace(v) != "" {
+					p.ProbeAPIKey = v
+				}
+			} else if v, ok := raw["probeApiKey"].(string); ok {
+				if strings.TrimSpace(v) != "" {
+					p.ProbeAPIKey = v
+				}
+			}
+			if v, ok := raw["probe_api_key_clear"].(bool); ok && v {
+				p.ProbeAPIKey = ""
+			} else if v, ok := raw["probeApiKeyClear"].(bool); ok && v {
+				p.ProbeAPIKey = ""
+			}
 			if v, ok := raw["disable_auth_on_hard"].(bool); ok {
 				p.DisableAuthOnHard = v
 			}
@@ -467,7 +493,7 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 			if err := store.updatePolicy(p); err != nil {
 				return managementJSON(http.StatusBadRequest, errMsg("invalidPolicy", err.Error()))
 			}
-			return managementJSON(http.StatusOK, map[string]any{"data": store.policy(), "ok": true})
+			return managementJSON(http.StatusOK, map[string]any{"data": publicPolicy(store.policy()), "ok": true})
 		}
 
 	case path == "/nodes":
@@ -727,6 +753,16 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 			} else if v, ok := raw["proxyUrl"].(string); ok {
 				in.ProxyURL = v
 			}
+			if v, ok := raw["test_group"].(string); ok {
+				in.TestGroup = v
+			} else if v, ok := raw["testGroup"].(string); ok {
+				in.TestGroup = v
+			}
+			if v, ok := raw["test_proxy_url"].(string); ok {
+				in.TestProxyURL = v
+			} else if v, ok := raw["testProxyUrl"].(string); ok {
+				in.TestProxyURL = v
+			}
 			if v, ok := raw["secret"].(string); ok {
 				in.Secret = v
 			}
@@ -813,48 +849,91 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 	return managementJSON(http.StatusNotFound, errMsg("notFound", "not found"))
 }
 
+func publicPolicy(p policyConfig) map[string]any {
+	hasKey := strings.TrimSpace(p.ProbeAPIKey) != ""
+	return map[string]any{
+		"mode":                    p.Mode,
+		"active_interval_seconds": p.ActiveIntervalSec,
+		"passive_poll_seconds":    p.PassivePollSec,
+		"quarantine_seconds":      p.QuarantineSec,
+		"soft_tps":                p.SoftTPS,
+		"hard_tps":                p.HardTPS,
+		"consecutive_soft":        p.ConsecutiveSoft,
+		"consecutive_errors":      p.ConsecutiveErrors,
+		"min_healthy_nodes":       p.MinHealthyNodes,
+		"min_generation_ms":       p.MinGenerationMs,
+		"min_output_tokens":       p.MinOutputTokens,
+		"model":                   p.Model,
+		"disable_auth_on_hard":    p.DisableAuthOnHard,
+		"max_output_tokens":       p.MaxOutputTokensProbe,
+		"isolation_keywords":      p.IsolationKeywords,
+		"probe_api_base":          p.ProbeAPIBase,
+		"probe_api_key_set":       hasKey,
+		"probe_api_key":           "",
+	}
+}
+
 func buildStatus() map[string]any {
 	ensureStore()
 	refreshAssignedCountsAsync(store)
 	nodes := store.listNodes()
 	nodeMap := map[string]any{}
 	for _, n := range nodes {
+		nowUnix := float64(time.Now().Unix())
+		avail := nodeAvailabilitySnapshot(n, nowUnix)
 		nodeMap[n.ID] = map[string]any{
-			"disabled_by_guard":   n.DisabledByGuard,
-			"quarantined_until":   n.QuarantinedUntil,
-			"error_strikes":       n.ErrorStrikes,
-			"soft_strikes":        n.SoftStrikes,
-			"last_classification": n.LastClassification,
-			"last_output_tps":     n.LastOutputTPS,
-			"last_first_token_ms": n.LastFirstTokenMs,
-			"last_duration_ms":    n.LastDurationMs,
-			"last_output_tokens":  n.LastOutputTokens,
-			"last_reason":         n.LastReason,
-			"last_source":         n.LastSource,
-			"last_observed_at":    n.LastObservedAt,
-			"last_probe_at":       n.LastProbeAt,
-			"source":              n.Source,
-			"clash_name":          n.ClashName,
-			"clash_group":         n.ClashGroup,
-			"clash_active":        n.ClashActive,
+			"disabled_by_guard":           n.DisabledByGuard,
+			"quarantined_until":           n.QuarantinedUntil,
+			"error_strikes":               n.ErrorStrikes,
+			"soft_strikes":                n.SoftStrikes,
+			"last_classification":         n.LastClassification,
+			"last_output_tps":             n.LastOutputTPS,
+			"last_first_token_ms":         n.LastFirstTokenMs,
+			"last_duration_ms":            n.LastDurationMs,
+			"last_output_tokens":          n.LastOutputTokens,
+			"last_reason":                 n.LastReason,
+			"last_source":                 n.LastSource,
+			"last_observed_at":            n.LastObservedAt,
+			"last_probe_at":               n.LastProbeAt,
+			"source":                      n.Source,
+			"clash_name":                  n.ClashName,
+			"clash_group":                 n.ClashGroup,
+			"clash_active":                n.ClashActive,
+			"last_active_at":              n.LastActiveAt,
+			"last_quarantined_at":         n.LastQuarantinedAt,
+			"total_active_ms":             avail["total_active_ms"],
+			"total_quarantined_ms":        avail["total_quarantined_ms"],
+			"current_active_ms":           avail["current_active_ms"],
+			"current_quarantined_ms":      avail["current_quarantined_ms"],
+			"current_selected_ms":         avail["current_selected_ms"],
+			"last_active_duration_ms":     n.LastActiveDurationMs,
+			"last_quarantine_duration_ms": n.LastQuarantineDurationMs,
+			"healthy_obs_count":           n.HealthyObsCount,
+			"degraded_obs_count":          n.DegradedObsCount,
+			"session_healthy_obs":         n.SessionHealthyObs,
+			"session_degraded_obs":        n.SessionDegradedObs,
+			"active_sessions":             n.ActiveSessions,
+			"quarantine_count":            n.QuarantineCount,
+			"quality_score":               avail["quality_score"],
 		}
 	}
 	pol := store.policy()
 	st := store.stats()
 	return map[string]any{
-		"available":    true,
-		"updatedAt":    store.snapshot().UpdatedAt,
-		"config":       pol,
-		"editable":     true,
-		"nodes":        nodeMap,
-		"statistics":   st,
-		"recentEvents": store.events(),
-		"plugin":       pluginName,
-		"version":      pluginVersion,
-		"started_at":   startedAt.Format(time.RFC3339),
-		"engine":       "cpa-native",
-		"clash":        clashStatusPayload(),
-		"hint":         "纯 CPA 出口守护：可对接本机 Clash PerfectAI；降智时走 Clash API 切换叶子节点，账号统一走本机 mixed-port。",
+		"available":     true,
+		"updatedAt":     store.snapshot().UpdatedAt,
+		"config":        publicPolicy(pol),
+		"editable":      true,
+		"nodes":         nodeMap,
+		"statistics":    st,
+		"recentEvents":  store.events(),
+		"quality_queue": qualitySched.snapshot(),
+		"plugin":        pluginName,
+		"version":       pluginVersion,
+		"started_at":    startedAt.Format(time.RFC3339),
+		"engine":        "cpa-native",
+		"clash":         clashStatusPayload(),
+		"hint":          "纯 CPA 出口守护：可对接本机 Clash PerfectAI；降智时走 Clash API 切换叶子节点，账号统一走本机 mixed-port。质量检测全局串行排队，避免 Clash 出口交叉。",
 	}
 }
 

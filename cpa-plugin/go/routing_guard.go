@@ -67,11 +67,24 @@ func handleSchedulerPick(request []byte) ([]byte, error) {
 		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
 	}
 	if len(eligible) == 0 {
-		// One more recovery attempt for the race where quarantine landed after
-		// the first ensureHealthyClashExit call above.
-		if ok, err := ensureHealthyClashExit(store); ok && err == nil {
+		// Active leaf is often already quarantined while Clash still points at it.
+		// Force switch (and clear active mark if needed) then recollect.
+		switched, err := ensureHealthyClashExit(store)
+		if err != nil {
+			// Last resort: pick any healthy clash leaf and switch production group.
+			if forceErr := forceSwitchAnyHealthyClash(store); forceErr == nil {
+				switched = true
+				err = nil
+			}
+		}
+		if switched || err == nil {
 			eligible, managed, nonXAIAvailable = collectEligibleSchedulerAuths(req)
 		}
+	}
+	if len(eligible) == 0 {
+		// Still empty: try force switch once more then fail soft for mixed providers.
+		_ = forceSwitchAnyHealthyClash(store)
+		eligible, managed, nonXAIAvailable = collectEligibleSchedulerAuths(req)
 	}
 	if len(eligible) == 0 {
 		if strings.TrimSpace(req.Provider) == "" && nonXAIAvailable {
@@ -337,4 +350,34 @@ func terminateQuarantinedRequest(errType, message string) ([]byte, error) {
 		},
 		ResponseBody: body,
 	})
+}
+
+
+// forceSwitchAnyHealthyClash ignores the current active mark and switches
+// production PerfectAI to any enabled non-quarantined Clash leaf.
+func forceSwitchAnyHealthyClash(store *stateStore) error {
+	if store == nil {
+		return fmt.Errorf("store 未初始化")
+	}
+	var chosen *nodeRecord
+	for _, n := range store.listNodes() {
+		if n.Source != nodeSourceClash || n.ClashName == "" || !n.Enabled || n.DisabledByGuard {
+			continue
+		}
+		chosen = n
+		break
+	}
+	if chosen == nil {
+		return fmt.Errorf("没有可切换的健康 Clash 节点")
+	}
+	if err := ensureClashSelectedForNode(store, chosen); err != nil {
+		return err
+	}
+	store.appendEvent(guardEvent{
+		Event:    "clash_switched",
+		NodeID:   chosen.ID,
+		NodeName: chosen.Name,
+		Reason:   "调度无健康账号，强制切换生产组到 " + chosen.ClashName,
+	})
+	return nil
 }

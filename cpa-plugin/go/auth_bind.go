@@ -551,7 +551,20 @@ func listAuthsForNode(node *nodeRecord, limit int) ([]authFile, error) {
 		if strings.TrimSpace(tok) == "" {
 			continue
 		}
-		onNode := node != nil && node.ProxyURL != "" && a.ProxyURL == node.ProxyURL
+		// Clash quality probes dial TestPort (e.g. :7953) while account sticky proxy
+		// remains production mixed-port (:7890). Match either the probe dial URL or
+		// the configured production Clash proxy so auths still resolve.
+		onNode := false
+		if node != nil && a.ProxyURL != "" {
+			if node.ProxyURL != "" && a.ProxyURL == node.ProxyURL {
+				onNode = true
+			} else if node.Source == nodeSourceClash {
+				prod := strings.TrimSpace(loadClashRuntimeConfig().ProxyURL)
+				if prod != "" && a.ProxyURL == prod {
+					onNode = true
+				}
+			}
+		}
 		if isAuthExpired(a) {
 			if onNode {
 				expired = append(expired, a)

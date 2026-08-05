@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -424,13 +425,116 @@ func TestStoreCreateNodesIsAllOrNothing(t *testing.T) {
 
 func TestRenderStatusPage(t *testing.T) {
 	page := strings.Replace(pageTemplate, "/*__HALLMARK_TOKENS__*/", tokenCSS, 1)
-	for _, want := range []string{"出口守护", "纯 CPA", "data-batch=\"enable\"", "重平衡账号", "批量添加", "/nodes/import", "页面每 15 秒刷新", "最短生成窗口", "X-Grok2API-Egress-UI"} {
+	for _, want := range []string{
+		"出口守护", "纯 CPA", "data-batch=\"enable\"", "重平衡账号", "批量添加", "/nodes/import",
+		"页面每 15 秒刷新", "最短生成窗口", "X-Grok2API-Egress-UI",
+		"queue-banner", "测试队列", "质量检测队列空闲", "quality_queue", "hasThinking",
+	} {
 		if !strings.Contains(page, want) {
 			t.Fatalf("missing %q", want)
 		}
 	}
 	if strings.Contains(page, "/*__HALLMARK_TOKENS__*/") {
 		t.Fatal("tokens not replaced in test helper path only")
+	}
+}
+
+func TestDeltaHasThinking(t *testing.T) {
+	if !deltaHasThinking(map[string]any{"reasoning_content": "step 1"}) {
+		t.Fatal("reasoning_content should count as thinking")
+	}
+	if !deltaHasThinking(map[string]any{"thinking": "why walk"}) {
+		t.Fatal("thinking field should count")
+	}
+	if !deltaHasThinking(map[string]any{"content": []any{map[string]any{"type": "thinking", "thinking": "..."}}}) {
+		t.Fatal("anthropic-style thinking block should count")
+	}
+	if deltaHasThinking(map[string]any{"content": "走路去"}) {
+		t.Fatal("plain content must not count as thinking")
+	}
+	if deltaHasThinking(nil) {
+		t.Fatal("nil delta must not count")
+	}
+}
+
+func TestQualityQueueDedupesAndSnapshots(t *testing.T) {
+	// Isolate global scheduler state for this test.
+	qualitySched.mu.Lock()
+	qualitySched.pending = nil
+	qualitySched.active = nil
+	qualitySched.started = false
+	qualitySched.nextID = 0
+	qualitySched.mu.Unlock()
+
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	a, err := store.createNode("node-a", "http://127.0.0.1:7951", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := store.createNode("node-b", "http://127.0.0.1:7952", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Do not start the worker: jobs stay pending so we can assert queue shape.
+	if _, err := queueNodeQuality(store, a.ID, "manual", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queueNodeQuality(store, b.ID, "active", false); err != nil {
+		t.Fatal(err)
+	}
+	dup, err := queueNodeQuality(store, a.ID, "manual", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dup["deduped"] != true {
+		t.Fatalf("expected dedupe for same node, got %#v", dup)
+	}
+
+	snap := qualitySched.snapshot()
+	if snap["busy"] != true {
+		t.Fatalf("snapshot busy=%v", snap["busy"])
+	}
+	if snap["total"] != 2 {
+		t.Fatalf("total=%v want 2", snap["total"])
+	}
+	pending, _ := snap["pending"].([]map[string]any)
+	if len(pending) != 2 {
+		t.Fatalf("pending=%d %#v", len(pending), snap["pending"])
+	}
+	if pending[0]["node_id"] != a.ID || pending[0]["source_label"] != "手动" {
+		t.Fatalf("first pending=%#v", pending[0])
+	}
+	if pending[1]["node_id"] != b.ID || pending[1]["source_label"] != "主动" {
+		t.Fatalf("second pending=%#v", pending[1])
+	}
+
+	// Clean up so later tests do not inherit queued jobs.
+	qualitySched.mu.Lock()
+	qualitySched.pending = nil
+	qualitySched.active = nil
+	qualitySched.started = false
+	qualitySched.mu.Unlock()
+}
+
+func TestQualityProbePromptIsCarWash(t *testing.T) {
+	if !strings.Contains(qualityProbePrompt, "洗车") {
+		t.Fatalf("probe prompt=%q", qualityProbePrompt)
+	}
+	if !strings.Contains(missingThinkingReason, "thinking") {
+		t.Fatalf("missing thinking reason=%q", missingThinkingReason)
+	}
+}
+
+func TestProbeTimeoutErrorsAreDetected(t *testing.T) {
+	if !isProbeTimeoutErr(context.DeadlineExceeded) {
+		t.Fatal("deadline exceeded must be timeout")
+	}
+	if !isProbeTimeoutErr(fmt.Errorf("Post url: context deadline exceeded (Client.Timeout exceeded while awaiting headers)")) {
+		t.Fatal("client timeout string must match")
+	}
+	if isProbeTimeoutErr(fmt.Errorf("connection refused")) {
+		t.Fatal("connection refused is not timeout")
 	}
 }
 

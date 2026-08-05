@@ -13,56 +13,78 @@ import (
 )
 
 type policyConfig struct {
-	Mode                 string   `json:"mode"`
-	ActiveIntervalSec    int      `json:"active_interval_seconds"`
-	PassivePollSec       int      `json:"passive_poll_seconds"`
-	QuarantineSec        int      `json:"quarantine_seconds"`
-	SoftTPS              float64  `json:"soft_tps"`
-	HardTPS              float64  `json:"hard_tps"`
-	ConsecutiveSoft      int      `json:"consecutive_soft"`
-	ConsecutiveErrors    int      `json:"consecutive_errors"`
-	MinHealthyNodes      int      `json:"min_healthy_nodes"`
-	MinGenerationMs      int64    `json:"min_generation_ms"`
-	MinOutputTokens      int64    `json:"min_output_tokens"`
-	Model                string   `json:"model"`
-	DisableAuthOnHard    bool     `json:"disable_auth_on_hard"`
-	MaxOutputTokensProbe int      `json:"max_output_tokens"`
+	Mode                 string  `json:"mode"`
+	ActiveIntervalSec    int     `json:"active_interval_seconds"`
+	PassivePollSec       int     `json:"passive_poll_seconds"`
+	QuarantineSec        int     `json:"quarantine_seconds"`
+	SoftTPS              float64 `json:"soft_tps"`
+	HardTPS              float64 `json:"hard_tps"`
+	ConsecutiveSoft      int     `json:"consecutive_soft"`
+	ConsecutiveErrors    int     `json:"consecutive_errors"`
+	MinHealthyNodes      int     `json:"min_healthy_nodes"`
+	MinGenerationMs      int64   `json:"min_generation_ms"`
+	MinOutputTokens      int64   `json:"min_output_tokens"`
+	Model                string  `json:"model"`
+	DisableAuthOnHard    bool    `json:"disable_auth_on_hard"`
+	MaxOutputTokensProbe int     `json:"max_output_tokens"`
+	// ProbeAPIBase / ProbeAPIKey: public OpenAI-compatible endpoint used for
+	// quality probes so free-usage cooling is recorded by the normal gateway
+	// (instead of bypassing via cli-chat-proxy with raw xAI tokens).
+	ProbeAPIBase string `json:"probe_api_base"`
+	ProbeAPIKey  string `json:"probe_api_key"`
 	// IsolationKeywords lists request-body substrings that quarantine the
 	// currently selected egress after auth. Empty disables keyword isolation.
 	IsolationKeywords []string `json:"isolation_keywords"`
 }
 
 type nodeRecord struct {
-	ID                   string    `json:"id"`
-	Name                 string    `json:"name"`
-	ProxyURL             string    `json:"-"` // never serialize to API clients in clear form via dedicated DTO
-	ProxyURLStored       string    `json:"proxy_url"`
-	Enabled              bool      `json:"enabled"`
-	ProxyPool            bool      `json:"proxy_pool"`
-	AccountCapacity      int       `json:"account_capacity"`
-	Source               string    `json:"source,omitempty"`       // manual | clash
-	ClashName            string    `json:"clash_name,omitempty"`  // leaf proxy name inside Clash group
-	ClashGroup           string    `json:"clash_group,omitempty"` // e.g. 🏜️ PerfectAI
-	ClashActive          bool      `json:"clash_active,omitempty"`
-	ExitIP               string    `json:"exit_ip,omitempty"`
-	ProbeStatus          string    `json:"probe_status,omitempty"`
-	ProbeLatencyMs       int64     `json:"probe_latency_ms,omitempty"`
-	AssignedAccountCount int       `json:"assigned_account_count"`
-	DisabledByGuard      bool      `json:"disabled_by_guard"`
-	QuarantinedUntil     float64   `json:"quarantined_until,omitempty"`
-	ErrorStrikes         int       `json:"error_strikes"`
-	SoftStrikes          int       `json:"soft_strikes"`
-	LastClassification   string    `json:"last_classification,omitempty"`
-	LastOutputTPS        float64   `json:"last_output_tps,omitempty"`
-	LastFirstTokenMs     int64     `json:"last_first_token_ms,omitempty"`
-	LastDurationMs       int64     `json:"last_duration_ms,omitempty"`
-	LastOutputTokens     int64     `json:"last_output_tokens,omitempty"`
-	LastReason           string    `json:"last_reason,omitempty"`
-	LastSource           string    `json:"last_source,omitempty"`
-	LastObservedAt       float64   `json:"last_observed_at,omitempty"`
-	LastProbeAt          float64   `json:"last_probe_at,omitempty"`
-	CreatedAt            time.Time `json:"created_at"`
-	UpdatedAt            time.Time `json:"updated_at"`
+	ID                   string  `json:"id"`
+	Name                 string  `json:"name"`
+	ProxyURL             string  `json:"-"` // never serialize to API clients in clear form via dedicated DTO
+	ProxyURLStored       string  `json:"proxy_url"`
+	Enabled              bool    `json:"enabled"`
+	ProxyPool            bool    `json:"proxy_pool"`
+	AccountCapacity      int     `json:"account_capacity"`
+	Source               string  `json:"source,omitempty"`      // manual | clash
+	ClashName            string  `json:"clash_name,omitempty"`  // leaf proxy name inside Clash group
+	ClashGroup           string  `json:"clash_group,omitempty"` // e.g. 🏜️ PerfectAI
+	ClashActive          bool    `json:"clash_active,omitempty"`
+	ExitIP               string  `json:"exit_ip,omitempty"`
+	ProbeStatus          string  `json:"probe_status,omitempty"`
+	ProbeLatencyMs       int64   `json:"probe_latency_ms,omitempty"`
+	AssignedAccountCount int     `json:"assigned_account_count"`
+	DisabledByGuard      bool    `json:"disabled_by_guard"`
+	QuarantinedUntil     float64 `json:"quarantined_until,omitempty"`
+	ErrorStrikes         int     `json:"error_strikes"`
+	SoftStrikes          int     `json:"soft_strikes"`
+	LastClassification   string  `json:"last_classification,omitempty"`
+	LastOutputTPS        float64 `json:"last_output_tps,omitempty"`
+	LastFirstTokenMs     int64   `json:"last_first_token_ms,omitempty"`
+	LastDurationMs       int64   `json:"last_duration_ms,omitempty"`
+	LastOutputTokens     int64   `json:"last_output_tokens,omitempty"`
+	LastReason           string  `json:"last_reason,omitempty"`
+	LastSource           string  `json:"last_source,omitempty"`
+	LastObservedAt       float64 `json:"last_observed_at,omitempty"`
+	LastProbeAt          float64 `json:"last_probe_at,omitempty"`
+	// Availability / quality tracking.
+	// Healthy side is observation-based (real request/probe usage), NOT wall-clock
+	// selected time — idle selection must not inflate quality.
+	// Quarantine side is wall-clock state duration (time spent marked degraded).
+	LastActiveAt             float64   `json:"last_active_at,omitempty"` // production selected since (display)
+	LastQuarantinedAt        float64   `json:"last_quarantined_at,omitempty"`
+	TotalActiveMs            int64     `json:"total_active_ms,omitempty"` // healthy usage ms from observations
+	TotalQuarantinedMs       int64     `json:"total_quarantined_ms,omitempty"`
+	SessionHealthyUsageMs    int64     `json:"session_healthy_usage_ms,omitempty"`
+	HealthyObsCount          int64     `json:"healthy_obs_count,omitempty"`
+	DegradedObsCount         int64     `json:"degraded_obs_count,omitempty"`
+	SessionHealthyObs        int64     `json:"session_healthy_obs,omitempty"`
+	SessionDegradedObs       int64     `json:"session_degraded_obs,omitempty"`
+	ActiveSessions           int64     `json:"active_sessions,omitempty"`
+	QuarantineCount          int64     `json:"quarantine_count,omitempty"`
+	LastActiveDurationMs     int64     `json:"last_active_duration_ms,omitempty"` // last session healthy usage ms
+	LastQuarantineDurationMs int64     `json:"last_quarantine_duration_ms,omitempty"`
+	CreatedAt                time.Time `json:"created_at"`
+	UpdatedAt                time.Time `json:"updated_at"`
 }
 
 type nodeCreateInput struct {
@@ -111,12 +133,14 @@ type statistics struct {
 // Non-empty fields override the CPA plugin YAML config so friends can
 // set group / API endpoint without touching host config files.
 type clashUIConfig struct {
-	Enabled   *bool  `json:"enabled,omitempty"`
-	APIURL    string `json:"api_url,omitempty"`
-	Secret    string `json:"secret,omitempty"`
-	Group     string `json:"group,omitempty"`
-	ProxyURL  string `json:"proxy_url,omitempty"`
-	UpdatedAt float64 `json:"updated_at,omitempty"`
+	Enabled      *bool   `json:"enabled,omitempty"`
+	APIURL       string  `json:"api_url,omitempty"`
+	Secret       string  `json:"secret,omitempty"`
+	Group        string  `json:"group,omitempty"`
+	ProxyURL     string  `json:"proxy_url,omitempty"`
+	TestGroup    string  `json:"test_group,omitempty"`
+	TestProxyURL string  `json:"test_proxy_url,omitempty"`
+	UpdatedAt    float64 `json:"updated_at,omitempty"`
 }
 
 type guardState struct {
@@ -152,6 +176,8 @@ func defaultPolicy() policyConfig {
 		Model:                "grok-4.5",
 		DisableAuthOnHard:    true,
 		MaxOutputTokensProbe: 384,
+		ProbeAPIBase:         "",
+		ProbeAPIKey:          "",
 		IsolationKeywords:    nil,
 	}
 }
@@ -236,6 +262,10 @@ func (s *stateStore) load() error {
 		data.Policy.MaxOutputTokensProbe = 384
 	}
 	data.Policy.IsolationKeywords = normalizeIsolationKeywords(data.Policy.IsolationKeywords)
+	data.Policy.ProbeAPIBase = strings.TrimRight(strings.TrimSpace(data.Policy.ProbeAPIBase), "/")
+	data.Policy.ProbeAPIKey = strings.TrimSpace(data.Policy.ProbeAPIKey)
+	// Public probe API left empty on purpose: quality probes use cli-chat-proxy +
+	// per-account tokens via TestPort. Panel can still set probe_api_* later.
 	if data.Policy.Mode == "" {
 		data.Policy.Mode = "hybrid"
 	}
@@ -321,6 +351,14 @@ func (s *stateStore) updatePolicy(p policyConfig) error {
 	if p.Model == "" {
 		p.Model = "grok-4.5"
 	}
+	p.ProbeAPIBase = strings.TrimRight(strings.TrimSpace(p.ProbeAPIBase), "/")
+	if len(p.ProbeAPIBase) > 512 {
+		return fmt.Errorf("探测 API 端点过长")
+	}
+	p.ProbeAPIKey = strings.TrimSpace(p.ProbeAPIKey)
+	if len(p.ProbeAPIKey) > 512 {
+		return fmt.Errorf("探测 API Key 过长")
+	}
 	if p.ConsecutiveSoft <= 0 {
 		p.ConsecutiveSoft = 2
 	}
@@ -400,6 +438,21 @@ func (s *stateStore) updateClashUI(in clashUIConfig, clearSecret bool) (clashUIC
 			return clashUIConfig{}, fmt.Errorf("代理 URL 过长")
 		}
 		cur.ProxyURL = v
+	}
+	if v := strings.TrimSpace(in.TestGroup); v != "" {
+		if len(v) > 200 {
+			return clashUIConfig{}, fmt.Errorf("测试策略组名过长")
+		}
+		cur.TestGroup = v
+	}
+	if v := strings.TrimSpace(in.TestProxyURL); v != "" {
+		if _, err := url.Parse(v); err != nil {
+			return clashUIConfig{}, fmt.Errorf("测试代理 URL 无效: %w", err)
+		}
+		if len(v) > 512 {
+			return clashUIConfig{}, fmt.Errorf("测试代理 URL 过长")
+		}
+		cur.TestProxyURL = v
 	}
 	cur.UpdatedAt = float64(time.Now().Unix())
 	s.data.ClashUI = cur
@@ -658,35 +711,266 @@ func publicNode(n *nodeRecord) map[string]any {
 	if source == "" {
 		source = nodeSourceManual
 	}
+	now := float64(time.Now().Unix())
+	avail := nodeAvailabilitySnapshot(n, now)
 	return map[string]any{
-		"id":                   n.ID,
-		"name":                 n.Name,
-		"enabled":              n.Enabled,
-		"proxyPool":            n.ProxyPool,
-		"accountCapacity":      n.AccountCapacity,
-		"source":               source,
-		"clashName":            n.ClashName,
-		"clashGroup":           n.ClashGroup,
-		"clashActive":          n.ClashActive,
-		"exitIp":               n.ExitIP,
-		"probeStatus":          n.ProbeStatus,
-		"probeLatencyMs":       n.ProbeLatencyMs,
-		"assignedAccountCount": n.AssignedAccountCount,
-		"disabled_by_guard":    n.DisabledByGuard,
-		"quarantined_until":    n.QuarantinedUntil,
-		"error_strikes":        n.ErrorStrikes,
-		"soft_strikes":         n.SoftStrikes,
-		"last_classification":  n.LastClassification,
-		"last_output_tps":      n.LastOutputTPS,
-		"last_first_token_ms":  n.LastFirstTokenMs,
-		"last_duration_ms":     n.LastDurationMs,
-		"last_output_tokens":   n.LastOutputTokens,
-		"last_reason":          n.LastReason,
-		"last_source":          n.LastSource,
-		"last_observed_at":     n.LastObservedAt,
-		"last_probe_at":        n.LastProbeAt,
-		"hasProxy":             n.ProxyURL != "",
-		"createdAt":            n.CreatedAt,
-		"updatedAt":            n.UpdatedAt,
+		"id":                          n.ID,
+		"name":                        n.Name,
+		"enabled":                     n.Enabled,
+		"proxyPool":                   n.ProxyPool,
+		"accountCapacity":             n.AccountCapacity,
+		"source":                      source,
+		"clashName":                   n.ClashName,
+		"clashGroup":                  n.ClashGroup,
+		"clashActive":                 n.ClashActive,
+		"exitIp":                      n.ExitIP,
+		"probeStatus":                 n.ProbeStatus,
+		"probeLatencyMs":              n.ProbeLatencyMs,
+		"assignedAccountCount":        n.AssignedAccountCount,
+		"disabled_by_guard":           n.DisabledByGuard,
+		"quarantined_until":           n.QuarantinedUntil,
+		"error_strikes":               n.ErrorStrikes,
+		"soft_strikes":                n.SoftStrikes,
+		"last_classification":         n.LastClassification,
+		"last_output_tps":             n.LastOutputTPS,
+		"last_first_token_ms":         n.LastFirstTokenMs,
+		"last_duration_ms":            n.LastDurationMs,
+		"last_output_tokens":          n.LastOutputTokens,
+		"last_reason":                 n.LastReason,
+		"last_source":                 n.LastSource,
+		"last_observed_at":            n.LastObservedAt,
+		"last_probe_at":               n.LastProbeAt,
+		"last_active_at":              n.LastActiveAt,
+		"last_quarantined_at":         n.LastQuarantinedAt,
+		"total_active_ms":             avail["total_active_ms"],
+		"total_quarantined_ms":        avail["total_quarantined_ms"],
+		"current_active_ms":           avail["current_active_ms"],
+		"current_quarantined_ms":      avail["current_quarantined_ms"],
+		"current_selected_ms":         avail["current_selected_ms"],
+		"last_active_duration_ms":     n.LastActiveDurationMs,
+		"last_quarantine_duration_ms": n.LastQuarantineDurationMs,
+		"healthy_obs_count":           n.HealthyObsCount,
+		"degraded_obs_count":          n.DegradedObsCount,
+		"session_healthy_obs":         n.SessionHealthyObs,
+		"session_degraded_obs":        n.SessionDegradedObs,
+		"active_sessions":             n.ActiveSessions,
+		"quarantine_count":            n.QuarantineCount,
+		"quality_score":               avail["quality_score"],
+		"hasProxy":                    n.ProxyURL != "",
+		"createdAt":                   n.CreatedAt,
+		"updatedAt":                   n.UpdatedAt,
+	}
+}
+
+// nodeAvailabilitySnapshot derives live quarantine duration and quality.
+// Healthy metrics are observation-based (real usage), never idle selected time.
+// quality_score prefers healthy_obs/(healthy+degraded obs); falls back to
+// healthy_usage_ms/(healthy_usage_ms+quarantined_ms).
+func nodeAvailabilitySnapshot(n *nodeRecord, now float64) map[string]any {
+	out := map[string]any{
+		"total_active_ms":        int64(0),
+		"total_quarantined_ms":   int64(0),
+		"current_active_ms":      int64(0),
+		"current_quarantined_ms": int64(0),
+		"current_selected_ms":    int64(0),
+		"quality_score":          nil,
+	}
+	if n == nil {
+		return out
+	}
+	if now <= 0 {
+		now = float64(time.Now().Unix())
+	}
+
+	// Healthy usage is already closed into totals + open session accumulator.
+	activeMs := n.TotalActiveMs
+	currentActive := n.SessionHealthyUsageMs
+	if currentActive < 0 {
+		currentActive = 0
+	}
+
+	qMs := n.TotalQuarantinedMs
+	var currentQ int64
+	if n.LastQuarantinedAt > 0 && n.DisabledByGuard {
+		if d := int64((now - n.LastQuarantinedAt) * 1000); d > 0 {
+			currentQ = d
+			qMs += d
+		}
+	}
+
+	var selectedMs int64
+	if n.LastActiveAt > 0 && n.ClashActive && !n.DisabledByGuard {
+		if d := int64((now - n.LastActiveAt) * 1000); d > 0 {
+			selectedMs = d
+		}
+	}
+
+	out["total_active_ms"] = activeMs + currentActive
+	out["total_quarantined_ms"] = qMs
+	out["current_active_ms"] = currentActive
+	out["current_quarantined_ms"] = currentQ
+	out["current_selected_ms"] = selectedMs
+
+	// Prefer response-count score: 未降智响应 / 全部判定响应
+	healthyObs := n.HealthyObsCount
+	degradedObs := n.DegradedObsCount
+	obsTotal := healthyObs + degradedObs
+	if obsTotal > 0 {
+		score := float64(healthyObs) / float64(obsTotal) * 100
+		out["quality_score"] = float64(int64(score*10+0.5)) / 10
+		return out
+	}
+	// Fallback: actual healthy usage time vs quarantine wall time
+	usage := activeMs + currentActive
+	total := usage + qMs
+	if total > 0 {
+		score := float64(usage) / float64(total) * 100
+		if score < 0 {
+			score = 0
+		}
+		if score > 100 {
+			score = 100
+		}
+		out["quality_score"] = float64(int64(score*10+0.5)) / 10
+	}
+	return out
+}
+
+// markNodeBecameActive records production selection. Does NOT credit healthy
+// time — that only accrues from real healthy/soft observations.
+func markNodeBecameActive(n *nodeRecord, now float64) {
+	if n == nil {
+		return
+	}
+	if now <= 0 {
+		now = float64(time.Now().Unix())
+	}
+	if n.LastActiveAt > 0 {
+		return
+	}
+	n.LastActiveAt = now
+	n.ActiveSessions++
+	n.SessionHealthyUsageMs = 0
+	n.SessionHealthyObs = 0
+	n.SessionDegradedObs = 0
+}
+
+// markNodeBecameInactive ends production selection. Flushes session healthy
+// usage (observation-based) into totals; selected idle time is discarded.
+func markNodeBecameInactive(n *nodeRecord, now float64) {
+	if n == nil {
+		return
+	}
+	if n.LastActiveAt <= 0 && n.SessionHealthyUsageMs <= 0 && n.SessionHealthyObs <= 0 {
+		return
+	}
+	if n.SessionHealthyUsageMs > 0 {
+		n.TotalActiveMs += n.SessionHealthyUsageMs
+		n.LastActiveDurationMs = n.SessionHealthyUsageMs
+		n.SessionHealthyUsageMs = 0
+	} else if n.LastActiveDurationMs == 0 && n.SessionHealthyObs == 0 {
+		// no real usage this session — last duration stays previous or 0
+		n.LastActiveDurationMs = 0
+	}
+	n.LastActiveAt = 0
+	n.SessionHealthyObs = 0
+	n.SessionDegradedObs = 0
+}
+
+// recordHealthyObservation credits real non-degraded usage (healthy/soft).
+// durationMs is the request/probe generation time; ignored idle selected time.
+func recordHealthyObservation(n *nodeRecord, durationMs int64) {
+	if n == nil || n.DisabledByGuard {
+		return
+	}
+	if durationMs < 0 {
+		durationMs = 0
+	}
+	n.HealthyObsCount++
+	n.SessionHealthyObs++
+	if durationMs > 0 {
+		n.SessionHealthyUsageMs += durationMs
+		n.LastActiveDurationMs = n.SessionHealthyUsageMs
+	}
+}
+
+// recordDegradedObservation credits a hard/error observation that indicates
+// quality failure (whether or not quarantine is suppressed).
+func recordDegradedObservation(n *nodeRecord) {
+	if n == nil {
+		return
+	}
+	n.DegradedObsCount++
+	n.SessionDegradedObs++
+}
+
+// markNodeQuarantined starts quarantine wall-clock and flushes healthy session.
+func markNodeQuarantined(n *nodeRecord, now float64) {
+	if n == nil {
+		return
+	}
+	if now <= 0 {
+		now = float64(time.Now().Unix())
+	}
+	// Flush healthy usage from this service stint before quarantine.
+	if n.SessionHealthyUsageMs > 0 {
+		n.TotalActiveMs += n.SessionHealthyUsageMs
+		n.LastActiveDurationMs = n.SessionHealthyUsageMs
+		n.SessionHealthyUsageMs = 0
+	}
+	n.LastActiveAt = 0
+	n.SessionHealthyObs = 0
+	n.SessionDegradedObs = 0
+	if n.LastQuarantinedAt > 0 {
+		return
+	}
+	n.LastQuarantinedAt = now
+	n.QuarantineCount++
+}
+
+// markNodeRestored closes quarantine wall-clock. Does not invent healthy usage.
+func markNodeRestored(n *nodeRecord, now float64) {
+	if n == nil {
+		return
+	}
+	if now <= 0 {
+		now = float64(time.Now().Unix())
+	}
+	if n.LastQuarantinedAt > 0 {
+		if d := int64((now - n.LastQuarantinedAt) * 1000); d > 0 {
+			n.TotalQuarantinedMs += d
+			n.LastQuarantineDurationMs = d
+		}
+		n.LastQuarantinedAt = 0
+	}
+	// Still selected after restore: open a new selection window, but healthy
+	// credit waits for the next real healthy observation.
+	if n.ClashActive {
+		if n.LastActiveAt <= 0 {
+			n.LastActiveAt = now
+			n.ActiveSessions++
+		}
+		n.SessionHealthyUsageMs = 0
+		n.SessionHealthyObs = 0
+		n.SessionDegradedObs = 0
+	}
+}
+
+// applyClashActiveTransition updates ClashActive and selection boundaries only.
+func applyClashActiveTransition(n *nodeRecord, active bool, now float64) {
+	if n == nil {
+		return
+	}
+	if now <= 0 {
+		now = float64(time.Now().Unix())
+	}
+	wasActive := n.ClashActive
+	n.ClashActive = active
+	if active {
+		if !n.DisabledByGuard && n.LastActiveAt <= 0 {
+			markNodeBecameActive(n, now)
+		}
+	} else if wasActive || n.LastActiveAt > 0 || n.SessionHealthyUsageMs > 0 {
+		markNodeBecameInactive(n, now)
 	}
 }
