@@ -80,6 +80,44 @@
     td { font-size: var(--text-xs); }
     tbody tr:last-child td { border-bottom: 0; }
     tbody tr:hover td { background: color-mix(in oklch, var(--secondary) 55%, transparent); }
+    /* 停用 / 隔离：行级状态色，停用沉底后一眼能分出「还在调度」和「已下线」 */
+    tbody tr.node-row-disabled td {
+      background: color-mix(in oklch, var(--muted) 72%, transparent);
+      color: var(--muted-foreground);
+      opacity: 0.92;
+    }
+    tbody tr.node-row-disabled td:first-child {
+      box-shadow: inset 3px 0 0 color-mix(in oklch, var(--muted-foreground) 55%, transparent);
+    }
+    tbody tr.node-row-disabled .node-name {
+      color: var(--muted-foreground);
+      text-decoration: line-through;
+      text-decoration-thickness: 1px;
+      text-decoration-color: color-mix(in oklch, var(--muted-foreground) 55%, transparent);
+    }
+    tbody tr.node-row-disabled:hover td {
+      background: color-mix(in oklch, var(--muted) 88%, var(--secondary));
+    }
+    tbody tr.node-row-disabled td.actions-col,
+    tbody tr.node-row-disabled:hover td.actions-col {
+      background: color-mix(in oklch, var(--muted) 80%, var(--card));
+    }
+    tbody tr.node-row-quarantined td {
+      background: color-mix(in oklch, var(--danger-surface) 55%, transparent);
+    }
+    tbody tr.node-row-quarantined td:first-child {
+      box-shadow: inset 3px 0 0 var(--destructive);
+    }
+    tbody tr.node-row-quarantined:hover td {
+      background: color-mix(in oklch, var(--danger-surface) 72%, var(--secondary));
+    }
+    tbody tr.node-row-quarantined td.actions-col,
+    tbody tr.node-row-quarantined:hover td.actions-col {
+      background: color-mix(in oklch, var(--danger-surface) 65%, var(--card));
+    }
+    tbody tr.node-row-active td:first-child {
+      box-shadow: inset 3px 0 0 var(--success);
+    }
     .check-cell { width: 2.5rem; text-align: center; }
     .node-name { max-width: 14rem; font-weight: 620; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .subtext { margin-top: var(--space-3xs); color: var(--muted-foreground); font-size: var(--text-2xs); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 22rem; }
@@ -89,6 +127,12 @@
     .badge.warn { color: var(--warning); background: var(--warning-surface); }
     .badge.bad { color: var(--destructive); background: var(--danger-surface); }
     .badge.muted { color: var(--muted-foreground); background: var(--secondary); }
+    .badge.disabled {
+      color: var(--muted-foreground);
+      background: color-mix(in oklch, var(--muted) 70%, var(--secondary));
+      border: var(--rule-hairline) solid color-mix(in oklch, var(--muted-foreground) 35%, transparent);
+      letter-spacing: 0.02em;
+    }
     .row-actions { justify-content: flex-end; flex-wrap: wrap; }
     .row-actions .button { min-height: 2rem; padding: 0 var(--space-2xs); }
     th.actions-col, td.actions-col {
@@ -103,6 +147,25 @@
     .node-card {
       border: var(--rule-hairline) solid var(--border); border-radius: var(--radius-md);
       padding: var(--space-sm); background: var(--background); display: grid; gap: var(--space-2xs);
+    }
+    .node-card.is-disabled {
+      background: color-mix(in oklch, var(--muted) 65%, var(--background));
+      border-color: color-mix(in oklch, var(--muted-foreground) 28%, var(--border));
+      border-left: 3px solid color-mix(in oklch, var(--muted-foreground) 55%, transparent);
+      opacity: 0.92;
+    }
+    .node-card.is-disabled strong {
+      color: var(--muted-foreground);
+      text-decoration: line-through;
+      text-decoration-thickness: 1px;
+    }
+    .node-card.is-quarantined {
+      background: color-mix(in oklch, var(--danger-surface) 48%, var(--background));
+      border-color: color-mix(in oklch, var(--destructive) 35%, var(--border));
+      border-left: 3px solid var(--destructive);
+    }
+    .node-card.is-active {
+      border-left: 3px solid var(--success);
     }
     .node-card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-sm); }
     .node-card-meta { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-2xs); font-size: var(--text-2xs); color: var(--muted-foreground); }
@@ -673,13 +736,41 @@
     }
     function filteredNodes() {
       const query = state.search.trim().toLowerCase();
-      if (!query) return state.nodes;
-      return state.nodes.filter((node) => [node.id,node.name,node.exitIp,node.clashName,node.clashGroup,node.source].some((value) => String(value || '').toLowerCase().includes(query)));
+      const base = !query
+        ? state.nodes.slice()
+        : state.nodes.filter((node) => [node.id,node.name,node.exitIp,node.clashName,node.clashGroup,node.source].some((value) => String(value || '').toLowerCase().includes(query)));
+      // 排序：Clash 当前 → 启用(隔离靠后) → 停用沉底。停用节点不再混在可用列表中间。
+      return base.map((node, index) => ({ node, index, guard: nodeGuard(node) })).sort((a, b) => {
+        const rank = (item) => {
+          const enabled = !!item.node.enabled;
+          const quarantined = !!item.guard.disabled_by_guard;
+          const active = item.node.source === 'clash' && !!(item.node.clashActive || item.guard.clash_active);
+          if (!enabled) return 300;           // 停用最底
+          if (quarantined) return 200;        // 启用但隔离：中下，仍可见
+          if (active) return 0;               // 当前生产出口置顶
+          return 100;                        // 其它启用节点
+        };
+        const d = rank(a) - rank(b);
+        return d !== 0 ? d : a.index - b.index;
+      }).map((item) => item.node);
     }
     function nodeGuard(node) { return state.status?.nodes?.[node.id] || {}; }
+    function nodeRowClass(node, guard) {
+      if (!node.enabled) return 'node-row-disabled';
+      if (guard.disabled_by_guard) return 'node-row-quarantined';
+      if (node.source === 'clash' && (node.clashActive || guard.clash_active)) return 'node-row-active';
+      return '';
+    }
+    function nodeCardClass(node, guard) {
+      const parts = ['node-card'];
+      if (!node.enabled) parts.push('is-disabled');
+      else if (guard.disabled_by_guard) parts.push('is-quarantined');
+      else if (node.source === 'clash' && (node.clashActive || guard.clash_active)) parts.push('is-active');
+      return parts.join(' ');
+    }
     function nodeBadge(node, guard) {
+      if (!node.enabled) return '<span class="badge disabled" title="已停用：不参与调度与自动复测">已停用</span>';
       if (guard.disabled_by_guard) return '<span class="badge bad">已隔离</span>';
-      if (!node.enabled) return '<span class="badge muted">已停用</span>';
       let extra = '';
       if (node.source === 'clash' && (node.clashActive || guard.clash_active)) extra = '<span class="badge good">Clash 当前</span> ';
       else if (node.source === 'clash') extra = '<span class="badge muted">Clash</span> ';
@@ -761,6 +852,7 @@
     }
     function nextObservation(node, guard) {
       const cfg = state.status?.config || {};
+      if (!node.enabled) return '已停用 · 不自动复测';
       if (guard.disabled_by_guard) return quarantineCountdown(guard) || '等待隔离复测';
       if (cfg.mode === 'passive') return '随下一次请求更新';
       const interval = Number(cfg.active_interval_seconds || 0);
@@ -806,12 +898,15 @@
         const cls = guard.last_classification || '';
         const tpsClass = cls === 'hard' ? 'tone-bad' : cls === 'soft' ? 'tone-warn' : '';
         const observed = guard.last_observed_at || guard.last_probe_at;
-        const reason = guard.last_reason || node.probeStatus || '-';
-        const cd = quarantineCountdown(guard);
+        const reason = !node.enabled
+          ? (guard.last_reason || '已停用 · 不参与调度/自动复测')
+          : (guard.last_reason || node.probeStatus || '-');
+        const cd = node.enabled ? quarantineCountdown(guard) : '';
         const avail = nodeAvailability(node, guard);
-        return '<tr data-id="' + esc(node.id) + '">' +
+        const rowClass = nodeRowClass(node, guard);
+        return '<tr class="' + rowClass + '" data-id="' + esc(node.id) + '">' +
           '<td class="check-cell"><input type="checkbox" data-action="select" ' + (state.selected.has(node.id) ? 'checked' : '') + ' aria-label="选择 ' + esc(node.name) + '"></td>' +
-          '<td><div class="node-name" title="' + esc(node.name) + '">' + esc(node.name) + '</div><div class="subtext">ID ' + esc(node.id) + ' · ' + (node.proxyPool ? '代理池' : '固定代理') + '</div></td>' +
+          '<td><div class="node-name" title="' + esc(node.name) + '">' + esc(node.name) + '</div><div class="subtext">ID ' + esc(node.id) + ' · ' + (node.proxyPool ? '代理池' : '固定代理') + (!node.enabled ? ' · 停用' : '') + '</div></td>' +
           '<td>' + nodeBadge(node, guard) + ' ' + qualityBadge(avail.score) + '<div class="subtext" title="' + esc(reason) + '">' + esc(reason) + (cd ? ' · ' + cd : '') + '</div></td>' +
           '<td><div title="真实健康响应累计使用时长（不含空闲选中）">' + (avail.serviceMs ? formatDurationMs(avail.serviceMs) : '-') + '<div class="subtext">正常 ' + number(avail.healthyObs) + ' · 降智观测 ' + number(avail.degradedObs) + '</div></div><div class="subtext" title="降智墙钟时长">' + (avail.quarantineMs ? ('降智 ' + formatDurationMs(avail.quarantineMs)) : '无降智记录') + (avail.totalActive ? (' · 累计使用 ' + formatDurationMs(avail.totalActive)) : '') + '</div></td>' +
           '<td><div>' + esc(node.exitIp || '-') + '</div><div class="subtext">' + esc(node.probeStatus || 'unknown') + ' · ' + number(node.probeLatencyMs) + ' ms</div></td>' +
@@ -824,12 +919,14 @@
       $('node-cards').innerHTML = nodes.map((node) => {
         const guard = nodeGuard(node);
         const observed = guard.last_observed_at || guard.last_probe_at;
-        const reason = guard.last_reason || node.probeStatus || '-';
-        const cd = quarantineCountdown(guard);
+        const reason = !node.enabled
+          ? (guard.last_reason || '已停用 · 不参与调度/自动复测')
+          : (guard.last_reason || node.probeStatus || '-');
+        const cd = node.enabled ? quarantineCountdown(guard) : '';
         const avail = nodeAvailability(node, guard);
-        return '<article class="node-card" data-id="' + esc(node.id) + '">' +
+        return '<article class="' + nodeCardClass(node, guard) + '" data-id="' + esc(node.id) + '">' +
           '<div class="node-card-head"><div><label><input type="checkbox" data-action="select" ' + (state.selected.has(node.id) ? 'checked' : '') + '> <strong>' + esc(node.name) + '</strong></label>' +
-          '<div class="subtext">ID ' + esc(node.id) + ' · ' + (node.proxyPool ? '代理池' : '固定代理') + '</div></div>' + nodeBadge(node, guard) + '</div>' +
+          '<div class="subtext">ID ' + esc(node.id) + ' · ' + (node.proxyPool ? '代理池' : '固定代理') + (!node.enabled ? ' · 停用' : '') + '</div></div>' + nodeBadge(node, guard) + '</div>' +
           '<div class="subtext" title="' + esc(reason) + '">' + esc(reason) + (cd ? ' · ' + cd : '') + '</div>' +
           '<div class="subtext">' + qualityBadge(avail.score) + ' · ' + esc(availabilityLine(node, guard)) + '</div>' +
           '<div class="node-card-meta">' +
