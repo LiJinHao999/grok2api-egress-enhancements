@@ -63,6 +63,8 @@ import (
 	"html"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -75,11 +77,13 @@ import (
 
 const (
 	pluginName          = "grok2api-egress"
-	pluginVersion       = "1.0.7"
+	pluginVersion       = "1.0.8"
 	resourcePath        = "/status"
 	managementAPIPath   = "/v0/management/grok2api-egress/api"
 	resourceContentType = "text/html; charset=utf-8"
-	defaultStateFile    = "/CLIProxyAPI/plugin-data/egress-guard/state.json"
+	// Prefer the CPA Docker layout; resolveDefaultStateFile falls back when
+	// /CLIProxyAPI is missing (bare-metal / non-standard installs).
+	defaultStateFile = "/CLIProxyAPI/plugin-data/egress-guard/state.json"
 )
 
 //go:embed page.html
@@ -175,11 +179,12 @@ func main() {}
 
 //export cliproxy_plugin_init
 func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_api) C.int {
-	if plugin == nil {
+	// Match official CPA plugins: both host and plugin tables are required.
+	if host == nil || plugin == nil {
 		return 1
 	}
 	C.store_host_api(host)
-	currentConfig.Store(pluginConfig{StateFile: defaultStateFile})
+	currentConfig.Store(pluginConfig{StateFile: resolveDefaultStateFile()})
 	plugin.abi_version = C.uint32_t(pluginabi.ABIVersion)
 	plugin.call = C.cliproxy_plugin_call_fn(C.cliproxyPluginCall)
 	plugin.free_buffer = C.cliproxy_plugin_free_fn(C.cliproxyPluginFree)
@@ -189,13 +194,16 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 
 //export cliproxyPluginCall
 func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t, response *C.cliproxy_buffer) C.int {
+	// Official CPA plugins always return 0 from call(); errors are carried in the
+	// JSON envelope. A non-zero rc can make some host builds treat the call as a
+	// hard failure even when an error envelope is present.
 	if response != nil {
 		response.ptr = nil
 		response.len = 0
 	}
 	if method == nil {
 		writeResponse(response, errorEnvelope("invalid_method", "method is required"))
-		return 1
+		return 0
 	}
 	var requestBytes []byte
 	if request != nil && requestLen > 0 {
@@ -204,7 +212,7 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 	raw, errHandle := handleMethod(C.GoString(method), requestBytes)
 	if errHandle != nil {
 		writeResponse(response, errorEnvelope("plugin_error", errHandle.Error()))
-		return 1
+		return 0
 	}
 	writeResponse(response, raw)
 	return 0
@@ -257,20 +265,28 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 }
 
 func configure(raw []byte) error {
+	// Keep register/reconfigure cheap and free of host callbacks.
+	// Store install + hot enable run plugin.register while CPA still holds the
+	// apply lock; a synchronous host.auth.list/get stampede (dozens of accounts)
+	// can stall or fail registration and leave the plugin as 未注册/未生效.
 	var req lifecycleRequest
 	if len(raw) > 0 {
 		if err := json.Unmarshal(raw, &req); err != nil {
 			return err
 		}
 	}
-	cfg := pluginConfig{StateFile: defaultStateFile}
+	cfg := pluginConfig{StateFile: resolveDefaultStateFile()}
 	if len(req.ConfigYAML) > 0 {
+		// Store installs pass the full plugins.configs.<id> YAML (enabled, store
+		// manifest, priority, …). Only our keys are decoded; unknown fields are
+		// ignored by yaml.v3. A decode failure must not block registration —
+		// fall back to defaults so the plugin still becomes 生效中.
 		if err := yaml.Unmarshal(req.ConfigYAML, &cfg); err != nil {
-			return err
+			cfg = pluginConfig{StateFile: resolveDefaultStateFile()}
 		}
 	}
 	if strings.TrimSpace(cfg.StateFile) == "" {
-		cfg.StateFile = defaultStateFile
+		cfg.StateFile = resolveDefaultStateFile()
 	}
 	if cfg.RotationTimeoutSec <= 0 {
 		cfg.RotationTimeoutSec = 45
@@ -283,8 +299,32 @@ func configure(raw []byte) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	workerCancel = cancel
 	startGuardWorker(ctx, store)
-	refreshAssignedCounts(store)
+	// Assigned counts are reconciled by the background worker; never block
+	// register on host.auth.* round-trips.
 	return nil
+}
+
+// resolveDefaultStateFile picks a writable state path.
+// Order: CPA Docker layout → cwd-relative plugin-data → temp dir fallback.
+func resolveDefaultStateFile() string {
+	candidates := []string{
+		defaultStateFile,
+		"plugin-data/egress-guard/state.json",
+	}
+	for _, path := range candidates {
+		dir := filepath.Dir(path)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			continue
+		}
+		// Prove the directory is writable without leaving junk when possible.
+		probe := filepath.Join(dir, ".write-probe")
+		if err := os.WriteFile(probe, []byte("ok"), 0o644); err != nil {
+			continue
+		}
+		_ = os.Remove(probe)
+		return path
+	}
+	return filepath.Join(os.TempDir(), "grok2api-egress-guard", "state.json")
 }
 
 func pluginRegistration() registration {

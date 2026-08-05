@@ -8,7 +8,7 @@
 | | |
 |---|---|
 | 插件名 | `grok2api-egress` |
-| 当前版本 | **1.0.7** |
+| 当前版本 | **1.0.8** |
 | 语言 | Go (`-buildmode=c-shared` → `.so`) |
 | CPA SDK | `CLIProxyAPI/v7` (`pluginabi` / `pluginapi`) |
 | 能力 | Management UI + Usage Plugin + Scheduler + Request Interceptor |
@@ -217,6 +217,19 @@ plugins:
 
 配置源并重启后，在 CPA 管理中心打开插件商店，搜索 **Grok Egress Guard** 或插件 ID `grok2api-egress`，选择与 CPA 主机架构一致的版本安装。发布包提供 `linux/amd64` 和 `linux/arm64`；商店会从 GitHub Release 下载并校验 `checksums.txt`。升级时在同一条目选择新版本即可，状态文件不会随插件二进制覆盖。
 
+安装完成后应看到：
+
+1. 插件管理里 `grok2api-egress` 开关为 **开**
+2. 徽章为 **已注册 / 生效中 / 已配置**（不是「未生效 / 未注册」）
+3. 左侧菜单出现 **出口守护**
+
+若仍是「未生效 / 未注册」：
+
+- 确认全局「插件」已启用，并打开该插件开关后点刷新
+- 使用 **v1.0.8+**（v1.0.7 及更早在 `plugin.register` 时会同步扫全部认证文件，账号多时可能注册失败并一直停在未注册）
+- 查看 CPA 日志中的 `pluginhost: failed to load plugin grok2api-egress` / `plugin … register failed`
+- 确认 `.so` 与 CPA 同架构、同 libc（官方 CPA 镜像为 Debian/glibc；Alpine/musl 需自行编译）
+
 也可直接从仓库 [Release](https://github.com/lij768423-svg/grok2api-egress-enhancements/releases) 下载 zip，校验 `checksums.txt` 后按下面的手动方式安装。
 
 ### 手动安装
@@ -361,9 +374,15 @@ CPA_LOADTEST_LOG_DIR=/var/log/cpa-loadtest \
 
 ---
 
-## 性能（v1.0.7）
+## 性能（v1.0.8）
 
 低配机器上若出现 CPA 整体变卡 / CPU 打满，通常不是探测本身，而是旧版热路径对 `host.auth.list` + N 次 `host.auth.get` 的反复全量扫描，以及每条 usage 事件全量 `MarshalIndent` 写 `state.json`。
+
+v1.0.8 起额外修复商店安装后一直「未生效 / 未注册」：
+
+- `plugin.register` / `reconfigure` **不再同步**调用 `host.auth.*`（绑定数改由 worker 延迟 3s 再对账）
+- 插件 `call()` 统一返回 0，错误只走 JSON envelope（与官方 CPA 插件一致）
+- 损坏的插件 YAML 不再阻断注册；`state_file` 自动选可写路径
 
 v1.0.7 起：
 

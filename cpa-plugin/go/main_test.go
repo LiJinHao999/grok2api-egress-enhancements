@@ -305,6 +305,106 @@ func TestStoreNodeCRUD(t *testing.T) {
 	}
 }
 
+func TestConfigureAcceptsStoreInstallYAMLWithoutHostAuth(t *testing.T) {
+	// Mirrors the YAML CPA passes on plugin.register after a store install:
+	// enabled + store manifest + optional plugin fields. Must succeed without
+	// any host.auth.* callbacks so the plugin becomes 已注册/生效中 immediately.
+	prevStore := store
+	prevCancel := workerCancel
+	prevHost := hostCall
+	t.Cleanup(func() {
+		if workerCancel != nil {
+			workerCancel()
+		}
+		workerCancel = prevCancel
+		store = prevStore
+		hostCall = prevHost
+	})
+	hostCall = func(method string, payload []byte) (json.RawMessage, error) {
+		t.Fatalf("configure must not call host during register, got %s", method)
+		return nil, fmt.Errorf("unexpected host call %s", method)
+	}
+
+	statePath := filepath.Join(t.TempDir(), "egress-guard", "state.json")
+	configYAML := []byte(fmt.Sprintf(`
+enabled: true
+priority: 0
+state_file: %s
+store:
+  schema-version: 1
+  id: grok2api-egress
+  version: 1.0.8
+  release-tag: v1.0.8
+  repository: https://github.com/lij768423-svg/grok2api-egress-enhancements
+  install:
+    type: github-release
+`, statePath))
+	lifecycle, err := json.Marshal(lifecycleRequest{ConfigYAML: configYAML})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := configure(lifecycle); err != nil {
+		t.Fatalf("configure(store install yaml): %v", err)
+	}
+	raw, err := handleMethod(pluginabi.MethodPluginRegister, lifecycle)
+	if err != nil {
+		t.Fatalf("plugin.register: %v", err)
+	}
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil || !env.OK {
+		t.Fatalf("register envelope ok=%v err=%v raw=%s", env.OK, err, raw)
+	}
+	var reg registration
+	if err := json.Unmarshal(env.Result, &reg); err != nil {
+		t.Fatal(err)
+	}
+	if reg.Metadata.Name != pluginName || reg.Metadata.Version != pluginVersion {
+		t.Fatalf("metadata=%+v", reg.Metadata)
+	}
+	if !reg.Capabilities.ManagementAPI || !reg.Capabilities.Scheduler {
+		t.Fatalf("capabilities=%+v", reg.Capabilities)
+	}
+	cfg, _ := currentConfig.Load().(pluginConfig)
+	if cfg.StateFile != statePath {
+		t.Fatalf("state_file=%q want %q", cfg.StateFile, statePath)
+	}
+}
+
+func TestConfigureFallsBackWhenYAMLIsGarbage(t *testing.T) {
+	prevStore := store
+	prevCancel := workerCancel
+	t.Cleanup(func() {
+		if workerCancel != nil {
+			workerCancel()
+		}
+		workerCancel = prevCancel
+		store = prevStore
+	})
+	lifecycle, _ := json.Marshal(lifecycleRequest{ConfigYAML: []byte(":\n  - not: valid")})
+	if err := configure(lifecycle); err != nil {
+		t.Fatalf("configure must tolerate bad yaml: %v", err)
+	}
+	if store == nil {
+		t.Fatal("store must still be initialized")
+	}
+}
+
+func TestResolveDefaultStateFileIsWritable(t *testing.T) {
+	path := resolveDefaultStateFile()
+	if path == "" {
+		t.Fatal("empty state path")
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	probe := filepath.Join(dir, "probe-write")
+	if err := os.WriteFile(probe, []byte("x"), 0o644); err != nil {
+		t.Fatalf("resolved path not writable: %v", err)
+	}
+	_ = os.Remove(probe)
+}
+
 func TestStoreCreateNodesIsAllOrNothing(t *testing.T) {
 	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
 	created, err := s.createNodes([]nodeCreateInput{

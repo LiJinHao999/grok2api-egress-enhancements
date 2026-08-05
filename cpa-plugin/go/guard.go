@@ -947,14 +947,25 @@ func busiestEnabledNode(store *stateStore) string {
 // backgroundWorker periodically probes quarantined / active mode nodes.
 func startGuardWorker(ctx context.Context, store *stateStore) {
 	go func() {
+		// First reconcile is deferred so plugin.register never blocks on
+		// host.auth.list/get (store-install activation path).
+		reconcile := time.NewTimer(3 * time.Second)
 		t := time.NewTicker(30 * time.Second)
 		defer t.Stop()
 		tick := 0
 		for {
 			select {
 			case <-ctx.Done():
+				if !reconcile.Stop() {
+					select {
+					case <-reconcile.C:
+					default:
+					}
+				}
 				_ = store.Flush()
 				return
+			case <-reconcile.C:
+				refreshAssignedCounts(store)
 			case <-t.C:
 				tick++
 				pol := store.policy()
