@@ -1297,8 +1297,19 @@ func executeNodeQuality(store *stateStore, id, source string) (map[string]any, e
 	if !ok {
 		return nil, fmt.Errorf("节点不存在")
 	}
-	log.Printf("egress-guard: quality start source=%s node=%s name=%q clash=%v leaf=%q quarantined=%v",
-		source, id, n.Name, n.Source == nodeSourceClash, n.ClashName, n.DisabledByGuard)
+	// Manual panel tests may intentionally hit a disabled leaf. Automatic sources
+	// (recovery/active/post-switch/…) must never spend queue slots on 停用 nodes.
+	if !n.Enabled && source != "manual" {
+		log.Printf("egress-guard: quality skip disabled node source=%s node=%s name=%q", source, id, n.Name)
+		return map[string]any{
+			"id":      id,
+			"skipped": true,
+			"reason":  "节点已停用",
+			"source":  source,
+		}, nil
+	}
+	log.Printf("egress-guard: quality start source=%s node=%s name=%q clash=%v leaf=%q quarantined=%v enabled=%v",
+		source, id, n.Name, n.Source == nodeSourceClash, n.ClashName, n.DisabledByGuard, n.Enabled)
 
 	// Quality probes always go internal cli-chat-proxy with CPA xAI tokens, via
 	// TestPort + :7953 so production PerfectAI/:7890 is undisturbed.
@@ -1439,6 +1450,8 @@ func qualitySourceLabel(source string) string {
 		return "换 IP 复测"
 	case "soft-recheck":
 		return "软阈值复测"
+	case "post-switch":
+		return "切后复测"
 	default:
 		if source == "" {
 			return "检测"
@@ -1514,6 +1527,17 @@ func queueNodeQuality(store *stateStore, nodeID, source string, wait bool) (map[
 	}
 	if strings.TrimSpace(source) == "" {
 		source = "manual"
+	}
+	// 停用节点：只允许面板手动检测；recovery/active/post-switch 等自动路径直接跳过，
+	// 避免隔离到期后继续烧测已停用叶子。
+	if !n.Enabled && source != "manual" {
+		return map[string]any{
+			"id":      nodeID,
+			"skipped": true,
+			"reason":  "节点已停用",
+			"source":  source,
+			"status":  "skipped_disabled",
+		}, nil
 	}
 
 	s := qualitySched
@@ -1836,7 +1860,8 @@ func startGuardWorker(ctx context.Context, store *stateStore) {
 				// Enqueue only — never run probes inline. Clash leaf selection is
 				// global; the quality scheduler keeps PerfectAI switches serial.
 				for _, n := range store.listNodes() {
-					if n.DisabledByGuard && n.QuarantinedUntil > 0 && now >= n.QuarantinedUntil {
+					// Recovery only for still-enabled leaves. Disabled nodes keep quarantine marks for UI but must never re-enter the probe queue.
+					if n.DisabledByGuard && n.Enabled && n.QuarantinedUntil > 0 && now >= n.QuarantinedUntil {
 						_, _ = queueNodeQuality(store, n.ID, "recovery", false)
 						continue
 					}

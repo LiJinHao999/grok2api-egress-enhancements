@@ -526,6 +526,67 @@ func TestQualityProbePromptIsCarWash(t *testing.T) {
 	}
 }
 
+func TestDisabledNodeSkipsAutomaticQualityQueue(t *testing.T) {
+	qualitySched.mu.Lock()
+	qualitySched.pending = nil
+	qualitySched.active = nil
+	qualitySched.started = false
+	qualitySched.nextID = 0
+	qualitySched.mu.Unlock()
+
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	n, err := store.createNode("disabled-leaf", "http://127.0.0.1:7959", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.updateNode(n.ID, func(node *nodeRecord) error {
+		node.Enabled = false
+		node.DisabledByGuard = true
+		node.QuarantinedUntil = float64(time.Now().Add(-time.Minute).Unix())
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := queueNodeQuality(store, n.ID, "recovery", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out["skipped"] != true || out["status"] != "skipped_disabled" {
+		t.Fatalf("expected skip for disabled recovery, got %#v", out)
+	}
+	out, err = queueNodeQuality(store, n.ID, "post-switch", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out["skipped"] != true {
+		t.Fatalf("expected skip for disabled post-switch, got %#v", out)
+	}
+	// Manual panel probe is still allowed so operators can diagnose a stopped leaf.
+	out, err = queueNodeQuality(store, n.ID, "manual", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out["queued"] != true {
+		t.Fatalf("manual probe should still queue on disabled node, got %#v", out)
+	}
+
+	qualitySched.mu.Lock()
+	if len(qualitySched.pending) != 1 || qualitySched.pending[0].source != "manual" {
+		t.Fatalf("pending=%#v", qualitySched.pending)
+	}
+	qualitySched.pending = nil
+	qualitySched.active = nil
+	qualitySched.started = false
+	qualitySched.mu.Unlock()
+}
+
+func TestQualitySourceLabelPostSwitch(t *testing.T) {
+	if qualitySourceLabel("post-switch") != "切后复测" {
+		t.Fatalf("label=%q", qualitySourceLabel("post-switch"))
+	}
+}
+
 func TestProbeTimeoutErrorsAreDetected(t *testing.T) {
 	if !isProbeTimeoutErr(context.DeadlineExceeded) {
 		t.Fatal("deadline exceeded must be timeout")

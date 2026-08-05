@@ -207,12 +207,49 @@ func TestSyncClashNodesCreatesSharedProxyNodes(t *testing.T) {
 		node.ExitIP = "198.51.100.1"
 		return nil
 	})
+	// Drain any leftover queue before asserting post-switch enqueue.
+	qualitySched.mu.Lock()
+	qualitySched.pending = nil
+	qualitySched.active = nil
+	qualitySched.started = false
+	qualitySched.mu.Unlock()
+
 	if err := switchClashAwayFromNode(store, bad); err != nil {
 		t.Fatal(err)
 	}
 	if current != "node-b" {
 		t.Fatalf("clash current=%s want node-b", current)
 	}
+
+	// Quarantine switch must immediately queue a post-switch quality probe on the
+	// newly selected leaf so degraded B is not left untested until the 30s tick.
+	var targetB string
+	for _, n := range store.listNodes() {
+		if n.ClashName == "node-b" {
+			targetB = n.ID
+		}
+	}
+	if targetB == "" {
+		t.Fatal("missing node-b id")
+	}
+	qualitySched.mu.Lock()
+	pending := append([]*qualityJob{}, qualitySched.pending...)
+	qualitySched.mu.Unlock()
+	found := false
+	for _, job := range pending {
+		if job != nil && job.nodeID == targetB && job.source == "post-switch" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected post-switch probe for node-b=%s, pending=%#v", targetB, pending)
+	}
+	qualitySched.mu.Lock()
+	qualitySched.pending = nil
+	qualitySched.active = nil
+	qualitySched.started = false
+	qualitySched.mu.Unlock()
 }
 
 func TestClashUIConfigOverridesRuntime(t *testing.T) {

@@ -379,5 +379,7 @@ func forceSwitchAnyHealthyClash(store *stateStore) error {
 		NodeName: chosen.Name,
 		Reason:   "调度无健康账号，强制切换生产组到 " + chosen.ClashName,
 	})
+	// Same chain as quarantine switch: do not park production on an untested leaf.
+	queuePostSwitchProbe(store, chosen, "")
 	return nil
 }

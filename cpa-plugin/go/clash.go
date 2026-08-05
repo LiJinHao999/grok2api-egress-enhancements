@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -238,6 +239,7 @@ func ensureHealthyClashExit(store *stateStore) (bool, error) {
 				if err := ensureClashSelectedForNode(store, n); err != nil {
 					return false, err
 				}
+				queuePostSwitchProbe(store, n, "")
 				return true, nil
 			}
 		}
@@ -257,6 +259,7 @@ func ensureHealthyClashExit(store *stateStore) (bool, error) {
 		for _, n := range store.listNodes() {
 			if n.Source == nodeSourceClash && n.Enabled && !n.DisabledByGuard && n.ClashName != "" && n.ID != active.ID {
 				if err2 := ensureClashSelectedForNode(store, n); err2 == nil {
+					queuePostSwitchProbe(store, n, active.Name)
 					return true, nil
 				}
 			}
@@ -264,6 +267,31 @@ func ensureHealthyClashExit(store *stateStore) (bool, error) {
 		return false, err
 	}
 	return true, nil
+}
+
+// queuePostSwitchProbe enqueues an immediate quality check on a newly selected
+// production leaf. Shared by quarantine switch and emergency failover paths.
+func queuePostSwitchProbe(store *stateStore, chosen *nodeRecord, isolatedName string) {
+	if store == nil || chosen == nil || chosen.ID == "" {
+		return
+	}
+	if _, qerr := queueNodeQuality(store, chosen.ID, "post-switch", false); qerr != nil {
+		log.Printf("egress-guard: post-switch probe enqueue failed node=%s name=%q err=%v",
+			chosen.ID, chosen.Name, qerr)
+		return
+	}
+	reason := fmt.Sprintf("切换后立即复测新出口 %s", chosen.ClashName)
+	if isolatedName != "" {
+		reason = fmt.Sprintf("隔离 %s 后立即复测新出口 %s", isolatedName, chosen.ClashName)
+	}
+	store.appendEvent(guardEvent{
+		Event:    "post_switch_probe_queued",
+		NodeID:   chosen.ID,
+		NodeName: chosen.Name,
+		Reason:   reason,
+	})
+	log.Printf("egress-guard: post-switch probe queued node=%s name=%q after isolating %q",
+		chosen.ID, chosen.Name, isolatedName)
 }
 
 func clashCfgEqual(a, b clashRuntimeConfig) bool {
@@ -882,6 +910,12 @@ func ensureClashSelectedForNode(store *stateStore, node *nodeRecord) error {
 
 // switchClashAwayFromNode is called on quarantine: pick another healthy
 // Clash-sourced node and switch PerfectAI to it.
+//
+// After a successful production switch it immediately enqueues a post-switch
+// quality probe on the new leaf. If that probe hard-fails, quarantine runs
+// again and chains: A bad → B → probe B → B bad → C → probe C → … until a
+// leaf stays healthy or no candidates remain. Probes are serial via the
+// quality scheduler so PerfectAI/TestGroup selection stays race-free.
 func switchClashAwayFromNode(store *stateStore, bad *nodeRecord) error {
 	if bad == nil || bad.Source != nodeSourceClash {
 		return nil
@@ -904,6 +938,9 @@ func switchClashAwayFromNode(store *stateStore, bad *nodeRecord) error {
 	}
 	if chosen == nil {
 		// Fall back to any enabled non-quarantined Clash leaf.
+		// Unverified leaves are OK: the post-switch probe below will confirm
+		// (or chain-quarantine) them immediately instead of leaving production
+		// parked on a possibly already-degraded exit until the next 30s tick.
 		for _, n := range store.listNodes() {
 			if n.ID == bad.ID || n.Source != nodeSourceClash || n.ClashName == "" || !n.Enabled || n.DisabledByGuard {
 				continue
@@ -942,6 +979,10 @@ func switchClashAwayFromNode(store *stateStore, bad *nodeRecord) error {
 		NodeName: chosen.Name,
 		Reason:   fmt.Sprintf("隔离 %s 后切换到 %s", bad.Name, after),
 	})
+	// Chain: verify the newly selected production leaf right away.
+	if chosen.ID != "" && chosen.ID != bad.ID {
+		queuePostSwitchProbe(store, chosen, bad.Name)
+	}
 	return nil
 }
 
