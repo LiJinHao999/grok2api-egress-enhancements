@@ -37,7 +37,7 @@ type policyConfig struct {
 	// also lacks thinking. Default true. May delay isolation and spend probe tokens.
 	ThinkingCrossVerify bool `json:"thinking_cross_verify"`
 	// SoftCrossVerify defers soft-TPS isolation until an active probe confirms the
-	// anomaly. Default false. May delay isolation and spend probe tokens.
+	// anomaly. Default true.
 	SoftCrossVerify      bool `json:"soft_cross_verify"`
 	MaxOutputTokensProbe int  `json:"max_output_tokens"`
 	// PolicySchema tracks policy feature revisions. Bump when new defaults must be
@@ -117,14 +117,29 @@ type statistics struct {
 	Actions   actionStats `json:"actions"`
 }
 
+// authDegradeRecord tracks per-account 降智 (missing-thinking) hits.
+type authDegradeRecord struct {
+	AuthID         string  `json:"auth_id"`
+	Label          string  `json:"label,omitempty"`
+	DegradedCount  int64   `json:"degraded_count"`
+	SampleCount    int64   `json:"sample_count"`
+	LastAt         float64 `json:"last_at,omitempty"`
+	LastReason     string  `json:"last_reason,omitempty"`
+	LastNodeID     string  `json:"last_node_id,omitempty"`
+	LastNodeName   string  `json:"last_node_name,omitempty"`
+	LastOutputTPS  float64 `json:"last_output_tps,omitempty"`
+	LastSource     string  `json:"last_source,omitempty"`
+}
+
 type guardState struct {
-	Version   int                    `json:"version"`
-	Policy    policyConfig           `json:"policy"`
-	Nodes     map[string]*nodeRecord `json:"nodes"`
-	Events    []guardEvent           `json:"events"`
-	Stats     statistics             `json:"statistics"`
-	NextID    int                    `json:"next_id"`
-	UpdatedAt float64                `json:"updated_at"`
+	Version    int                           `json:"version"`
+	Policy     policyConfig                  `json:"policy"`
+	Nodes      map[string]*nodeRecord        `json:"nodes"`
+	Events     []guardEvent                  `json:"events"`
+	Stats      statistics                    `json:"statistics"`
+	AuthStats  map[string]*authDegradeRecord `json:"auth_stats"`
+	NextID     int                           `json:"next_id"`
+	UpdatedAt  float64                       `json:"updated_at"`
 }
 
 type stateStore struct {
@@ -156,9 +171,9 @@ func defaultPolicy() policyConfig {
 		ThinkingGuard:              true,
 		ConsecutiveMissingThinking: 1,
 		ThinkingCrossVerify:        true,
-		SoftCrossVerify:            false,
+		SoftCrossVerify:            true,
 		MaxOutputTokensProbe:       384,
-		PolicySchema:               2,
+		PolicySchema:               3,
 	}
 }
 
@@ -233,18 +248,20 @@ func normalizePolicy(p *policyConfig, rawPolicy map[string]any) {
 		p.DisableAuthOnHard = def.DisableAuthOnHard
 	}
 
-	// policy_schema < 2: one-shot product redesign defaults.
-	// Covers pure-old state AND intermediate builds that already wrote
-	// thinking_cross_verify=false / consecutive_missing_thinking=1 without schema.
-	if p.PolicySchema < def.PolicySchema {
+	// policy_schema migrations are one-shot product default upgrades.
+	// schema < 2: thinking redesign defaults
+	// schema < 3: soft cross-verify defaults to on
+	if p.PolicySchema < 2 {
 		if !has("consecutive_missing_thinking", "consecutiveMissingThinking") {
 			p.ConsecutiveMissingThinking = def.ConsecutiveMissingThinking
 		}
-		// Force the new default ON once, even if an intermediate build persisted false.
+		// Force ON once, even if an intermediate build persisted false.
 		p.ThinkingCrossVerify = def.ThinkingCrossVerify
-		if !has("soft_cross_verify", "softCrossVerify") {
-			p.SoftCrossVerify = def.SoftCrossVerify
-		}
+		p.SoftCrossVerify = def.SoftCrossVerify
+		p.PolicySchema = def.PolicySchema
+	} else if p.PolicySchema < def.PolicySchema {
+		// 2 -> 3: soft cross-verify product default flipped to on.
+		p.SoftCrossVerify = def.SoftCrossVerify
 		p.PolicySchema = def.PolicySchema
 	} else {
 		if !has("thinking_cross_verify", "thinkingCrossVerify") {
@@ -290,6 +307,9 @@ func (s *stateStore) load() error {
 	}
 	if data.Nodes == nil {
 		data.Nodes = map[string]*nodeRecord{}
+	}
+	if data.AuthStats == nil {
+		data.AuthStats = map[string]*authDegradeRecord{}
 	}
 	if data.NextID <= 0 {
 		data.NextID = 1
@@ -665,6 +685,72 @@ func (s *stateStore) events() []guardEvent {
 	copy(out, s.data.Events)
 	return out
 }
+
+
+func (s *stateStore) recordAuthObservation(authID, label, source, nodeID, nodeName, class, reason string, tps float64, degraded bool) {
+	authID = strings.TrimSpace(authID)
+	if authID == "" || s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.data.AuthStats == nil {
+		s.data.AuthStats = map[string]*authDegradeRecord{}
+	}
+	rec := s.data.AuthStats[authID]
+	if rec == nil {
+		rec = &authDegradeRecord{AuthID: authID}
+		s.data.AuthStats[authID] = rec
+	}
+	if label != "" {
+		rec.Label = label
+	}
+	rec.SampleCount++
+	if degraded {
+		rec.DegradedCount++
+	}
+	rec.LastAt = float64(time.Now().Unix())
+	rec.LastSource = source
+	if reason != "" {
+		rec.LastReason = reason
+	} else if degraded {
+		rec.LastReason = "响应缺少 thinking_content（降智）"
+	}
+	if nodeID != "" {
+		rec.LastNodeID = nodeID
+	}
+	if nodeName != "" {
+		rec.LastNodeName = nodeName
+	}
+	if tps > 0 {
+		rec.LastOutputTPS = tps
+	}
+	s.scheduleFlushLocked()
+}
+
+func (s *stateStore) listAuthDegradeStats() []*authDegradeRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]*authDegradeRecord, 0, len(s.data.AuthStats))
+	for _, rec := range s.data.AuthStats {
+		if rec == nil {
+			continue
+		}
+		cp := *rec
+		out = append(out, &cp)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].DegradedCount != out[j].DegradedCount {
+			return out[i].DegradedCount > out[j].DegradedCount
+		}
+		if out[i].LastAt != out[j].LastAt {
+			return out[i].LastAt > out[j].LastAt
+		}
+		return out[i].AuthID < out[j].AuthID
+	})
+	return out
+}
+
 
 func (s *stateStore) stats() statistics {
 	s.mu.Lock()

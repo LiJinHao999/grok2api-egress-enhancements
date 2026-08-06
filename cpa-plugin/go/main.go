@@ -475,6 +475,13 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 			return managementJSON(http.StatusOK, map[string]any{"data": store.policy(), "ok": true})
 		}
 
+	case path == "/auth-stats" || path == "/quality-guard/auth-stats":
+		if method == http.MethodGet {
+			ensureStore()
+			items := store.listAuthDegradeStats()
+			return managementJSON(http.StatusOK, map[string]any{"data": map[string]any{"items": items, "total": len(items)}, "items": items, "total": len(items)})
+		}
+
 	case path == "/nodes":
 		if method == http.MethodGet {
 			refreshAssignedCounts(store)
@@ -740,6 +747,7 @@ func buildStatus() map[string]any {
 	}
 	pol := store.policy()
 	st := store.stats()
+	authStats := store.listAuthDegradeStats()
 	return map[string]any{
 		"available":    true,
 		"updatedAt":    store.snapshot().UpdatedAt,
@@ -747,6 +755,7 @@ func buildStatus() map[string]any {
 		"editable":     true,
 		"nodes":        nodeMap,
 		"statistics":   st,
+		"authStats":    authStats,
 		"recentEvents": store.events(),
 		"plugin":       pluginName,
 		"version":      pluginVersion,

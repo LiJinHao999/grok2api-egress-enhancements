@@ -328,6 +328,8 @@ type qualityResult struct {
 	DurationMs     int64   `json:"duration_ms"`
 	FirstTokenMs   int64   `json:"first_token_ms"`
 	HasThinking    bool    `json:"has_thinking,omitempty"`
+	AuthID         string  `json:"auth_id,omitempty"`
+	AuthLabel      string  `json:"auth_label,omitempty"`
 	ExitIP         string  `json:"exit_ip,omitempty"`
 	Error          string  `json:"error,omitempty"`
 	ErrorKind      string  `json:"error_kind,omitempty"`
@@ -783,6 +785,8 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 		}
 		res.OutputTokens = outTokens
 		res.HasThinking = hasThinking
+		res.AuthID = firstNonEmpty(auth.ID, auth.Index, auth.Name, auth.Email)
+		res.AuthLabel = authProbeLabel(auth)
 		res.TPS = computeTPS(outTokens, res.DurationMs, res.FirstTokenMs, pol.MinGenerationMs)
 		res.Classification = classifyQuality(res.TPS, outTokens, hasThinking, pol)
 		if res.Classification == "unknown" && outTokens == 0 {
@@ -1017,6 +1021,18 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 		store.bumpStat(source, res.Classification, res.OutputTokens)
 		return
 	}
+	// Per-account 降智 counters (missing-thinking hard hits only).
+	if res.AuthID != "" && pol.ThinkingGuard {
+		degraded := missingThinkingHit(res, pol)
+		// Count only real generation samples for this auth (not transport errors).
+		if res.Classification != "error" && res.Classification != "ignored" && res.Classification != "unknown" {
+			reason := res.Error
+			if degraded && reason == "" {
+				reason = "响应缺少 thinking_content（降智）"
+			}
+			store.recordAuthObservation(res.AuthID, res.AuthLabel, source, nodeCopy.ID, nodeCopy.Name, res.Classification, reason, res.TPS, degraded)
+		}
+	}
 	if res.Classification == "ignored" {
 		// Account, quota, upstream and no-account failures are not evidence that
 		// the egress is degraded. Keep the observation for diagnostics, but never
@@ -1250,6 +1266,7 @@ func handlePassiveUsage(store *stateStore, record map[string]any) {
 	}
 	nodeID := resolveNodeIDForAuth(store, authID, authIndex,
 		filepath.Base(authID), strings.TrimSuffix(filepath.Base(authID), ".json"))
+	authKey := firstNonEmpty(authID, authIndex)
 	res := qualityResult{
 		Classification: class,
 		TPS:            tps,
@@ -1257,6 +1274,8 @@ func handlePassiveUsage(store *stateStore, record map[string]any) {
 		DurationMs:     durMs,
 		FirstTokenMs:   ttftMs,
 		HasThinking:    hasThinking,
+		AuthID:         authKey,
+		AuthLabel:      authKey,
 		ErrorKind:      errorKind,
 	}
 	if class == "hard" && !failed && pol.ThinkingGuard && !hasThinking {
@@ -1267,11 +1286,16 @@ func handlePassiveUsage(store *stateStore, record map[string]any) {
 		if class == "hard" || class == "soft" {
 			store.appendEvent(guardEvent{
 				Event:          "unmapped_" + class,
-				AuthID:         firstNonEmpty(authID, authIndex),
+				AuthID:         authKey,
 				Classification: class,
 				OutputTPS:      tps,
 				Reason:         fmt.Sprintf("usage 未映射到出口节点 auth=%s idx=%s tokens=%d dur=%dms ttft=%dms", authID, authIndex, outTokens, durMs, ttftMs),
 			})
+		}
+		// Still attribute 降智 hits to the account even when egress mapping is missing.
+		if authKey != "" && pol.ThinkingGuard && class != "error" && class != "ignored" && class != "unknown" {
+			degraded := class == "hard" && !hasThinking && !failed
+			store.recordAuthObservation(authKey, authKey, "passive", "", "", class, res.Error, tps, degraded)
 		}
 		return
 	}

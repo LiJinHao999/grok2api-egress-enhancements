@@ -147,6 +147,10 @@
     .policy-section .section-note { margin: 0; color: var(--muted-foreground); font-size: var(--text-2xs); }
     .policy-section .form-grid { margin: 0; }
     .policy-section.is-disabled { opacity: 0.55; }
+    .panel-switch { display: inline-flex; align-items: center; gap: var(--space-3xs); padding: 0.15rem; border: var(--rule-hairline) solid var(--border); border-radius: var(--radius-sm); background: var(--muted); }
+    .panel-switch .button { min-height: 1.9rem; border: 0; background: transparent; box-shadow: none; }
+    .panel-switch .button.active { background: var(--card); color: var(--foreground); }
+    .panel[hidden] { display: none !important; }
     .modal-actions { justify-content: flex-end; padding: var(--space-sm); border-top: var(--rule-hairline) solid var(--border); }
     .toast-region { position: fixed; right: var(--space-sm); bottom: var(--space-sm); z-index: 30; width: min(22rem, calc(100% - 2rem)); display: grid; gap: var(--space-2xs); }
     .toast { padding: var(--space-xs) var(--space-sm); border: var(--rule-hairline) solid var(--border); border-radius: var(--radius-sm); background: var(--popover); color: var(--popover-foreground); box-shadow: var(--shadow); font-size: var(--text-xs); animation: toast-in var(--dur-medium) var(--ease-out); }
@@ -201,6 +205,10 @@
       </div>
       <div class="head-actions">
         <span class="status-line"><span id="service-dot" class="status-dot"></span><span id="service-text">正在连接</span></span>
+        <div class="panel-switch" role="tablist" aria-label="面板切换">
+          <button id="panel-btn-nodes" class="button active" type="button" role="tab" aria-selected="true" data-panel="nodes">节点面板</button>
+          <button id="panel-btn-accounts" class="button" type="button" role="tab" aria-selected="false" data-panel="accounts">账号降智</button>
+        </div>
         <button id="theme-button" class="button icon ghost" type="button" title="切换深浅色" aria-label="切换深浅色">◐</button>
         <button id="refresh-button" class="button" type="button" title="刷新页面快照，不会立即运行真实模型质量检测">刷新显示</button>
       </div>
@@ -213,6 +221,7 @@
       <div class="metric"><div class="metric-label">已隔离</div><div id="metric-quarantined" class="metric-value">-</div><div id="metric-next" class="metric-detail">严格质量恢复</div></div>
     </section>
 
+    <div id="panel-nodes" class="panel stack" data-panel-root="nodes">
     <section class="section" aria-labelledby="nodes-title">
       <div class="section-head">
         <div><h2 id="nodes-title">出口节点</h2><p id="nodes-freshness">页面每 15 秒刷新；节点健康状态随请求审计或主动检测更新，代理凭据不会回显</p></div>
@@ -257,6 +266,36 @@
       <section class="section" aria-labelledby="policy-title">
         <div class="section-head"><div><h2 id="policy-title">守护策略</h2><p>修改后由 CPA 插件热加载</p></div><button id="edit-policy" class="button" type="button">编辑</button></div>
         <dl id="policy-view" class="policy"></dl>
+      </section>
+    </div>
+    </div>
+
+    <div id="panel-accounts" class="panel stack" data-panel-root="accounts" hidden>
+      <section class="section" aria-labelledby="auth-degrade-title">
+        <div class="section-head">
+          <div>
+            <h2 id="auth-degrade-title">账号降智统计</h2>
+            <p>按账号累计被标记为缺少 thinking（降智）的请求次数；样本数为参与质量判定的成功生成次数</p>
+          </div>
+          <div class="toolbar">
+            <input id="auth-search" class="search" type="search" placeholder="搜索账号 / 标签" aria-label="搜索账号">
+          </div>
+        </div>
+        <div class="table-wrap desktop-table">
+          <table>
+            <thead><tr>
+              <th>账号</th>
+              <th class="numeric">降智次数</th>
+              <th class="numeric">样本数</th>
+              <th class="numeric">降智率</th>
+              <th>最近出口</th>
+              <th>最近原因</th>
+              <th>最近时间</th>
+            </tr></thead>
+            <tbody id="auth-degrade-body"><tr><td colspan="7" class="loading">正在加载账号统计</td></tr></tbody>
+          </table>
+        </div>
+        <div id="auth-degrade-cards" class="node-cards" aria-label="账号降智卡片"></div>
       </section>
     </div>
   </main>
@@ -312,7 +351,7 @@
               <div class="field"><label for="policy-soft">软阈值 Token/s</label><input id="policy-soft" type="number" min="1" max="9999" step="1"></div>
               <div class="field"><label for="policy-hard">硬阈值 Token/s</label><input id="policy-hard" type="number" min="2" max="10000" step="1"></div>
               <div class="field"><label for="policy-soft-count">连续软异常次数</label><input id="policy-soft-count" type="number" min="1" max="20"></div>
-              <div class="field full check-row"><div><label for="policy-soft-cross-verify">软阈值交叉验证探测</label><p class="help">连续软异常达到次数后不立即隔离，先做一次主动质量探测；复测仍异常才隔离。可能会导致隔离节点有一定延迟且增加 Token 消耗</p></div><input id="policy-soft-cross-verify" type="checkbox"></div>
+              <div class="field full check-row"><div><label for="policy-soft-cross-verify">软阈值交叉验证探测</label><p class="help">与主动的质量探测进行交叉验证，连续软异常达到次数后不立即隔离，先做一次主动质量探测；复测仍异常才隔离。</p></div><input id="policy-soft-cross-verify" type="checkbox"></div>
             </div>
           </section>
 
@@ -322,7 +361,7 @@
             <div class="form-grid">
               <div class="field full check-row"><div><label for="policy-thinking-guard">启用 thinking 降智判定</label><p class="help">开启后：同一出口连续缺少 thinking_content 达到设定次数则隔离；有 thinking 时回落 Token/s 阈值</p></div><input id="policy-thinking-guard" type="checkbox"></div>
               <div class="field" id="policy-missing-count-wrap"><label for="policy-missing-thinking-count">连续缺 thinking 次数</label><input id="policy-missing-thinking-count" type="number" min="1" max="50"><p class="help">同一出口连续多少次无 thinking 才动作；默认 1</p></div>
-              <div class="field full check-row" id="policy-thinking-cv-wrap"><div><label for="policy-thinking-cross-verify">thinking 交叉验证探测</label><p class="help">达到连续缺 thinking 次数后，先触发一次主动质量探测；复测仍无 thinking 才判定降智。可能会导致隔离节点有一定延迟且增加 Token 消耗</p></div><input id="policy-thinking-cross-verify" type="checkbox"></div>
+              <div class="field full check-row" id="policy-thinking-cv-wrap"><div><label for="policy-thinking-cross-verify">thinking 交叉验证探测</label><p class="help">与主动的质量探测进行交叉验证，达到连续缺 thinking 次数后不立即隔离，先做一次主动质量探测；复测仍无 thinking 才判定降智。</p></div><input id="policy-thinking-cross-verify" type="checkbox"></div>
             </div>
           </section>
 
@@ -354,7 +393,18 @@
     'use strict';
     const PLUGIN_BASE = '/v0/resource/plugins/grok2api-egress';
     const MANAGEMENT_API = '/v0/management/grok2api-egress/api';
-    const state = { status: null, nodes: [], selected: new Set(), search: '', editing: null, confirm: null, loading: false, autoTimer: 0 };
+    const state = {
+      panel: localStorage.getItem('egress-guard-panel') || 'nodes',
+      authSearch: '',
+      status: null,
+      nodes: [],
+      selected: new Set(),
+      search: '',
+      editing: null,
+      confirm: null,
+      loading: false,
+      autoTimer: 0
+    };
     const $ = (id) => document.getElementById(id);
     const esc = (value) => String(value ?? '').replace(/[&<>'"]/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]));
     const number = (value) => new Intl.NumberFormat('zh-CN').format(Number(value || 0));
@@ -452,7 +502,88 @@
       }
     }
     function render() {
-      renderMetrics(); renderNodes(); renderStatistics(); renderEvents(); renderPolicy();
+      applyPanel();
+      renderMetrics(); renderNodes(); renderStatistics(); renderEvents(); renderPolicy(); renderAuthDegrade();
+    }
+    function applyPanel() {
+      const panel = state.panel === 'accounts' ? 'accounts' : 'nodes';
+      state.panel = panel;
+      localStorage.setItem('egress-guard-panel', panel);
+      const nodesPanel = $('panel-nodes');
+      const accountsPanel = $('panel-accounts');
+      if (nodesPanel) nodesPanel.hidden = panel !== 'nodes';
+      if (accountsPanel) accountsPanel.hidden = panel !== 'accounts';
+      const btnNodes = $('panel-btn-nodes');
+      const btnAccounts = $('panel-btn-accounts');
+      if (btnNodes) {
+        btnNodes.classList.toggle('active', panel === 'nodes');
+        btnNodes.setAttribute('aria-selected', panel === 'nodes' ? 'true' : 'false');
+      }
+      if (btnAccounts) {
+        btnAccounts.classList.toggle('active', panel === 'accounts');
+        btnAccounts.setAttribute('aria-selected', panel === 'accounts' ? 'true' : 'false');
+      }
+    }
+    function setPanel(panel) {
+      state.panel = panel;
+      applyPanel();
+    }
+    function authStatsList() {
+      const raw = state.status?.authStats || state.status?.auth_stats || [];
+      return Array.isArray(raw) ? raw : [];
+    }
+    function renderAuthDegrade() {
+      const body = $('auth-degrade-body');
+      const cards = $('auth-degrade-cards');
+      if (!body) return;
+      const query = String(state.authSearch || '').trim().toLowerCase();
+      let rows = authStatsList().slice();
+      if (query) {
+        rows = rows.filter((row) => [row.auth_id, row.label].some((v) => String(v || '').toLowerCase().includes(query)));
+      }
+      // Prefer accounts with degrade hits first (API already sorts, keep stable)
+      if (!rows.length) {
+        body.innerHTML = '<tr><td colspan="7" class="empty">' + (query ? '没有匹配的账号' : '暂无账号降智样本') + '</td></tr>';
+        if (cards) cards.innerHTML = '<div class="empty">' + (query ? '没有匹配的账号' : '暂无账号降智样本') + '</div>';
+        return;
+      }
+      body.innerHTML = rows.map((row) => {
+        const samples = Number(row.sample_count || 0);
+        const degraded = Number(row.degraded_count || 0);
+        const rate = samples > 0 ? ((degraded / samples) * 100).toFixed(1) + '%' : '-';
+        const label = row.label || row.auth_id || '-';
+        const node = row.last_node_name || row.last_node_id || '-';
+        const reason = row.last_reason || '-';
+        const when = row.last_at ? relative(row.last_at) : '-';
+        return '<tr>' +
+          '<td><div class="node-name" title="' + esc(row.auth_id || '') + '">' + esc(label) + '</div><div class="subtext">' + esc(row.auth_id || '') + '</div></td>' +
+          '<td class="numeric ' + (degraded ? 'tone-bad' : '') + '">' + number(degraded) + '</td>' +
+          '<td class="numeric">' + number(samples) + '</td>' +
+          '<td class="numeric ' + (degraded ? 'tone-warn' : '') + '">' + rate + '</td>' +
+          '<td>' + esc(node) + '</td>' +
+          '<td><div class="subtext" title="' + esc(reason) + '">' + esc(reason) + '</div></td>' +
+          '<td title="' + esc(time(row.last_at, true)) + '">' + when + '</td>' +
+          '</tr>';
+      }).join('');
+      if (cards) {
+        cards.innerHTML = rows.map((row) => {
+          const samples = Number(row.sample_count || 0);
+          const degraded = Number(row.degraded_count || 0);
+          const rate = samples > 0 ? ((degraded / samples) * 100).toFixed(1) + '%' : '-';
+          const label = row.label || row.auth_id || '-';
+          return '<article class="node-card">' +
+            '<div class="node-card-head"><div><strong>' + esc(label) + '</strong><div class="subtext">' + esc(row.auth_id || '') + '</div></div>' +
+            (degraded ? '<span class="badge bad">降智 ' + number(degraded) + '</span>' : '<span class="badge muted">无降智</span>') + '</div>' +
+            '<div class="node-card-meta">' +
+              '<div><span>样本</span><strong>' + number(samples) + '</strong></div>' +
+              '<div><span>降智率</span><strong>' + rate + '</strong></div>' +
+              '<div><span>最近出口</span><strong>' + esc(row.last_node_name || row.last_node_id || '-') + '</strong></div>' +
+              '<div><span>最近</span><strong>' + (row.last_at ? relative(row.last_at) : '-') + '</strong></div>' +
+            '</div>' +
+            '<div class="subtext" title="' + esc(row.last_reason || '') + '">' + esc(row.last_reason || '-') + '</div>' +
+          '</article>';
+        }).join('');
+      }
     }
     function renderMetrics() {
       const status = state.status || {};
@@ -612,7 +743,7 @@
         ['隔离复测', cfg.quarantine_seconds + ' 秒'],
         ['软 / 硬阈值', cfg.soft_tps + ' / ' + cfg.hard_tps],
         ['连续软/错', cfg.consecutive_soft + ' / ' + cfg.consecutive_errors],
-        ['软阈值交叉验证', cfg.soft_cross_verify ? '开' : '关'],
+        ['软阈值交叉验证', cfg.soft_cross_verify !== false ? '开' : '关'],
         ['thinking 降智', thinkingOn ? '开' : '关'],
         ['连续缺 thinking', thinkingOn ? String(cfg.consecutive_missing_thinking || 1) : '-'],
         ['thinking 交叉验证', thinkingOn && cfg.thinking_cross_verify !== false ? '开' : '关'],
@@ -658,7 +789,7 @@
       $('policy-missing-thinking-count').value = cfg.consecutive_missing_thinking || 1;
       // defaults-on flags: absent/undefined => on
       $('policy-thinking-cross-verify').checked = cfg.thinking_guard !== false && cfg.thinking_cross_verify !== false;
-      $('policy-soft-cross-verify').checked = !!cfg.soft_cross_verify;
+      $('policy-soft-cross-verify').checked = cfg.soft_cross_verify !== false;
       $('policy-disable-auth').checked = cfg.disable_auth_on_hard !== false;
       syncPolicyFormDependencies();
       openModal('policy-modal');
