@@ -40,6 +40,9 @@ type policyConfig struct {
 	// anomaly. Default false. May delay isolation and spend probe tokens.
 	SoftCrossVerify      bool `json:"soft_cross_verify"`
 	MaxOutputTokensProbe int  `json:"max_output_tokens"`
+	// PolicySchema tracks policy feature revisions. Bump when new defaults must be
+	// force-migrated once for existing state.json files.
+	PolicySchema int `json:"policy_schema,omitempty"`
 }
 
 type nodeRecord struct {
@@ -155,6 +158,7 @@ func defaultPolicy() policyConfig {
 		ThinkingCrossVerify:        true,
 		SoftCrossVerify:            false,
 		MaxOutputTokensProbe:       384,
+		PolicySchema:               2,
 	}
 }
 
@@ -209,42 +213,48 @@ func normalizePolicy(p *policyConfig, rawPolicy map[string]any) {
 	if p.ConsecutiveMissingThinking <= 0 {
 		p.ConsecutiveMissingThinking = def.ConsecutiveMissingThinking
 	}
-	if rawPolicy != nil {
-		if _, ok := rawPolicy["thinking_guard"]; !ok {
-			if _, ok2 := rawPolicy["thinkingGuard"]; !ok2 {
-				p.ThinkingGuard = def.ThinkingGuard
+
+	// Detect whether bool keys were explicitly present in the raw JSON object.
+	has := func(keys ...string) bool {
+		if rawPolicy == nil {
+			return false
+		}
+		for _, k := range keys {
+			if _, ok := rawPolicy[k]; ok {
+				return true
 			}
 		}
-		if _, ok := rawPolicy["disable_auth_on_hard"]; !ok {
-			if _, ok2 := rawPolicy["disableAuthOnHard"]; !ok2 {
-				p.DisableAuthOnHard = def.DisableAuthOnHard
-			}
-		}
-		// Redesign migration: older state never had consecutive_missing_thinking /
-		// soft_cross_verify. Re-apply the new product defaults even if an intermediate
-		// build had already persisted thinking_cross_verify=false.
-		_, hasMissingCount := rawPolicy["consecutive_missing_thinking"]
-		if !hasMissingCount {
-			_, hasMissingCount = rawPolicy["consecutiveMissingThinking"]
-		}
-		_, hasSoftCV := rawPolicy["soft_cross_verify"]
-		if !hasSoftCV {
-			_, hasSoftCV = rawPolicy["softCrossVerify"]
-		}
-		if !hasMissingCount {
+		return false
+	}
+	if !has("thinking_guard", "thinkingGuard") {
+		p.ThinkingGuard = def.ThinkingGuard
+	}
+	if !has("disable_auth_on_hard", "disableAuthOnHard") {
+		p.DisableAuthOnHard = def.DisableAuthOnHard
+	}
+
+	// policy_schema < 2: one-shot product redesign defaults.
+	// Covers pure-old state AND intermediate builds that already wrote
+	// thinking_cross_verify=false / consecutive_missing_thinking=1 without schema.
+	if p.PolicySchema < def.PolicySchema {
+		if !has("consecutive_missing_thinking", "consecutiveMissingThinking") {
 			p.ConsecutiveMissingThinking = def.ConsecutiveMissingThinking
-			p.ThinkingCrossVerify = def.ThinkingCrossVerify
-		} else {
-			if _, ok := rawPolicy["thinking_cross_verify"]; !ok {
-				if _, ok2 := rawPolicy["thinkingCrossVerify"]; !ok2 {
-					p.ThinkingCrossVerify = def.ThinkingCrossVerify
-				}
-			}
 		}
-		if !hasSoftCV {
+		// Force the new default ON once, even if an intermediate build persisted false.
+		p.ThinkingCrossVerify = def.ThinkingCrossVerify
+		if !has("soft_cross_verify", "softCrossVerify") {
+			p.SoftCrossVerify = def.SoftCrossVerify
+		}
+		p.PolicySchema = def.PolicySchema
+	} else {
+		if !has("thinking_cross_verify", "thinkingCrossVerify") {
+			p.ThinkingCrossVerify = def.ThinkingCrossVerify
+		}
+		if !has("soft_cross_verify", "softCrossVerify") {
 			p.SoftCrossVerify = def.SoftCrossVerify
 		}
 	}
+
 	if !p.ThinkingGuard {
 		p.ThinkingCrossVerify = false
 	}
@@ -296,28 +306,23 @@ func (s *stateStore) load() error {
 		data.Policy = defaultPolicy()
 		rawPolicy = nil
 	}
-	normalizePolicy(&data.Policy, rawPolicy)
-	// Persist migrated defaults so subsequent boots see explicit keys (not only memory).
+	beforeSchema := 0
 	if rawPolicy != nil {
-		_, hasMissingCount := rawPolicy["consecutive_missing_thinking"]
-		if !hasMissingCount {
-			_, hasMissingCount = rawPolicy["consecutiveMissingThinking"]
-		}
-		if !hasMissingCount {
-			// force rewrite with migrated policy
-			s.data = data
-			for _, n := range data.Nodes {
-				n.ProxyURL = n.ProxyURLStored
-			}
-			_ = s.persistLocked()
-			return nil
+		// PolicySchema may be absent (0) in old files.
+		if v, ok := rawPolicy["policy_schema"].(float64); ok {
+			beforeSchema = int(v)
 		}
 	}
+	normalizePolicy(&data.Policy, rawPolicy)
 	// hydrate private proxy field
 	for _, n := range data.Nodes {
 		n.ProxyURL = n.ProxyURLStored
 	}
 	s.data = data
+	// Persist once when redesign migration ran so defaults become explicit keys.
+	if beforeSchema < defaultPolicy().PolicySchema {
+		_ = s.persistLocked()
+	}
 	return nil
 }
 

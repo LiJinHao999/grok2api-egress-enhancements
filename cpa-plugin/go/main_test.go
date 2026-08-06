@@ -195,7 +195,7 @@ func TestDefaultPolicyThinkingFeaturesOn(t *testing.T) {
 }
 
 func TestNormalizePolicyFillsAbsentBoolDefaults(t *testing.T) {
-	// Simulate old state.json that never had the new keys.
+	// Pure old state: no redesign keys, schema 0.
 	p := policyConfig{HardTPS: 1000, SoftTPS: 500}
 	normalizePolicy(&p, map[string]any{
 		"hard_tps": 1000,
@@ -205,53 +205,57 @@ func TestNormalizePolicyFillsAbsentBoolDefaults(t *testing.T) {
 		t.Fatal("absent thinking_guard must default on")
 	}
 	if !p.ThinkingCrossVerify {
-		t.Fatal("absent thinking_cross_verify must default on")
+		t.Fatal("schema migration must turn thinking_cross_verify on")
 	}
 	if p.SoftCrossVerify {
 		t.Fatal("absent soft_cross_verify must default off")
 	}
 	if p.ConsecutiveMissingThinking != 1 {
-		t.Fatalf("absent consecutive_missing_thinking=%d, want 1", p.ConsecutiveMissingThinking)
+		t.Fatalf("consecutive_missing_thinking=%d, want 1", p.ConsecutiveMissingThinking)
 	}
-	// Intermediate build may have persisted thinking_cross_verify=false before redesign.
-	// Missing consecutive_missing_thinking still means "pre-redesign" → upgrade defaults.
-	pMid := policyConfig{HardTPS: 1000, SoftTPS: 500, ThinkingGuard: true, ThinkingCrossVerify: false}
+	if p.PolicySchema != 2 {
+		t.Fatalf("policy_schema=%d, want 2", p.PolicySchema)
+	}
+
+	// Intermediate build: explicit thinking_cross_verify=false but schema still 0.
+	pMid := policyConfig{HardTPS: 1000, SoftTPS: 500, ThinkingGuard: true, ThinkingCrossVerify: false, ConsecutiveMissingThinking: 1}
 	normalizePolicy(&pMid, map[string]any{
-		"hard_tps":               1000,
-		"soft_tps":               500,
-		"thinking_guard":         true,
-		"thinking_cross_verify":  false,
+		"hard_tps":                     1000,
+		"soft_tps":                     500,
+		"thinking_guard":               true,
+		"thinking_cross_verify":        false,
+		"consecutive_missing_thinking": 1,
 	})
 	if !pMid.ThinkingCrossVerify {
-		t.Fatal("pre-redesign state must migrate thinking_cross_verify to default on")
+		t.Fatal("schema<2 must migrate thinking_cross_verify to default on even if false was persisted")
 	}
-	if pMid.ConsecutiveMissingThinking != 1 {
-		t.Fatalf("migrated consecutive_missing_thinking=%d, want 1", pMid.ConsecutiveMissingThinking)
+	if pMid.PolicySchema != 2 {
+		t.Fatalf("migrated policy_schema=%d, want 2", pMid.PolicySchema)
 	}
-	// After redesign, explicit false + present consecutive count must be preserved.
-	p2 := policyConfig{HardTPS: 1000, SoftTPS: 500, ThinkingGuard: true, ThinkingCrossVerify: false, ConsecutiveMissingThinking: 2}
+
+	// After redesign (schema 2), explicit false must stick.
+	p2 := policyConfig{HardTPS: 1000, SoftTPS: 500, ThinkingGuard: true, ThinkingCrossVerify: false, ConsecutiveMissingThinking: 2, PolicySchema: 2}
 	normalizePolicy(&p2, map[string]any{
 		"hard_tps":                     1000,
 		"soft_tps":                     500,
 		"thinking_guard":               true,
 		"thinking_cross_verify":        false,
 		"consecutive_missing_thinking": 2,
+		"policy_schema":                2,
 	})
 	if p2.ThinkingCrossVerify {
-		t.Fatal("explicit thinking_cross_verify=false after redesign must stay false")
+		t.Fatal("explicit false after schema 2 must stay false")
 	}
-	// Explicit thinking_guard=false must stay false and force cross-verify off.
+
+	// Explicit thinking_guard=false stays false and forces cross-verify off.
 	p3 := policyConfig{HardTPS: 1000, SoftTPS: 500, ThinkingGuard: false}
 	normalizePolicy(&p3, map[string]any{
 		"hard_tps":       1000,
 		"soft_tps":       500,
 		"thinking_guard": false,
 	})
-	if p3.ThinkingGuard {
-		t.Fatal("explicit thinking_guard=false must stay false")
-	}
-	if p3.ThinkingCrossVerify {
-		t.Fatal("thinking cross-verify must be forced off when guard is off")
+	if p3.ThinkingGuard || p3.ThinkingCrossVerify {
+		t.Fatal("explicit thinking_guard=false must disable guard and cross-verify")
 	}
 }
 
