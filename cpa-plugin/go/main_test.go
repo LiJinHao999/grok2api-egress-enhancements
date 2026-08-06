@@ -364,6 +364,47 @@ func TestSoftCrossVerifySchedulesInsteadOfQuarantine(t *testing.T) {
 }
 
 
+
+func TestAuthDegradeSkipsCrossVerifySchedule(t *testing.T) {
+	store := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	node, err := store.createNode("n1", "http://127.0.0.1:7951", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.createNode("n2", "http://127.0.0.1:7952", true, false, 10); err != nil {
+		t.Fatal(err)
+	}
+	pol := store.policy()
+	pol.ThinkingGuard = true
+	pol.ThinkingCrossVerify = true
+	pol.ConsecutiveMissingThinking = 1
+	pol.MinHealthyNodes = 1
+	if err := store.updatePolicy(pol); err != nil {
+		t.Fatal(err)
+	}
+	res := qualityResult{
+		Classification: "hard",
+		HasThinking:    false,
+		OutputTokens:   64,
+		TPS:            10,
+		AuthID:         "user@x",
+		AuthLabel:      "user@x",
+		Error:          "响应缺少 thinking_content（降智）",
+	}
+	applyObservation(store, node.ID, "passive", res)
+	items := store.listAuthDegradeStats()
+	if len(items) != 1 || items[0].SampleCount != 1 || items[0].DegradedCount != 0 {
+		t.Fatalf("pre-cross-verify should sample only, not degrade: %+v", items)
+	}
+	// Active confirmation counts as one degrade.
+	applyObservation(store, node.ID, "active", res)
+	items = store.listAuthDegradeStats()
+	if len(items) != 1 || items[0].DegradedCount != 1 || items[0].SampleCount != 2 {
+		t.Fatalf("after confirm want degraded=1 samples=2 got %+v", items[0])
+	}
+	endCrossVerify(node.ID)
+}
+
 func TestRecordAuthDegradeStats(t *testing.T) {
 	store := newStateStore(filepath.Join(t.TempDir(), "state.json"))
 	store.recordAuthObservation("a1@x", "a1@x", "passive", "1", "n1", "hard", "响应缺少 thinking_content（降智）", 10, true)

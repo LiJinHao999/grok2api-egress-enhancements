@@ -8,6 +8,7 @@
   <title>出口守护</title>
   <style>
 /*__HALLMARK_TOKENS__*/
+/*__ACCOUNTS_PANEL_CSS__*/
     * { box-sizing: border-box; border-color: var(--border); }
     html, body { margin: 0; min-width: 0; overflow-x: clip; background: var(--background); color: var(--foreground); }
     body { font-family: var(--font-body); font-size: var(--text-md); line-height: 1.5; -webkit-font-smoothing: antialiased; }
@@ -207,7 +208,7 @@
         <span class="status-line"><span id="service-dot" class="status-dot"></span><span id="service-text">正在连接</span></span>
         <div class="panel-switch" role="tablist" aria-label="面板切换">
           <button id="panel-btn-nodes" class="button active" type="button" role="tab" aria-selected="true" data-panel="nodes">节点面板</button>
-          <button id="panel-btn-accounts" class="button" type="button" role="tab" aria-selected="false" data-panel="accounts">账号降智</button>
+          <button id="panel-btn-accounts" class="button" type="button" role="tab" aria-selected="false" data-panel="accounts">账号降智统计</button>
         </div>
         <button id="theme-button" class="button icon ghost" type="button" title="切换深浅色" aria-label="切换深浅色">◐</button>
         <button id="refresh-button" class="button" type="button" title="刷新页面快照，不会立即运行真实模型质量检测">刷新显示</button>
@@ -270,34 +271,7 @@
     </div>
     </div>
 
-    <div id="panel-accounts" class="panel stack" data-panel-root="accounts" hidden>
-      <section class="section" aria-labelledby="auth-degrade-title">
-        <div class="section-head">
-          <div>
-            <h2 id="auth-degrade-title">账号降智统计</h2>
-            <p>按账号累计被标记为缺少 thinking（降智）的请求次数；样本数为参与质量判定的成功生成次数</p>
-          </div>
-          <div class="toolbar">
-            <input id="auth-search" class="search" type="search" placeholder="搜索账号 / 标签" aria-label="搜索账号">
-          </div>
-        </div>
-        <div class="table-wrap desktop-table">
-          <table>
-            <thead><tr>
-              <th>账号</th>
-              <th class="numeric">降智次数</th>
-              <th class="numeric">样本数</th>
-              <th class="numeric">降智率</th>
-              <th>最近出口</th>
-              <th>最近原因</th>
-              <th>最近时间</th>
-            </tr></thead>
-            <tbody id="auth-degrade-body"><tr><td colspan="7" class="loading">正在加载账号统计</td></tr></tbody>
-          </table>
-        </div>
-        <div id="auth-degrade-cards" class="node-cards" aria-label="账号降智卡片"></div>
-      </section>
-    </div>
+    <div id="panel-accounts-host"></div>
   </main>
 
   <div id="node-modal" class="modal-layer" hidden>
@@ -389,6 +363,8 @@
   <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
 
   <script>
+  /*__ACCOUNTS_PANEL_JS__*/
+
   (() => {
     'use strict';
     const PLUGIN_BASE = '/v0/resource/plugins/grok2api-egress';
@@ -396,6 +372,8 @@
     const state = {
       panel: localStorage.getItem('egress-guard-panel') || 'nodes',
       authSearch: '',
+      authPage: 1,
+      authPageSize: 20,
       status: null,
       nodes: [],
       selected: new Set(),
@@ -503,7 +481,8 @@
     }
     function render() {
       applyPanel();
-      renderMetrics(); renderNodes(); renderStatistics(); renderEvents(); renderPolicy(); renderAuthDegrade();
+      renderMetrics(); renderNodes(); renderStatistics(); renderEvents(); renderPolicy();
+      if (window.EgressAccountsPanel) window.EgressAccountsPanel.render(state);
     }
     function applyPanel() {
       const panel = state.panel === 'accounts' ? 'accounts' : 'nodes';
@@ -525,65 +504,9 @@
       }
     }
     function setPanel(panel) {
-      state.panel = panel;
+      state.panel = panel === 'accounts' ? 'accounts' : 'nodes';
       applyPanel();
-    }
-    function authStatsList() {
-      const raw = state.status?.authStats || state.status?.auth_stats || [];
-      return Array.isArray(raw) ? raw : [];
-    }
-    function renderAuthDegrade() {
-      const body = $('auth-degrade-body');
-      const cards = $('auth-degrade-cards');
-      if (!body) return;
-      const query = String(state.authSearch || '').trim().toLowerCase();
-      let rows = authStatsList().slice();
-      if (query) {
-        rows = rows.filter((row) => [row.auth_id, row.label].some((v) => String(v || '').toLowerCase().includes(query)));
-      }
-      // Prefer accounts with degrade hits first (API already sorts, keep stable)
-      if (!rows.length) {
-        body.innerHTML = '<tr><td colspan="7" class="empty">' + (query ? '没有匹配的账号' : '暂无账号降智样本') + '</td></tr>';
-        if (cards) cards.innerHTML = '<div class="empty">' + (query ? '没有匹配的账号' : '暂无账号降智样本') + '</div>';
-        return;
-      }
-      body.innerHTML = rows.map((row) => {
-        const samples = Number(row.sample_count || 0);
-        const degraded = Number(row.degraded_count || 0);
-        const rate = samples > 0 ? ((degraded / samples) * 100).toFixed(1) + '%' : '-';
-        const label = row.label || row.auth_id || '-';
-        const node = row.last_node_name || row.last_node_id || '-';
-        const reason = row.last_reason || '-';
-        const when = row.last_at ? relative(row.last_at) : '-';
-        return '<tr>' +
-          '<td><div class="node-name" title="' + esc(row.auth_id || '') + '">' + esc(label) + '</div><div class="subtext">' + esc(row.auth_id || '') + '</div></td>' +
-          '<td class="numeric ' + (degraded ? 'tone-bad' : '') + '">' + number(degraded) + '</td>' +
-          '<td class="numeric">' + number(samples) + '</td>' +
-          '<td class="numeric ' + (degraded ? 'tone-warn' : '') + '">' + rate + '</td>' +
-          '<td>' + esc(node) + '</td>' +
-          '<td><div class="subtext" title="' + esc(reason) + '">' + esc(reason) + '</div></td>' +
-          '<td title="' + esc(time(row.last_at, true)) + '">' + when + '</td>' +
-          '</tr>';
-      }).join('');
-      if (cards) {
-        cards.innerHTML = rows.map((row) => {
-          const samples = Number(row.sample_count || 0);
-          const degraded = Number(row.degraded_count || 0);
-          const rate = samples > 0 ? ((degraded / samples) * 100).toFixed(1) + '%' : '-';
-          const label = row.label || row.auth_id || '-';
-          return '<article class="node-card">' +
-            '<div class="node-card-head"><div><strong>' + esc(label) + '</strong><div class="subtext">' + esc(row.auth_id || '') + '</div></div>' +
-            (degraded ? '<span class="badge bad">降智 ' + number(degraded) + '</span>' : '<span class="badge muted">无降智</span>') + '</div>' +
-            '<div class="node-card-meta">' +
-              '<div><span>样本</span><strong>' + number(samples) + '</strong></div>' +
-              '<div><span>降智率</span><strong>' + rate + '</strong></div>' +
-              '<div><span>最近出口</span><strong>' + esc(row.last_node_name || row.last_node_id || '-') + '</strong></div>' +
-              '<div><span>最近</span><strong>' + (row.last_at ? relative(row.last_at) : '-') + '</strong></div>' +
-            '</div>' +
-            '<div class="subtext" title="' + esc(row.last_reason || '') + '">' + esc(row.last_reason || '-') + '</div>' +
-          '</article>';
-        }).join('');
-      }
+      if (window.EgressAccountsPanel) window.EgressAccountsPanel.render(state);
     }
     function renderMetrics() {
       const status = state.status || {};
@@ -1012,11 +935,34 @@
       catch (error) { toast(error.message, 'error'); }
       finally { busy(button, false); }
     });
-    document.addEventListener('click', (event) => { const close = event.target.closest('[data-close]'); if (close) closeModal(close.dataset.close); });
+    document.addEventListener('click', (event) => {
+      const close = event.target.closest('[data-close]');
+      if (close) closeModal(close.dataset.close);
+      const tab = event.target.closest('[data-panel]');
+      if (tab && tab.dataset.panel) setPanel(tab.dataset.panel);
+    });
     $('confirm-action').addEventListener('click', () => { if (state.confirm) state.confirm($('confirm-action')); });
     document.addEventListener('keydown', (event) => { if (event.key === 'Escape') ['node-modal','bulk-node-modal','policy-modal','confirm-modal','accounts-modal'].forEach((id) => { if (!$(id).hidden) closeModal(id); }); });
     const savedTheme = localStorage.getItem('grok2api-egress-theme');
     document.documentElement.dataset.theme = savedTheme || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+    $('panel-btn-nodes').addEventListener('click', () => setPanel('nodes'));
+    $('panel-btn-accounts').addEventListener('click', () => setPanel('accounts'));
+    if (window.EgressAccountsPanel) {
+      window.EgressAccountsPanel.mount({
+        host: $('panel-accounts-host'),
+        state,
+        api,
+        toast,
+        busy,
+        esc,
+        number,
+        time,
+        relative,
+        load,
+        setPanel,
+      });
+    }
+    applyPanel();
     load();
     state.autoTimer = window.setInterval(() => { if (document.visibilityState === 'visible') load(true); }, 15000);
   })();

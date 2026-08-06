@@ -92,6 +92,12 @@ var pageTemplate string
 //go:embed tokens.css
 var tokenCSS string
 
+//go:embed accounts-panel.js
+var accountsPanelJS string
+
+//go:embed accounts-panel.css
+var accountsPanelCSS string
+
 type envelope struct {
 	OK     bool            `json:"ok"`
 	Result json.RawMessage `json:"result,omitempty"`
@@ -364,7 +370,7 @@ func handleManagement(request []byte) ([]byte, error) {
 		return okEnvelope(managementResponse{
 			StatusCode: http.StatusOK,
 			Headers:    http.Header{"content-type": []string{resourceContentType}},
-			Body:       []byte(strings.Replace(pageTemplate, "/*__HALLMARK_TOKENS__*/", tokenCSS, 1)),
+			Body:       []byte(renderPageHTML()),
 		})
 	case path == managementAPIPath:
 		return handleUIProxy(req)
@@ -480,6 +486,11 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 			ensureStore()
 			items := store.listAuthDegradeStats()
 			return managementJSON(http.StatusOK, map[string]any{"data": map[string]any{"items": items, "total": len(items)}, "items": items, "total": len(items)})
+		}
+		if method == http.MethodDelete {
+			ensureStore()
+			store.clearAuthDegradeStats()
+			return managementJSON(http.StatusOK, map[string]any{"data": map[string]any{"cleared": true}, "ok": true})
 		}
 
 	case path == "/nodes":
@@ -720,6 +731,15 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 	}
 
 	return managementJSON(http.StatusNotFound, errMsg("notFound", "not found"))
+}
+
+
+func renderPageHTML() string {
+	out := pageTemplate
+	out = strings.Replace(out, "/*__HALLMARK_TOKENS__*/", tokenCSS, 1)
+	out = strings.Replace(out, "/*__ACCOUNTS_PANEL_CSS__*/", accountsPanelCSS, 1)
+	out = strings.Replace(out, "/*__ACCOUNTS_PANEL_JS__*/", accountsPanelJS, 1)
+	return out
 }
 
 func buildStatus() map[string]any {

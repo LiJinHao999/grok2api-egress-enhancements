@@ -1021,15 +1021,46 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 		store.bumpStat(source, res.Classification, res.OutputTokens)
 		return
 	}
-	// Per-account 降智 counters (missing-thinking hard hits only).
-	if res.AuthID != "" && pol.ThinkingGuard {
-		degraded := missingThinkingHit(res, pol)
-		// Count only real generation samples for this auth (not transport errors).
+	// Per-account 降智 stats:
+	// - sample: real generation outcomes (healthy/soft/hard), not errors/ignored
+	// - degraded: final quality-degrade hits only
+	//   * missing-thinking hard that is NOT deferred to cross-verify
+	//   * soft/hard TPS outcomes that actually quarantine (or would, if already isolated)
+	// Cross-verify scheduling must NOT mark degrade yet (avoid +2).
+	if res.AuthID != "" {
 		if res.Classification != "error" && res.Classification != "ignored" && res.Classification != "unknown" {
+			degraded := false
 			reason := res.Error
-			if degraded && reason == "" {
-				reason = "响应缺少 thinking_content（降智）"
+			if missingThinkingHit(res, pol) {
+				// Deferred to cross-verify: wait for active confirmation.
+				if scheduleCV && cvEvent == "thinking_cross_verify_scheduled" {
+					degraded = false
+				} else {
+					degraded = true
+					if reason == "" {
+						reason = "响应缺少 thinking_content（降智）"
+					}
+				}
+			} else if res.Classification == "hard" && res.ErrorKind != "probe_unstable" {
+				// TPS hard (with thinking) or other hard quality — count as degrade when final.
+				degraded = true
+				if reason == "" {
+					reason = fmt.Sprintf("硬阈值 Token/s=%.1f", res.TPS)
+				}
+			} else if res.Classification == "soft" {
+				// Soft only counts as degrade when it reaches action threshold and is not deferred.
+				if scheduleCV && cvEvent == "soft_cross_verify_scheduled" {
+					degraded = false
+				} else if doQuarantine || nodeCopy.DisabledByGuard {
+					// Reached consecutive soft threshold (quarantine now or already isolated).
+					degraded = true
+					if reason == "" {
+						reason = fmt.Sprintf("连续软阈值 Token/s=%.1f", res.TPS)
+					}
+				}
 			}
+			// Always count the sample for rate denominator when it's a real generation.
+			// For soft-below-threshold, degraded=false (suspicious but not yet 降智事件).
 			store.recordAuthObservation(res.AuthID, res.AuthLabel, source, nodeCopy.ID, nodeCopy.Name, res.Classification, reason, res.TPS, degraded)
 		}
 	}
@@ -1292,10 +1323,23 @@ func handlePassiveUsage(store *stateStore, record map[string]any) {
 				Reason:         fmt.Sprintf("usage 未映射到出口节点 auth=%s idx=%s tokens=%d dur=%dms ttft=%dms", authID, authIndex, outTokens, durMs, ttftMs),
 			})
 		}
-		// Still attribute 降智 hits to the account even when egress mapping is missing.
-		if authKey != "" && pol.ThinkingGuard && class != "error" && class != "ignored" && class != "unknown" {
-			degraded := class == "hard" && !hasThinking && !failed
-			store.recordAuthObservation(authKey, authKey, "passive", "", "", class, res.Error, tps, degraded)
+		// Unmapped egress: still attribute account samples. Missing-thinking hard counts
+		// as degrade immediately (no node to cross-verify against). Soft does not.
+		if authKey != "" && class != "error" && class != "ignored" && class != "unknown" {
+			degraded := false
+			reason := res.Error
+			if pol.ThinkingGuard && class == "hard" && !hasThinking && !failed {
+				degraded = true
+				if reason == "" {
+					reason = "响应缺少 thinking_content（降智）"
+				}
+			} else if class == "hard" && !failed {
+				degraded = true
+				if reason == "" {
+					reason = fmt.Sprintf("硬阈值 Token/s=%.1f", tps)
+				}
+			}
+			store.recordAuthObservation(authKey, authKey, "passive", "", "", class, reason, tps, degraded)
 		}
 		return
 	}

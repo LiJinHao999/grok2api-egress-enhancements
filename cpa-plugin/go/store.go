@@ -728,6 +728,13 @@ func (s *stateStore) recordAuthObservation(authID, label, source, nodeID, nodeNa
 	s.scheduleFlushLocked()
 }
 
+func authDegradeRate(rec *authDegradeRecord) float64 {
+	if rec == nil || rec.SampleCount <= 0 {
+		return 0
+	}
+	return float64(rec.DegradedCount) / float64(rec.SampleCount)
+}
+
 func (s *stateStore) listAuthDegradeStats() []*authDegradeRecord {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -739,9 +746,19 @@ func (s *stateStore) listAuthDegradeStats() []*authDegradeRecord {
 		cp := *rec
 		out = append(out, &cp)
 	}
+	// 100% degrade rate first, then by degrade count, recency, id.
 	sort.Slice(out, func(i, j int) bool {
+		fullI := out[i].SampleCount > 0 && out[i].DegradedCount == out[i].SampleCount
+		fullJ := out[j].SampleCount > 0 && out[j].DegradedCount == out[j].SampleCount
+		if fullI != fullJ {
+			return fullI
+		}
 		if out[i].DegradedCount != out[j].DegradedCount {
 			return out[i].DegradedCount > out[j].DegradedCount
+		}
+		rateI, rateJ := authDegradeRate(out[i]), authDegradeRate(out[j])
+		if rateI != rateJ {
+			return rateI > rateJ
 		}
 		if out[i].LastAt != out[j].LastAt {
 			return out[i].LastAt > out[j].LastAt
@@ -749,6 +766,13 @@ func (s *stateStore) listAuthDegradeStats() []*authDegradeRecord {
 		return out[i].AuthID < out[j].AuthID
 	})
 	return out
+}
+
+func (s *stateStore) clearAuthDegradeStats() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.data.AuthStats = map[string]*authDegradeRecord{}
+	_ = s.flushNowLocked()
 }
 
 
