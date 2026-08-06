@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -59,13 +60,371 @@ func TestXAITokenAccountingDoesNotDoubleCountReasoning(t *testing.T) {
 	}
 }
 
-func TestSmallOutputIsIgnoredBeforeTPSThreshold(t *testing.T) {
+func TestThinkingPresenceIsPrimaryQualitySignal(t *testing.T) {
 	pol := defaultPolicy()
-	if got := classifyQuality(5000, pol.MinOutputTokens-1, pol); got != "ignored" {
-		t.Fatalf("small output classification=%q, want ignored", got)
+	pol.ThinkingGuard = true
+	// Small output without thinking is not enough evidence.
+	if got := classifyQuality(5000, pol.MinOutputTokens-1, false, pol); got != "ignored" {
+		t.Fatalf("small output without thinking=%q, want ignored", got)
 	}
-	if got := classifyQuality(5000, pol.MinOutputTokens, pol); got != "hard" {
-		t.Fatalf("threshold output classification=%q, want hard", got)
+	// Enough output but no thinking → 降智 / hard.
+	if got := classifyQuality(5000, pol.MinOutputTokens, false, pol); got != "hard" {
+		t.Fatalf("no-thinking classification=%q, want hard", got)
+	}
+	// Thinking present falls back to original Token/s thresholds.
+	if got := classifyQuality(5000, pol.MinOutputTokens, true, pol); got != "hard" {
+		t.Fatalf("with-thinking high TPS classification=%q, want hard", got)
+	}
+	if got := classifyQuality(10, 200, true, pol); got != "healthy" {
+		t.Fatalf("with-thinking low TPS classification=%q, want healthy", got)
+	}
+	if got := classifyQuality(750, 200, true, pol); got != "soft" {
+		t.Fatalf("with-thinking mid TPS classification=%q, want soft", got)
+	}
+}
+
+func TestThinkingGuardOffFallsBackToTPSOnly(t *testing.T) {
+	pol := defaultPolicy()
+	pol.ThinkingGuard = false
+	if got := classifyQuality(5000, 200, false, pol); got != "hard" {
+		t.Fatalf("guard off high TPS=%q, want hard", got)
+	}
+	if got := classifyQuality(10, 200, false, pol); got != "healthy" {
+		t.Fatalf("guard off low TPS without thinking=%q, want healthy", got)
+	}
+}
+
+func TestRecordHasThinkingFallsBackToReasoningTokens(t *testing.T) {
+	if recordHasThinking(map[string]any{
+		"Detail": map[string]any{"reasoning_tokens": float64(12)},
+	}) != true {
+		t.Fatal("reasoning_tokens in Detail should count as thinking")
+	}
+	if recordHasThinking(map[string]any{
+		"delta": map[string]any{"thinking_content": "step 1"},
+	}) != true {
+		t.Fatal("thinking_content should count as thinking")
+	}
+	if recordHasThinking(map[string]any{
+		"output_tokens": float64(64),
+	}) != false {
+		t.Fatal("plain output without reasoning must not count as thinking")
+	}
+}
+
+func TestAccountQuotaExhaustedDetection(t *testing.T) {
+	for _, test := range []struct {
+		status int
+		body   string
+		want   bool
+	}{
+		{200, "free-usage-exhausted for plan", true},
+		{403, "FREE_USAGE_EXHAUSTED", true},
+		{400, "subscription:free-usage limit", true},
+		{400, "Included Free Usage has ended", true},
+		{429, "rate limit exceeded", true},
+		{429, "quota remaining 0", true},
+		{429, "daily usage cap", true},
+		{200, "quota exhausted on account", true},
+		{429, "please slow down", false},
+		{500, "internal error", false},
+	} {
+		if got := isAccountQuotaExhausted(test.status, test.body); got != test.want {
+			t.Fatalf("isAccountQuotaExhausted(%d, %q)=%v, want %v", test.status, test.body, got, test.want)
+		}
+	}
+}
+
+func TestShouldRetryProbeWithNextAuth(t *testing.T) {
+	if !shouldRetryProbeWithNextAuth(true, 429, "free-usage-exhausted", "account_error") {
+		t.Fatal("quota exhaustion must retry next auth")
+	}
+	if shouldRetryProbeWithNextAuth(false, 429, "free-usage-exhausted", "account_error") {
+		t.Fatal("no next auth must not retry")
+	}
+	if !shouldRetryProbeWithNextAuth(true, 401, "invalid or expired token", "account_error") {
+		t.Fatal("auth error must retry next auth")
+	}
+	if shouldRetryProbeWithNextAuth(true, 502, "bad gateway", "upstream_error") {
+		t.Fatal("upstream error must not switch auth")
+	}
+}
+
+func TestProbeUnstableErrDetection(t *testing.T) {
+	for _, msg := range []string{
+		"read: connection reset by peer",
+		"unexpected EOF",
+		"http2: stream closed",
+		"tls: handshake failure",
+		"i/o timeout",
+	} {
+		if !isProbeUnstableErr(errors.New(msg)) {
+			t.Fatalf("expected unstable for %q", msg)
+		}
+	}
+	if isProbeUnstableErr(errors.New("json: cannot unmarshal")) {
+		t.Fatal("parse errors are not probe instability")
+	}
+	res := probeUnstableResult(qualityResult{Model: "grok-4.5"}, errors.New("connection reset by peer"), 1234)
+	if res.Classification != "hard" || res.ErrorKind != "probe_unstable" {
+		t.Fatalf("unstable result=%+v", res)
+	}
+	if !strings.Contains(res.Error, "断流不稳定") {
+		t.Fatalf("error text=%q", res.Error)
+	}
+}
+
+
+func TestDefaultPolicyThinkingFeaturesOn(t *testing.T) {
+	pol := defaultPolicy()
+	if !pol.ThinkingGuard {
+		t.Fatal("default ThinkingGuard should be on")
+	}
+	if !pol.ThinkingCrossVerify {
+		t.Fatal("default ThinkingCrossVerify should be on")
+	}
+	if !pol.SoftCrossVerify {
+		t.Fatal("default SoftCrossVerify should be on")
+	}
+	if pol.ConsecutiveMissingThinking != 1 {
+		t.Fatalf("default consecutive missing thinking=%d, want 1", pol.ConsecutiveMissingThinking)
+	}
+	if got := classifyQuality(100, 64, false, pol); got != "hard" {
+		t.Fatalf("missing thinking with guard=%q, want hard", got)
+	}
+}
+
+func TestNormalizePolicyFillsAbsentBoolDefaults(t *testing.T) {
+	// Pure old state: no redesign keys, schema 0.
+	p := policyConfig{HardTPS: 1000, SoftTPS: 500}
+	normalizePolicy(&p, map[string]any{
+		"hard_tps": 1000,
+		"soft_tps": 500,
+	})
+	if !p.ThinkingGuard {
+		t.Fatal("absent thinking_guard must default on")
+	}
+	if !p.ThinkingCrossVerify {
+		t.Fatal("schema migration must turn thinking_cross_verify on")
+	}
+	if !p.SoftCrossVerify {
+		t.Fatal("absent soft_cross_verify must default on")
+	}
+	if p.ConsecutiveMissingThinking != 1 {
+		t.Fatalf("consecutive_missing_thinking=%d, want 1", p.ConsecutiveMissingThinking)
+	}
+	if p.PolicySchema != 3 {
+		t.Fatalf("policy_schema=%d, want 3", p.PolicySchema)
+	}
+
+	// Intermediate build: explicit thinking_cross_verify=false but schema still 0.
+	pMid := policyConfig{HardTPS: 1000, SoftTPS: 500, ThinkingGuard: true, ThinkingCrossVerify: false, ConsecutiveMissingThinking: 1}
+	normalizePolicy(&pMid, map[string]any{
+		"hard_tps":                     1000,
+		"soft_tps":                     500,
+		"thinking_guard":               true,
+		"thinking_cross_verify":        false,
+		"consecutive_missing_thinking": 1,
+	})
+	if !pMid.ThinkingCrossVerify {
+		t.Fatal("schema<2 must migrate thinking_cross_verify to default on even if false was persisted")
+	}
+	if !pMid.SoftCrossVerify {
+		t.Fatal("schema migration must turn soft_cross_verify on")
+	}
+	if pMid.PolicySchema != 3 {
+		t.Fatalf("migrated policy_schema=%d, want 3", pMid.PolicySchema)
+	}
+
+	// After redesign (schema 2), explicit false must stick.
+	p2 := policyConfig{HardTPS: 1000, SoftTPS: 500, ThinkingGuard: true, ThinkingCrossVerify: false, SoftCrossVerify: false, ConsecutiveMissingThinking: 2, PolicySchema: 3}
+	normalizePolicy(&p2, map[string]any{
+		"hard_tps":                     1000,
+		"soft_tps":                     500,
+		"thinking_guard":               true,
+		"thinking_cross_verify":        false,
+		"soft_cross_verify":            false,
+		"consecutive_missing_thinking": 2,
+		"policy_schema":                3,
+	})
+	if p2.ThinkingCrossVerify {
+		t.Fatal("explicit false after schema 2 must stay false")
+	}
+
+	// Explicit thinking_guard=false stays false and forces cross-verify off.
+	p3 := policyConfig{HardTPS: 1000, SoftTPS: 500, ThinkingGuard: false}
+	normalizePolicy(&p3, map[string]any{
+		"hard_tps":       1000,
+		"soft_tps":       500,
+		"thinking_guard": false,
+	})
+	if p3.ThinkingGuard || p3.ThinkingCrossVerify {
+		t.Fatal("explicit thinking_guard=false must disable guard and cross-verify")
+	}
+}
+
+func TestMissingThinkingRequiresConsecutiveStrikes(t *testing.T) {
+	store := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	node, err := store.createNode("n1", "http://127.0.0.1:7951", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Keep min_healthy satisfiable so quarantine is not suppressed.
+	if _, err := store.createNode("n2", "http://127.0.0.1:7952", true, false, 10); err != nil {
+		t.Fatal(err)
+	}
+	pol := store.policy()
+	pol.ThinkingGuard = true
+	pol.ThinkingCrossVerify = false
+	pol.ConsecutiveMissingThinking = 2
+	pol.MinHealthyNodes = 1
+	if err := store.updatePolicy(pol); err != nil {
+		t.Fatal(err)
+	}
+	res := qualityResult{Classification: "hard", HasThinking: false, OutputTokens: 64, TPS: 10}
+	applyObservation(store, node.ID, "passive", res)
+	got, _ := store.getNode(node.ID)
+	if got.DisabledByGuard {
+		t.Fatal("first missing-thinking must not quarantine when threshold=2")
+	}
+	if got.ThinkingStrikes != 1 {
+		t.Fatalf("thinking strikes=%d, want 1", got.ThinkingStrikes)
+	}
+	applyObservation(store, node.ID, "passive", res)
+	got, _ = store.getNode(node.ID)
+	if !got.DisabledByGuard {
+		t.Fatal("second missing-thinking should quarantine when threshold=2 and cross-verify off")
+	}
+}
+
+func TestThinkingCrossVerifySchedulesInsteadOfQuarantine(t *testing.T) {
+	store := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	node, err := store.createNode("n1", "http://127.0.0.1:7951", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Add a second healthy node so quarantine is not suppressed by min_healthy.
+	if _, err := store.createNode("n2", "http://127.0.0.1:7952", true, false, 10); err != nil {
+		t.Fatal(err)
+	}
+	pol := store.policy()
+	pol.ThinkingGuard = true
+	pol.ThinkingCrossVerify = true
+	pol.ConsecutiveMissingThinking = 1
+	pol.MinHealthyNodes = 1
+	if err := store.updatePolicy(pol); err != nil {
+		t.Fatal(err)
+	}
+	res := qualityResult{Classification: "hard", HasThinking: false, OutputTokens: 64, TPS: 10}
+	applyObservation(store, node.ID, "passive", res)
+	got, _ := store.getNode(node.ID)
+	if got.DisabledByGuard {
+		t.Fatal("passive missing-thinking with cross-verify must not quarantine immediately")
+	}
+	if got.ThinkingStrikes < 1 {
+		t.Fatal("thinking strikes should accumulate")
+	}
+	// Active confirmation quarantines without re-scheduling.
+	applyObservation(store, node.ID, "active", res)
+	got, _ = store.getNode(node.ID)
+	if !got.DisabledByGuard {
+		t.Fatal("active missing-thinking confirmation should quarantine")
+	}
+	endCrossVerify(node.ID)
+}
+
+func TestSoftCrossVerifySchedulesInsteadOfQuarantine(t *testing.T) {
+	store := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	node, err := store.createNode("n1", "http://127.0.0.1:7951", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.createNode("n2", "http://127.0.0.1:7952", true, false, 10); err != nil {
+		t.Fatal(err)
+	}
+	pol := store.policy()
+	pol.SoftCrossVerify = true
+	pol.ConsecutiveSoft = 1
+	pol.MinHealthyNodes = 1
+	if err := store.updatePolicy(pol); err != nil {
+		t.Fatal(err)
+	}
+	res := qualityResult{Classification: "soft", HasThinking: true, OutputTokens: 64, TPS: 600}
+	applyObservation(store, node.ID, "passive", res)
+	got, _ := store.getNode(node.ID)
+	if got.DisabledByGuard {
+		t.Fatal("soft cross-verify must defer quarantine")
+	}
+	applyObservation(store, node.ID, "active", res)
+	got, _ = store.getNode(node.ID)
+	if !got.DisabledByGuard {
+		t.Fatal("active soft confirmation should quarantine")
+	}
+	endCrossVerify(node.ID)
+}
+
+
+
+func TestAuthDegradeSkipsCrossVerifySchedule(t *testing.T) {
+	store := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	node, err := store.createNode("n1", "http://127.0.0.1:7951", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.createNode("n2", "http://127.0.0.1:7952", true, false, 10); err != nil {
+		t.Fatal(err)
+	}
+	pol := store.policy()
+	pol.ThinkingGuard = true
+	pol.ThinkingCrossVerify = true
+	pol.ConsecutiveMissingThinking = 1
+	pol.MinHealthyNodes = 1
+	if err := store.updatePolicy(pol); err != nil {
+		t.Fatal(err)
+	}
+	res := qualityResult{
+		Classification: "hard",
+		HasThinking:    false,
+		OutputTokens:   64,
+		TPS:            10,
+		AuthID:         "user@x",
+		AuthLabel:      "user@x",
+		Error:          "响应缺少 thinking_content（降智）",
+	}
+	applyObservation(store, node.ID, "passive", res)
+	items := store.listAuthDegradeStats()
+	if len(items) != 1 || items[0].SampleCount != 1 || items[0].DegradedCount != 0 {
+		t.Fatalf("pre-cross-verify should sample only, not degrade: %+v", items)
+	}
+	// Active confirmation counts as one degrade.
+	applyObservation(store, node.ID, "active", res)
+	items = store.listAuthDegradeStats()
+	if len(items) != 1 || items[0].DegradedCount != 1 || items[0].SampleCount != 2 {
+		t.Fatalf("after confirm want degraded=1 samples=2 got %+v", items[0])
+	}
+	endCrossVerify(node.ID)
+}
+
+func TestRecordAuthDegradeStats(t *testing.T) {
+	store := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	store.recordAuthObservation("a1@x", "a1@x", "passive", "1", "n1", "hard", "响应缺少 thinking_content（降智）", 10, true)
+	store.recordAuthObservation("a1@x", "a1@x", "passive", "1", "n1", "healthy", "", 8, false)
+	store.recordAuthObservation("b2@x", "b2@x", "passive", "2", "n2", "hard", "响应缺少 thinking_content（降智）", 12, true)
+	items := store.listAuthDegradeStats()
+	if len(items) != 2 {
+		t.Fatalf("auth stats len=%d, want 2", len(items))
+	}
+	if items[0].AuthID != "a1@x" && items[0].DegradedCount < items[1].DegradedCount {
+		t.Fatalf("expected higher degrade count first: %+v", items)
+	}
+	var a1 *authDegradeRecord
+	for _, it := range items {
+		if it.AuthID == "a1@x" {
+			a1 = it
+		}
+	}
+	if a1 == nil || a1.DegradedCount != 1 || a1.SampleCount != 2 {
+		t.Fatalf("a1 stats=%+v", a1)
 	}
 }
 

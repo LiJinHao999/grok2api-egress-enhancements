@@ -1,0 +1,6 @@
+/* accounts-panel.css */
+.panel-switch { display: inline-flex; align-items: center; gap: var(--space-3xs); padding: 0.15rem; border: var(--rule-hairline) solid var(--border); border-radius: var(--radius-sm); background: var(--muted); }
+.panel-switch .button { min-height: 1.9rem; border: 0; background: transparent; box-shadow: none; }
+.panel-switch .button.active { background: var(--card); color: var(--foreground); }
+.panel[hidden] { display: none !important; }
+#panel-accounts-host .section-note { margin: var(--space-3xs) 0 0; color: var(--muted-foreground); font-size: var(--text-2xs); line-height: 1.5; }

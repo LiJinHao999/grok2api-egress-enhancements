@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -139,16 +140,90 @@ func classifyTPS(tps float64, soft, hard float64) string {
 	return "healthy"
 }
 
-// classifyQuality applies the minimum-evidence guard before TPS thresholds.
-// Tiny responses are not enough evidence to call an egress degraded: provider
-// usage fields can be missing or generation may have ended immediately.
-func classifyQuality(tps float64, outputTokens int64, pol policyConfig) string {
+// thinkingFieldNonEmpty reports whether a delta/message field carries real
+// thinking/reasoning text. Empty strings and whitespace-only values do not count.
+func thinkingFieldNonEmpty(v any) bool {
+	s, ok := v.(string)
+	return ok && strings.TrimSpace(s) != ""
+}
+
+// mapHasThinkingContent inspects OpenAI-compatible delta/message maps for the
+// thinking markers used by Grok/xAI streams (thinking_content / reasoning_content).
+func mapHasThinkingContent(m map[string]any) bool {
+	if m == nil {
+		return false
+	}
+	for _, key := range []string{
+		"thinking_content", "ThinkingContent", "thinkingContent",
+		"reasoning_content", "ReasoningContent", "reasoningContent",
+		"thinking", "Thinking",
+	} {
+		if thinkingFieldNonEmpty(m[key]) {
+			return true
+		}
+	}
+	return false
+}
+
+// recordHasThinking derives a thinking signal from a CPA usage event.
+// Prefer explicit thinking/reasoning body fields; fall back to reasoning_tokens > 0
+// because passive usage rarely includes full response text.
+func recordHasThinking(record map[string]any) bool {
+	if record == nil {
+		return false
+	}
+	if mapHasThinkingContent(record) {
+		return true
+	}
+	for _, nestKey := range []string{"Detail", "detail", "Message", "message", "Response", "response", "Delta", "delta"} {
+		if nested, ok := record[nestKey].(map[string]any); ok && mapHasThinkingContent(nested) {
+			return true
+		}
+	}
+	// Boolean / presence markers some hosts may attach.
+	for _, key := range []string{"has_thinking", "HasThinking", "hasThinking", "has_reasoning", "HasReasoning"} {
+		switch v := record[key].(type) {
+		case bool:
+			if v {
+				return true
+			}
+		case string:
+			if strings.EqualFold(strings.TrimSpace(v), "true") || strings.TrimSpace(v) == "1" {
+				return true
+			}
+		}
+	}
+	if firstInt(record, "reasoning_tokens", "ReasoningTokens", "reasoningTokens") > 0 {
+		return true
+	}
+	for _, nestKey := range []string{"Detail", "detail", "Usage", "usage"} {
+		if nested, ok := record[nestKey].(map[string]any); ok {
+			if firstInt(nested, "reasoning_tokens", "ReasoningTokens", "reasoningTokens") > 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// classifyQuality classifies a successful generation sample.
+// When ThinkingGuard is on: missing thinking (with enough output) is hard 降智;
+// present thinking falls through to the original soft/hard Token/s thresholds.
+// When ThinkingGuard is off: behavior matches the original TPS-only path.
+func classifyQuality(tps float64, outputTokens int64, hasThinking bool, pol policyConfig) string {
 	if outputTokens <= 0 || tps <= 0 {
 		return "unknown"
 	}
 	if pol.MinOutputTokens > 0 && outputTokens < pol.MinOutputTokens {
+		// Tiny responses are not enough evidence (original min-output guard).
 		return "ignored"
 	}
+	if pol.ThinkingGuard && !hasThinking {
+		// Sufficient output but no thinking_content / reasoning signal → 降智.
+		return "hard"
+	}
+	// Original author logic: soft/hard Token/s thresholds as the quality baseline
+	// (also the fallback when thinking is present, or ThinkingGuard is disabled).
 	return classifyTPS(tps, pol.SoftTPS, pol.HardTPS)
 }
 
@@ -252,6 +327,9 @@ type qualityResult struct {
 	OutputTokens   int64   `json:"output_tokens"`
 	DurationMs     int64   `json:"duration_ms"`
 	FirstTokenMs   int64   `json:"first_token_ms"`
+	HasThinking    bool    `json:"has_thinking,omitempty"`
+	AuthID         string  `json:"auth_id,omitempty"`
+	AuthLabel      string  `json:"auth_label,omitempty"`
 	ExitIP         string  `json:"exit_ip,omitempty"`
 	Error          string  `json:"error,omitempty"`
 	ErrorKind      string  `json:"error_kind,omitempty"`
@@ -375,6 +453,30 @@ func isAuthExpired(auth authFile) bool {
 	return false
 }
 
+// isAccountQuotaExhausted detects free-tier / quota exhaustion on an auth.
+// body is normalized to lower-case inside the helper.
+func isAccountQuotaExhausted(status int, body string) bool {
+	lower := strings.ToLower(body)
+	for _, marker := range []string{
+		"free-usage-exhausted",
+		"free_usage_exhausted",
+		"subscription:free-usage",
+		"included free usage",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	if status == http.StatusTooManyRequests &&
+		(strings.Contains(lower, "quota") || strings.Contains(lower, "usage") || strings.Contains(lower, "rate")) {
+		return true
+	}
+	if strings.Contains(lower, "quota") && strings.Contains(lower, "exhaust") {
+		return true
+	}
+	return false
+}
+
 func isAuthErrorRetryable(status int, body string) bool {
 	if status == http.StatusUnauthorized || status == http.StatusForbidden {
 		return true
@@ -384,6 +486,91 @@ func isAuthErrorRetryable(status int, body string) bool {
 		strings.Contains(lower, "no auth context") ||
 		strings.Contains(lower, "permissiondenied") ||
 		strings.Contains(lower, "x_xai_token_auth=none")
+}
+
+// shouldRetryProbeWithNextAuth switches credentials on free-usage / account errors.
+// Stream instability must NOT go through this path — those hard-quarantine the node.
+func shouldRetryProbeWithNextAuth(hasNext bool, status int, body, kind string) bool {
+	if !hasNext {
+		return false
+	}
+	if isAccountQuotaExhausted(status, body) {
+		return true
+	}
+	if kind == "account_error" {
+		return true
+	}
+	return isAuthErrorRetryable(status, body)
+}
+
+func isProbeTimeoutErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "timeout") ||
+		strings.Contains(lower, "timed out") ||
+		strings.Contains(lower, "deadline exceeded") ||
+		strings.Contains(lower, "context deadline")
+}
+
+// isProbeUnstableErr marks mid-stream / link instability. Timeouts are also
+// unstable, but callers may branch on isProbeTimeoutErr first.
+func isProbeUnstableErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isProbeTimeoutErr(err) {
+		return true
+	}
+	lower := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"unexpected eof",
+		"eof",
+		"connection reset",
+		"connection refused",
+		"broken pipe",
+		"stream error",
+		"http2: stream",
+		"server closed idle connection",
+		"tls:",
+		"tls handshake",
+		"use of closed network connection",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func probeUnstableResult(base qualityResult, err error, durationMs int64) qualityResult {
+	base.Classification = "hard"
+	base.ErrorKind = "probe_unstable"
+	base.DurationMs = durationMs
+	detail := ""
+	if err != nil {
+		detail = truncate(err.Error(), 80)
+	}
+	if detail != "" {
+		base.Error = "不一定降智，但节点断流不稳定，标记为降智，暂不使用 (" + detail + ")"
+	} else {
+		base.Error = "不一定降智，但节点断流不稳定，标记为降智，暂不使用"
+	}
+	return base
+}
+
+func authProbeLabel(auth authFile) string {
+	if auth.Email != "" {
+		return auth.Email
+	}
+	if auth.Name != "" {
+		return auth.Name
+	}
+	if auth.ID != "" {
+		return auth.ID
+	}
+	return auth.Index
 }
 
 func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
@@ -468,22 +655,34 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 		start := time.Now()
 		resp, errDo := client.Do(req)
 		if errDo != nil {
+			dur := time.Since(start).Milliseconds()
+			// Timeout / mid-stream link instability is a node problem: hard, no auth switch.
+			if isProbeTimeoutErr(errDo) || isProbeUnstableErr(errDo) {
+				return probeUnstableResult(res, errDo, dur)
+			}
 			lastErr = "模型探测请求失败: " + truncate(errDo.Error(), 120)
 			res.ErrorKind = "transport_error"
-			res.DurationMs = time.Since(start).Milliseconds()
+			res.DurationMs = dur
 			continue
 		}
 
 		if resp.StatusCode >= 400 {
 			b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 			_ = resp.Body.Close()
-			msg := fmt.Sprintf("上游 HTTP %d: %s", resp.StatusCode, truncate(string(b), 160))
+			bodyText := string(b)
+			msg := fmt.Sprintf("上游 HTTP %d: %s", resp.StatusCode, truncate(bodyText, 160))
 			lastErr = msg
-			res.ErrorKind = classifyFailureKind(resp.StatusCode, string(b))
+			kind := classifyFailureKind(resp.StatusCode, bodyText)
+			res.ErrorKind = kind
 			res.DurationMs = time.Since(start).Milliseconds()
-			if (res.ErrorKind == "account_error" || isAuthErrorRetryable(resp.StatusCode, string(b))) && i+1 < len(candidates) {
+			hasNext := i+1 < len(candidates)
+			if shouldRetryProbeWithNextAuth(hasNext, resp.StatusCode, bodyText, kind) {
 				// Account/quota errors belong to the credential, not the egress.
 				// Try another account on the same channel before classifying it.
+				if isAccountQuotaExhausted(resp.StatusCode, bodyText) {
+					log.Printf("quality free-usage exhausted -> retry next auth auth=%s node=%s remain=%d",
+						authProbeLabel(auth), node.ID, len(candidates)-(i+1))
+				}
 				continue
 			}
 			res.Classification = "error"
@@ -496,6 +695,7 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 			contentLen   int
 			usageOut     int64
 			usageReason  int64
+			hasThinking  bool
 		)
 		scanner := bufio.NewScanner(resp.Body)
 		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
@@ -518,13 +718,24 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 			if u, ok := chunk["usage"].(map[string]any); ok {
 				usageOut = maxInt64(usageOut, outputTokensFromUsage(u))
 				usageReason = maxInt64(usageReason, anyInt(u["reasoning_tokens"]), anyInt(u["reasoningTokens"]))
+				if usageReason > 0 {
+					hasThinking = true
+				}
 			}
 			choices, _ := chunk["choices"].([]any)
 			for _, c := range choices {
 				cm, _ := c.(map[string]any)
 				delta, _ := cm["delta"].(map[string]any)
 				if delta == nil {
+					if msg, ok := cm["message"].(map[string]any); ok {
+						delta = msg
+					}
+				}
+				if delta == nil {
 					continue
+				}
+				if mapHasThinkingContent(delta) {
+					hasThinking = true
 				}
 				if t, ok := delta["content"].(string); ok && t != "" {
 					if firstTokenAt.IsZero() {
@@ -532,19 +743,26 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 					}
 					contentLen += len([]rune(t))
 				}
-				if t, ok := delta["reasoning_content"].(string); ok && t != "" {
-					if firstTokenAt.IsZero() {
-						firstTokenAt = time.Now()
+				for _, key := range []string{"thinking_content", "reasoning_content", "thinking"} {
+					if t, ok := delta[key].(string); ok && t != "" {
+						if firstTokenAt.IsZero() {
+							firstTokenAt = time.Now()
+						}
+						contentLen += len([]rune(t))
 					}
-					contentLen += len([]rune(t))
 				}
 			}
 		}
 		_ = resp.Body.Close()
 		if scanErr := scanner.Err(); scanErr != nil {
+			dur := time.Since(start).Milliseconds()
+			// Broken stream while reading SSE: hard-quarantine, do not switch auth.
+			if isProbeTimeoutErr(scanErr) || isProbeUnstableErr(scanErr) {
+				return probeUnstableResult(res, scanErr, dur)
+			}
 			lastErr = "模型探测流读取失败: " + truncate(scanErr.Error(), 120)
 			res.ErrorKind = "transport_error"
-			res.DurationMs = time.Since(start).Milliseconds()
+			res.DurationMs = dur
 			continue
 		}
 
@@ -566,14 +784,21 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 			}
 		}
 		res.OutputTokens = outTokens
+		res.HasThinking = hasThinking
+		res.AuthID = firstNonEmpty(auth.ID, auth.Index, auth.Name, auth.Email)
+		res.AuthLabel = authProbeLabel(auth)
 		res.TPS = computeTPS(outTokens, res.DurationMs, res.FirstTokenMs, pol.MinGenerationMs)
-		res.Classification = classifyQuality(res.TPS, outTokens, pol)
+		res.Classification = classifyQuality(res.TPS, outTokens, hasThinking, pol)
 		if res.Classification == "unknown" && outTokens == 0 {
 			lastErr = "探测无输出"
 			res.ErrorKind = "no_output"
 			continue
 		}
-		res.Error = ""
+		if res.Classification == "hard" && pol.ThinkingGuard && !hasThinking {
+			res.Error = "响应缺少 thinking_content（降智）"
+		} else {
+			res.Error = ""
+		}
 		res.ErrorKind = ""
 		return res
 	}
@@ -605,6 +830,71 @@ func anyInt(v any) int64 {
 	}
 }
 
+// crossVerifyInflight prevents stacked follow-up probes for the same node
+// while a soft/thinking cross-verify is already running.
+var (
+	crossVerifyMu       sync.Mutex
+	crossVerifyInflight = map[string]struct{}{}
+)
+
+func beginCrossVerify(nodeID string) bool {
+	crossVerifyMu.Lock()
+	defer crossVerifyMu.Unlock()
+	if _, ok := crossVerifyInflight[nodeID]; ok {
+		return false
+	}
+	crossVerifyInflight[nodeID] = struct{}{}
+	return true
+}
+
+func endCrossVerify(nodeID string) {
+	crossVerifyMu.Lock()
+	defer crossVerifyMu.Unlock()
+	delete(crossVerifyInflight, nodeID)
+}
+
+func scheduleCrossVerifyProbe(store *stateStore, nodeID, name, event, reason string, res qualityResult, source string) {
+	if !beginCrossVerify(nodeID) {
+		return
+	}
+	_, _ = store.updateNode(nodeID, func(node *nodeRecord) error {
+		// Keep soft-ish UI state while waiting for confirmation; do not quarantine yet.
+		if node.LastClassification == "" || node.LastClassification == "hard" {
+			node.LastClassification = "soft"
+		}
+		node.LastReason = reason
+		node.LastSource = source
+		node.LastObservedAt = float64(time.Now().Unix())
+		node.LastOutputTPS = res.TPS
+		node.LastOutputTokens = res.OutputTokens
+		node.LastDurationMs = res.DurationMs
+		node.LastFirstTokenMs = res.FirstTokenMs
+		return nil
+	})
+	store.appendEvent(guardEvent{
+		Event:          event,
+		NodeID:         nodeID,
+		NodeName:       name,
+		Classification: "soft",
+		OutputTPS:      res.TPS,
+		Reason:         reason,
+	})
+	go func(id string) {
+		defer endCrossVerify(id)
+		if _, err := runNodeQuality(store, id); err != nil {
+			log.Printf("cross-verify probe failed node=%s err=%v", id, err)
+		}
+	}(nodeID)
+}
+
+// missingThinkingHit is a pure 降智 sample (enough output, no thinking), not transport instability.
+func missingThinkingHit(res qualityResult, pol policyConfig) bool {
+	return pol.ThinkingGuard &&
+		res.Classification == "hard" &&
+		!res.HasThinking &&
+		res.ErrorKind != "probe_unstable"
+}
+
 func applyObservation(store *stateStore, nodeID, source string, res qualityResult) {
 	pol := store.policy()
 	if res.Classification == "error" && res.ErrorKind != "transport_error" {
@@ -616,6 +906,9 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 		doQuarantine  bool
 		quarantineWhy string
 		nodeCopy      nodeRecord
+		scheduleCV    bool
+		cvEvent       string
+		cvReason      string
 	)
 	updated, err := store.updateNode(nodeID, func(n *nodeRecord) error {
 		n.LastClassification = res.Classification
@@ -636,27 +929,85 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 		} else if res.Classification == "healthy" {
 			n.LastReason = ""
 		}
-		switch res.Classification {
-		case "healthy":
+
+		isActiveConfirm := source == "active" || source == "cross_verify"
+		needMissing := missingThinkingHit(res, pol)
+
+		switch {
+		case res.Classification == "healthy":
 			n.SoftStrikes = 0
 			n.ErrorStrikes = 0
+			n.ThinkingStrikes = 0
 			if n.DisabledByGuard && (source == "active" || pol.Mode == "passive") {
 				n.DisabledByGuard = false
 				n.QuarantinedUntil = 0
 				doRestore = true
 			}
-		case "soft":
+
+		case needMissing:
+			// Missing thinking accumulates on the same egress; healthy/soft/error reset it.
+			n.ThinkingStrikes++
+			n.SoftStrikes = 0
+			threshold := pol.ConsecutiveMissingThinking
+			if threshold <= 0 {
+				threshold = 1
+			}
+			if n.ThinkingStrikes < threshold {
+				n.LastClassification = "soft"
+				n.LastReason = fmt.Sprintf("连续缺少 thinking %d/%d", n.ThinkingStrikes, threshold)
+			} else if !n.DisabledByGuard {
+				// Reached threshold: either cross-verify (passive) or quarantine now.
+				if pol.ThinkingCrossVerify && !isActiveConfirm {
+					scheduleCV = true
+					cvEvent = "thinking_cross_verify_scheduled"
+					cvReason = fmt.Sprintf("连续缺少 thinking %d 次，触发交叉验证探测（可能延迟隔离并增加 Token 消耗）", n.ThinkingStrikes)
+					n.LastClassification = "soft"
+					n.LastReason = cvReason
+					// Keep strikes so a confirming active probe still sees threshold met;
+					// active path quarantines immediately without rescheduling.
+				} else {
+					doQuarantine = true
+					if res.Error != "" {
+						quarantineWhy = res.Error
+					} else {
+						quarantineWhy = fmt.Sprintf("连续缺少 thinking_content %d 次（降智）", n.ThinkingStrikes)
+					}
+				}
+			}
+
+		case res.Classification == "soft":
+			n.ThinkingStrikes = 0
 			n.SoftStrikes++
 			if n.SoftStrikes >= pol.ConsecutiveSoft && !n.DisabledByGuard {
-				doQuarantine = true
-				quarantineWhy = fmt.Sprintf("连续软阈值 Token/s=%.1f", res.TPS)
+				if pol.SoftCrossVerify && !isActiveConfirm {
+					scheduleCV = true
+					cvEvent = "soft_cross_verify_scheduled"
+					cvReason = fmt.Sprintf("连续软阈值 Token/s=%.1f，触发交叉验证探测（可能延迟隔离并增加 Token 消耗）", res.TPS)
+					n.LastReason = cvReason
+				} else {
+					doQuarantine = true
+					if res.Error != "" {
+						quarantineWhy = res.Error
+					} else {
+						quarantineWhy = fmt.Sprintf("连续软阈值 Token/s=%.1f", res.TPS)
+					}
+				}
 			}
-		case "hard":
+
+		case res.Classification == "hard":
+			// Hard for non-missing-thinking reasons (e.g. probe_unstable, TPS hard with thinking).
+			n.ThinkingStrikes = 0
 			if !n.DisabledByGuard {
 				doQuarantine = true
-				quarantineWhy = fmt.Sprintf("硬阈值 Token/s=%.1f", res.TPS)
+				if res.Error != "" {
+					quarantineWhy = res.Error
+				} else {
+					quarantineWhy = fmt.Sprintf("硬阈值 Token/s=%.1f", res.TPS)
+				}
 			}
-		case "error":
+
+		case res.Classification == "error":
+			n.ThinkingStrikes = 0
 			n.ErrorStrikes++
 			if n.ErrorStrikes >= pol.ConsecutiveErrors && !n.DisabledByGuard {
 				doQuarantine = true
@@ -670,6 +1021,49 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 		store.bumpStat(source, res.Classification, res.OutputTokens)
 		return
 	}
+	// Per-account 降智 stats:
+	// - sample: real generation outcomes (healthy/soft/hard), not errors/ignored
+	// - degraded: final quality-degrade hits only
+	//   * missing-thinking hard that is NOT deferred to cross-verify
+	//   * soft/hard TPS outcomes that actually quarantine (or would, if already isolated)
+	// Cross-verify scheduling must NOT mark degrade yet (avoid +2).
+	if res.AuthID != "" {
+		if res.Classification != "error" && res.Classification != "ignored" && res.Classification != "unknown" {
+			degraded := false
+			reason := res.Error
+			if missingThinkingHit(res, pol) {
+				// Deferred to cross-verify: wait for active confirmation.
+				if scheduleCV && cvEvent == "thinking_cross_verify_scheduled" {
+					degraded = false
+				} else {
+					degraded = true
+					if reason == "" {
+						reason = "响应缺少 thinking_content（降智）"
+					}
+				}
+			} else if res.Classification == "hard" && res.ErrorKind != "probe_unstable" {
+				// TPS hard (with thinking) or other hard quality — count as degrade when final.
+				degraded = true
+				if reason == "" {
+					reason = fmt.Sprintf("硬阈值 Token/s=%.1f", res.TPS)
+				}
+			} else if res.Classification == "soft" {
+				// Soft only counts as degrade when it reaches action threshold and is not deferred.
+				if scheduleCV && cvEvent == "soft_cross_verify_scheduled" {
+					degraded = false
+				} else if doQuarantine || nodeCopy.DisabledByGuard {
+					// Reached consecutive soft threshold (quarantine now or already isolated).
+					degraded = true
+					if reason == "" {
+						reason = fmt.Sprintf("连续软阈值 Token/s=%.1f", res.TPS)
+					}
+				}
+			}
+			// Always count the sample for rate denominator when it's a real generation.
+			// For soft-below-threshold, degraded=false (suspicious but not yet 降智事件).
+			store.recordAuthObservation(res.AuthID, res.AuthLabel, source, nodeCopy.ID, nodeCopy.Name, res.Classification, reason, res.TPS, degraded)
+		}
+	}
 	if res.Classification == "ignored" {
 		// Account, quota, upstream and no-account failures are not evidence that
 		// the egress is degraded. Keep the observation for diagnostics, but never
@@ -681,6 +1075,12 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 		store.bumpAction("restored")
 		store.appendEvent(guardEvent{Event: "node_restored", NodeID: nodeCopy.ID, NodeName: nodeCopy.Name, Classification: "healthy", OutputTPS: res.TPS})
 		go func(nn nodeRecord) { _ = enableAuthsOnNode(&nn) }(nodeCopy)
+	}
+	if scheduleCV {
+		// Stat as soft while waiting; active confirmation will record the final class.
+		store.bumpStat(source, "soft", res.OutputTokens)
+		scheduleCrossVerifyProbe(store, nodeCopy.ID, nodeCopy.Name, cvEvent, cvReason, res, source)
+		return
 	}
 	if doQuarantine {
 		quarantineNode(store, nodeCopy.ID, quarantineWhy, res.TPS, res.Classification)
@@ -871,6 +1271,7 @@ func handlePassiveUsage(store *stateStore, record map[string]any) {
 	class := "unknown"
 	tps := 0.0
 	errorKind := ""
+	hasThinking := false
 	if failed {
 		failure, _ := record["Failure"].(map[string]any)
 		if failure == nil {
@@ -886,7 +1287,8 @@ func handlePassiveUsage(store *stateStore, record map[string]any) {
 		}
 	} else {
 		tps = computeTPS(outTokens, durMs, ttftMs, pol.MinGenerationMs)
-		class = classifyQuality(tps, outTokens, pol)
+		hasThinking = recordHasThinking(record)
+		class = classifyQuality(tps, outTokens, hasThinking, pol)
 	}
 
 	// On anomaly, force auth-proxy cache refresh so we don't miss mappings.
@@ -895,24 +1297,49 @@ func handlePassiveUsage(store *stateStore, record map[string]any) {
 	}
 	nodeID := resolveNodeIDForAuth(store, authID, authIndex,
 		filepath.Base(authID), strings.TrimSuffix(filepath.Base(authID), ".json"))
+	authKey := firstNonEmpty(authID, authIndex)
 	res := qualityResult{
 		Classification: class,
 		TPS:            tps,
 		OutputTokens:   outTokens,
 		DurationMs:     durMs,
 		FirstTokenMs:   ttftMs,
+		HasThinking:    hasThinking,
+		AuthID:         authKey,
+		AuthLabel:      authKey,
 		ErrorKind:      errorKind,
+	}
+	if class == "hard" && !failed && pol.ThinkingGuard && !hasThinking {
+		res.Error = "响应缺少 thinking_content（降智）"
 	}
 	if nodeID == "" {
 		store.bumpStat("passive", class, outTokens)
 		if class == "hard" || class == "soft" {
 			store.appendEvent(guardEvent{
 				Event:          "unmapped_" + class,
-				AuthID:         firstNonEmpty(authID, authIndex),
+				AuthID:         authKey,
 				Classification: class,
 				OutputTPS:      tps,
 				Reason:         fmt.Sprintf("usage 未映射到出口节点 auth=%s idx=%s tokens=%d dur=%dms ttft=%dms", authID, authIndex, outTokens, durMs, ttftMs),
 			})
+		}
+		// Unmapped egress: still attribute account samples. Missing-thinking hard counts
+		// as degrade immediately (no node to cross-verify against). Soft does not.
+		if authKey != "" && class != "error" && class != "ignored" && class != "unknown" {
+			degraded := false
+			reason := res.Error
+			if pol.ThinkingGuard && class == "hard" && !hasThinking && !failed {
+				degraded = true
+				if reason == "" {
+					reason = "响应缺少 thinking_content（降智）"
+				}
+			} else if class == "hard" && !failed {
+				degraded = true
+				if reason == "" {
+					reason = fmt.Sprintf("硬阈值 Token/s=%.1f", tps)
+				}
+			}
+			store.recordAuthObservation(authKey, authKey, "passive", "", "", class, reason, tps, degraded)
 		}
 		return
 	}

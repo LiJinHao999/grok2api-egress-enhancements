@@ -92,6 +92,12 @@ var pageTemplate string
 //go:embed tokens.css
 var tokenCSS string
 
+//go:embed accounts-panel.js
+var accountsPanelJS string
+
+//go:embed accounts-panel.css
+var accountsPanelCSS string
+
 type envelope struct {
 	OK     bool            `json:"ok"`
 	Result json.RawMessage `json:"result,omitempty"`
@@ -364,7 +370,7 @@ func handleManagement(request []byte) ([]byte, error) {
 		return okEnvelope(managementResponse{
 			StatusCode: http.StatusOK,
 			Headers:    http.Header{"content-type": []string{resourceContentType}},
-			Body:       []byte(strings.Replace(pageTemplate, "/*__HALLMARK_TOKENS__*/", tokenCSS, 1)),
+			Body:       []byte(renderPageHTML()),
 		})
 	case path == managementAPIPath:
 		return handleUIProxy(req)
@@ -443,10 +449,48 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 			if v, ok := raw["disable_auth_on_hard"].(bool); ok {
 				p.DisableAuthOnHard = v
 			}
+			if v, ok := raw["disableAuthOnHard"].(bool); ok {
+				p.DisableAuthOnHard = v
+			}
+			if v, ok := raw["thinking_guard"].(bool); ok {
+				p.ThinkingGuard = v
+			}
+			if v, ok := raw["thinkingGuard"].(bool); ok {
+				p.ThinkingGuard = v
+			}
+			p.ConsecutiveMissingThinking = intPick(raw, p.ConsecutiveMissingThinking, "consecutive_missing_thinking", "consecutiveMissingThinking")
+			if v, ok := raw["thinking_cross_verify"].(bool); ok {
+				p.ThinkingCrossVerify = v
+			}
+			if v, ok := raw["thinkingCrossVerify"].(bool); ok {
+				p.ThinkingCrossVerify = v
+			}
+			if v, ok := raw["soft_cross_verify"].(bool); ok {
+				p.SoftCrossVerify = v
+			}
+			if v, ok := raw["softCrossVerify"].(bool); ok {
+				p.SoftCrossVerify = v
+			}
+			// Cross-verify only makes sense with thinking guard.
+			if !p.ThinkingGuard {
+				p.ThinkingCrossVerify = false
+			}
 			if err := store.updatePolicy(p); err != nil {
 				return managementJSON(http.StatusBadRequest, errMsg("invalidPolicy", err.Error()))
 			}
 			return managementJSON(http.StatusOK, map[string]any{"data": store.policy(), "ok": true})
+		}
+
+	case path == "/auth-stats" || path == "/quality-guard/auth-stats":
+		if method == http.MethodGet {
+			ensureStore()
+			items := store.listAuthDegradeStats()
+			return managementJSON(http.StatusOK, map[string]any{"data": map[string]any{"items": items, "total": len(items)}, "items": items, "total": len(items)})
+		}
+		if method == http.MethodDelete {
+			ensureStore()
+			store.clearAuthDegradeStats()
+			return managementJSON(http.StatusOK, map[string]any{"data": map[string]any{"cleared": true}, "ok": true})
 		}
 
 	case path == "/nodes":
@@ -689,6 +733,15 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 	return managementJSON(http.StatusNotFound, errMsg("notFound", "not found"))
 }
 
+
+func renderPageHTML() string {
+	out := pageTemplate
+	out = strings.Replace(out, "/*__HALLMARK_TOKENS__*/", tokenCSS, 1)
+	out = strings.Replace(out, "/*__ACCOUNTS_PANEL_CSS__*/", accountsPanelCSS, 1)
+	out = strings.Replace(out, "/*__ACCOUNTS_PANEL_JS__*/", accountsPanelJS, 1)
+	return out
+}
+
 func buildStatus() map[string]any {
 	ensureStore()
 	refreshAssignedCounts(store)
@@ -700,6 +753,7 @@ func buildStatus() map[string]any {
 			"quarantined_until":   n.QuarantinedUntil,
 			"error_strikes":       n.ErrorStrikes,
 			"soft_strikes":        n.SoftStrikes,
+				"thinking_strikes":    n.ThinkingStrikes,
 			"last_classification": n.LastClassification,
 			"last_output_tps":     n.LastOutputTPS,
 			"last_first_token_ms": n.LastFirstTokenMs,
@@ -713,6 +767,7 @@ func buildStatus() map[string]any {
 	}
 	pol := store.policy()
 	st := store.stats()
+	authStats := store.listAuthDegradeStats()
 	return map[string]any{
 		"available":    true,
 		"updatedAt":    store.snapshot().UpdatedAt,
@@ -720,6 +775,7 @@ func buildStatus() map[string]any {
 		"editable":     true,
 		"nodes":        nodeMap,
 		"statistics":   st,
+		"authStats":    authStats,
 		"recentEvents": store.events(),
 		"plugin":       pluginName,
 		"version":      pluginVersion,
