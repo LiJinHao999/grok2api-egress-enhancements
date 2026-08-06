@@ -1023,23 +1023,19 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 	}
 	// Per-account 降智 stats:
 	// - sample: real generation outcomes (healthy/soft/hard), not errors/ignored
-	// - degraded: final quality-degrade hits only
-	//   * missing-thinking hard that is NOT deferred to cross-verify
+	// - degraded: quality-degrade hits for THIS account only (never merge across accounts)
+	//   * missing-thinking hard: count on the observed account immediately
+	//     (node cross-verify may still defer quarantine; probe may use another account)
 	//   * soft/hard TPS outcomes that actually quarantine (or would, if already isolated)
-	// Cross-verify scheduling must NOT mark degrade yet (avoid +2).
+	// Soft cross-verify scheduling must NOT mark degrade yet (avoid +2 on soft).
 	if res.AuthID != "" {
 		if res.Classification != "error" && res.Classification != "ignored" && res.Classification != "unknown" {
 			degraded := false
 			reason := res.Error
 			if missingThinkingHit(res, pol) {
-				// Deferred to cross-verify: wait for active confirmation.
-				if scheduleCV && cvEvent == "thinking_cross_verify_scheduled" {
-					degraded = false
-				} else {
-					degraded = true
-					if reason == "" {
-						reason = "响应缺少 thinking_content（降智）"
-					}
+				degraded = true
+				if reason == "" {
+					reason = "响应缺少 thinking_content（降智）"
 				}
 			} else if res.Classification == "hard" && res.ErrorKind != "probe_unstable" {
 				// TPS hard (with thinking) or other hard quality — count as degrade when final.
