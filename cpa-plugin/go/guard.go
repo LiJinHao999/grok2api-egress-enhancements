@@ -826,60 +826,39 @@ func anyInt(v any) int64 {
 	}
 }
 
-// thinkingCrossVerifyInflight prevents stacked follow-up probes for the same node
-// while a missing-thinking cross-verify is already running.
+// crossVerifyInflight prevents stacked follow-up probes for the same node
+// while a soft/thinking cross-verify is already running.
 var (
-	thinkingCrossVerifyMu       sync.Mutex
-	thinkingCrossVerifyInflight = map[string]struct{}{}
+	crossVerifyMu       sync.Mutex
+	crossVerifyInflight = map[string]struct{}{}
 )
 
-func beginThinkingCrossVerify(nodeID string) bool {
-	thinkingCrossVerifyMu.Lock()
-	defer thinkingCrossVerifyMu.Unlock()
-	if _, ok := thinkingCrossVerifyInflight[nodeID]; ok {
+func beginCrossVerify(nodeID string) bool {
+	crossVerifyMu.Lock()
+	defer crossVerifyMu.Unlock()
+	if _, ok := crossVerifyInflight[nodeID]; ok {
 		return false
 	}
-	thinkingCrossVerifyInflight[nodeID] = struct{}{}
+	crossVerifyInflight[nodeID] = struct{}{}
 	return true
 }
 
-func endThinkingCrossVerify(nodeID string) {
-	thinkingCrossVerifyMu.Lock()
-	defer thinkingCrossVerifyMu.Unlock()
-	delete(thinkingCrossVerifyInflight, nodeID)
+func endCrossVerify(nodeID string) {
+	crossVerifyMu.Lock()
+	defer crossVerifyMu.Unlock()
+	delete(crossVerifyInflight, nodeID)
 }
 
-// maybeScheduleThinkingCrossVerify launches one active quality probe to confirm a
-// passive missing-thinking hit. Returns true if the hard quarantine was deferred.
-func maybeScheduleThinkingCrossVerify(store *stateStore, nodeID, source string, res qualityResult, pol policyConfig) bool {
-	if store == nil || nodeID == "" {
-		return false
-	}
-	if !pol.ThinkingGuard || !pol.ThinkingCrossVerify {
-		return false
-	}
-	// Only defer pure missing-thinking hard hits from non-active sources.
-	// Active probes are already the confirmation sample.
-	if source == "active" || source == "cross_verify" {
-		return false
-	}
-	if res.Classification != "hard" || res.HasThinking {
-		return false
-	}
-	if res.ErrorKind == "probe_unstable" {
-		return false
-	}
-	if !beginThinkingCrossVerify(nodeID) {
-		return true // already pending; still suppress this hard hit
-	}
-	n, ok := store.getNode(nodeID)
-	name := nodeID
-	if ok && n != nil {
-		name = n.Name
+func scheduleCrossVerifyProbe(store *stateStore, nodeID, name, event, reason string, res qualityResult, source string) {
+	if !beginCrossVerify(nodeID) {
+		return
 	}
 	_, _ = store.updateNode(nodeID, func(node *nodeRecord) error {
-		node.LastClassification = "soft"
-		node.LastReason = "缺少 thinking，等待交叉验证探测（可能延迟隔离并增加 Token 消耗）"
+		// Keep soft-ish UI state while waiting for confirmation; do not quarantine yet.
+		if node.LastClassification == "" || node.LastClassification == "hard" {
+			node.LastClassification = "soft"
+		}
+		node.LastReason = reason
 		node.LastSource = source
 		node.LastObservedAt = float64(time.Now().Unix())
 		node.LastOutputTPS = res.TPS
@@ -889,21 +868,27 @@ func maybeScheduleThinkingCrossVerify(store *stateStore, nodeID, source string, 
 		return nil
 	})
 	store.appendEvent(guardEvent{
-		Event:          "thinking_cross_verify_scheduled",
+		Event:          event,
 		NodeID:         nodeID,
 		NodeName:       name,
 		Classification: "soft",
 		OutputTPS:      res.TPS,
-		Reason:         "缺少 thinking_content，触发交叉验证探测（可能延迟隔离并增加 Token 消耗）",
+		Reason:         reason,
 	})
-	store.bumpStat(source, "soft", res.OutputTokens)
 	go func(id string) {
-		defer endThinkingCrossVerify(id)
+		defer endCrossVerify(id)
 		if _, err := runNodeQuality(store, id); err != nil {
-			log.Printf("thinking cross-verify probe failed node=%s err=%v", id, err)
+			log.Printf("cross-verify probe failed node=%s err=%v", id, err)
 		}
 	}(nodeID)
-	return true
+}
+
+// missingThinkingHit is a pure 降智 sample (enough output, no thinking), not transport instability.
+func missingThinkingHit(res qualityResult, pol policyConfig) bool {
+	return pol.ThinkingGuard &&
+		res.Classification == "hard" &&
+		!res.HasThinking &&
+		res.ErrorKind != "probe_unstable"
 }
 
 func applyObservation(store *stateStore, nodeID, source string, res qualityResult) {
@@ -911,17 +896,15 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 	if res.Classification == "error" && res.ErrorKind != "transport_error" {
 		res.Classification = "ignored"
 	}
-	// Missing-thinking hard hit under cross-verify: schedule an active probe and
-	// do not quarantine yet. Active/cross_verify results still apply immediately.
-	if maybeScheduleThinkingCrossVerify(store, nodeID, source, res, pol) {
-		return
-	}
 	now := float64(time.Now().Unix())
 	var (
 		doRestore     bool
 		doQuarantine  bool
 		quarantineWhy string
 		nodeCopy      nodeRecord
+		scheduleCV    bool
+		cvEvent       string
+		cvReason      string
 	)
 	updated, err := store.updateNode(nodeID, func(n *nodeRecord) error {
 		n.LastClassification = res.Classification
@@ -942,37 +925,85 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 		} else if res.Classification == "healthy" {
 			n.LastReason = ""
 		}
-		switch res.Classification {
-		case "healthy":
+
+		isActiveConfirm := source == "active" || source == "cross_verify"
+		needMissing := missingThinkingHit(res, pol)
+
+		switch {
+		case res.Classification == "healthy":
 			n.SoftStrikes = 0
 			n.ErrorStrikes = 0
+			n.ThinkingStrikes = 0
 			if n.DisabledByGuard && (source == "active" || pol.Mode == "passive") {
 				n.DisabledByGuard = false
 				n.QuarantinedUntil = 0
 				doRestore = true
 			}
-		case "soft":
-			n.SoftStrikes++
-			if n.SoftStrikes >= pol.ConsecutiveSoft && !n.DisabledByGuard {
-				doQuarantine = true
-				if res.Error != "" {
-					quarantineWhy = res.Error
+
+		case needMissing:
+			// Missing thinking accumulates on the same egress; healthy/soft/error reset it.
+			n.ThinkingStrikes++
+			n.SoftStrikes = 0
+			threshold := pol.ConsecutiveMissingThinking
+			if threshold <= 0 {
+				threshold = 1
+			}
+			if n.ThinkingStrikes < threshold {
+				n.LastClassification = "soft"
+				n.LastReason = fmt.Sprintf("连续缺少 thinking %d/%d", n.ThinkingStrikes, threshold)
+			} else if !n.DisabledByGuard {
+				// Reached threshold: either cross-verify (passive) or quarantine now.
+				if pol.ThinkingCrossVerify && !isActiveConfirm {
+					scheduleCV = true
+					cvEvent = "thinking_cross_verify_scheduled"
+					cvReason = fmt.Sprintf("连续缺少 thinking %d 次，触发交叉验证探测（可能延迟隔离并增加 Token 消耗）", n.ThinkingStrikes)
+					n.LastClassification = "soft"
+					n.LastReason = cvReason
+					// Keep strikes so a confirming active probe still sees threshold met;
+					// active path quarantines immediately without rescheduling.
 				} else {
-					quarantineWhy = fmt.Sprintf("连续软阈值 Token/s=%.1f", res.TPS)
+					doQuarantine = true
+					if res.Error != "" {
+						quarantineWhy = res.Error
+					} else {
+						quarantineWhy = fmt.Sprintf("连续缺少 thinking_content %d 次（降智）", n.ThinkingStrikes)
+					}
 				}
 			}
-		case "hard":
+
+		case res.Classification == "soft":
+			n.ThinkingStrikes = 0
+			n.SoftStrikes++
+			if n.SoftStrikes >= pol.ConsecutiveSoft && !n.DisabledByGuard {
+				if pol.SoftCrossVerify && !isActiveConfirm {
+					scheduleCV = true
+					cvEvent = "soft_cross_verify_scheduled"
+					cvReason = fmt.Sprintf("连续软阈值 Token/s=%.1f，触发交叉验证探测（可能延迟隔离并增加 Token 消耗）", res.TPS)
+					n.LastReason = cvReason
+				} else {
+					doQuarantine = true
+					if res.Error != "" {
+						quarantineWhy = res.Error
+					} else {
+						quarantineWhy = fmt.Sprintf("连续软阈值 Token/s=%.1f", res.TPS)
+					}
+				}
+			}
+
+		case res.Classification == "hard":
+			// Hard for non-missing-thinking reasons (e.g. probe_unstable, TPS hard with thinking).
+			n.ThinkingStrikes = 0
 			if !n.DisabledByGuard {
 				doQuarantine = true
 				if res.Error != "" {
 					quarantineWhy = res.Error
-				} else if pol.ThinkingGuard && !res.HasThinking {
-					quarantineWhy = "响应缺少 thinking_content（降智）"
 				} else {
 					quarantineWhy = fmt.Sprintf("硬阈值 Token/s=%.1f", res.TPS)
 				}
 			}
-		case "error":
+
+		case res.Classification == "error":
+			n.ThinkingStrikes = 0
 			n.ErrorStrikes++
 			if n.ErrorStrikes >= pol.ConsecutiveErrors && !n.DisabledByGuard {
 				doQuarantine = true
@@ -997,6 +1028,12 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 		store.bumpAction("restored")
 		store.appendEvent(guardEvent{Event: "node_restored", NodeID: nodeCopy.ID, NodeName: nodeCopy.Name, Classification: "healthy", OutputTPS: res.TPS})
 		go func(nn nodeRecord) { _ = enableAuthsOnNode(&nn) }(nodeCopy)
+	}
+	if scheduleCV {
+		// Stat as soft while waiting; active confirmation will record the final class.
+		store.bumpStat(source, "soft", res.OutputTokens)
+		scheduleCrossVerifyProbe(store, nodeCopy.ID, nodeCopy.Name, cvEvent, cvReason, res, source)
+		return
 	}
 	if doQuarantine {
 		quarantineNode(store, nodeCopy.ID, quarantineWhy, res.TPS, res.Classification)

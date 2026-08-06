@@ -175,55 +175,157 @@ func TestProbeUnstableErrDetection(t *testing.T) {
 }
 
 
-func TestThinkingCrossVerifyPolicyRequiresGuard(t *testing.T) {
+func TestDefaultPolicyThinkingFeaturesOn(t *testing.T) {
 	pol := defaultPolicy()
 	if !pol.ThinkingGuard {
 		t.Fatal("default ThinkingGuard should be on")
 	}
-	if pol.ThinkingCrossVerify {
-		t.Fatal("default ThinkingCrossVerify should be off")
+	if !pol.ThinkingCrossVerify {
+		t.Fatal("default ThinkingCrossVerify should be on")
 	}
-	// classify still hard on missing thinking when guard on (cross-verify is apply-time only)
+	if pol.SoftCrossVerify {
+		t.Fatal("default SoftCrossVerify should be off")
+	}
+	if pol.ConsecutiveMissingThinking != 1 {
+		t.Fatalf("default consecutive missing thinking=%d, want 1", pol.ConsecutiveMissingThinking)
+	}
 	if got := classifyQuality(100, 64, false, pol); got != "hard" {
 		t.Fatalf("missing thinking with guard=%q, want hard", got)
 	}
-	pol.ThinkingCrossVerify = true
-	if got := classifyQuality(100, 64, false, pol); got != "hard" {
-		t.Fatalf("cross-verify must not change classifyQuality itself: %q", got)
+}
+
+func TestNormalizePolicyFillsAbsentBoolDefaults(t *testing.T) {
+	// Simulate old state.json that never had the new keys.
+	p := policyConfig{HardTPS: 1000, SoftTPS: 500}
+	normalizePolicy(&p, map[string]any{
+		"hard_tps": 1000,
+		"soft_tps": 500,
+	})
+	if !p.ThinkingGuard {
+		t.Fatal("absent thinking_guard must default on")
+	}
+	if !p.ThinkingCrossVerify {
+		t.Fatal("absent thinking_cross_verify must default on")
+	}
+	if p.SoftCrossVerify {
+		t.Fatal("absent soft_cross_verify must default off")
+	}
+	if p.ConsecutiveMissingThinking != 1 {
+		t.Fatalf("absent consecutive_missing_thinking=%d, want 1", p.ConsecutiveMissingThinking)
+	}
+	// Explicit false must be preserved.
+	p2 := policyConfig{HardTPS: 1000, SoftTPS: 500, ThinkingGuard: false}
+	normalizePolicy(&p2, map[string]any{
+		"hard_tps":       1000,
+		"soft_tps":       500,
+		"thinking_guard": false,
+	})
+	if p2.ThinkingGuard {
+		t.Fatal("explicit thinking_guard=false must stay false")
+	}
+	if p2.ThinkingCrossVerify {
+		t.Fatal("thinking cross-verify must be forced off when guard is off")
 	}
 }
 
-func TestMaybeScheduleThinkingCrossVerifyGates(t *testing.T) {
+func TestMissingThinkingRequiresConsecutiveStrikes(t *testing.T) {
 	store := newStateStore(filepath.Join(t.TempDir(), "state.json"))
 	node, err := store.createNode("n1", "http://127.0.0.1:7951", true, false, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Keep min_healthy satisfiable so quarantine is not suppressed.
+	if _, err := store.createNode("n2", "http://127.0.0.1:7952", true, false, 10); err != nil {
+		t.Fatal(err)
+	}
 	pol := store.policy()
 	pol.ThinkingGuard = true
-	pol.ThinkingCrossVerify = true
+	pol.ThinkingCrossVerify = false
+	pol.ConsecutiveMissingThinking = 2
+	pol.MinHealthyNodes = 1
 	if err := store.updatePolicy(pol); err != nil {
 		t.Fatal(err)
 	}
 	res := qualityResult{Classification: "hard", HasThinking: false, OutputTokens: 64, TPS: 10}
-	if !maybeScheduleThinkingCrossVerify(store, node.ID, "passive", res, store.policy()) {
-		t.Fatal("passive missing-thinking should schedule cross-verify")
+	applyObservation(store, node.ID, "passive", res)
+	got, _ := store.getNode(node.ID)
+	if got.DisabledByGuard {
+		t.Fatal("first missing-thinking must not quarantine when threshold=2")
 	}
-	// second call should suppress without launching another (inflight)
-	if !maybeScheduleThinkingCrossVerify(store, node.ID, "passive", res, store.policy()) {
-		t.Fatal("inflight should still suppress hard")
+	if got.ThinkingStrikes != 1 {
+		t.Fatalf("thinking strikes=%d, want 1", got.ThinkingStrikes)
 	}
-	endThinkingCrossVerify(node.ID)
-	// active source must not defer
-	if maybeScheduleThinkingCrossVerify(store, node.ID, "active", res, store.policy()) {
-		t.Fatal("active probe must not defer quarantine")
+	applyObservation(store, node.ID, "passive", res)
+	got, _ = store.getNode(node.ID)
+	if !got.DisabledByGuard {
+		t.Fatal("second missing-thinking should quarantine when threshold=2 and cross-verify off")
 	}
-	// disabled option
-	pol.ThinkingCrossVerify = false
-	_ = store.updatePolicy(pol)
-	if maybeScheduleThinkingCrossVerify(store, node.ID, "passive", res, store.policy()) {
-		t.Fatal("disabled cross-verify must not schedule")
+}
+
+func TestThinkingCrossVerifySchedulesInsteadOfQuarantine(t *testing.T) {
+	store := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	node, err := store.createNode("n1", "http://127.0.0.1:7951", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
 	}
+	// Add a second healthy node so quarantine is not suppressed by min_healthy.
+	if _, err := store.createNode("n2", "http://127.0.0.1:7952", true, false, 10); err != nil {
+		t.Fatal(err)
+	}
+	pol := store.policy()
+	pol.ThinkingGuard = true
+	pol.ThinkingCrossVerify = true
+	pol.ConsecutiveMissingThinking = 1
+	pol.MinHealthyNodes = 1
+	if err := store.updatePolicy(pol); err != nil {
+		t.Fatal(err)
+	}
+	res := qualityResult{Classification: "hard", HasThinking: false, OutputTokens: 64, TPS: 10}
+	applyObservation(store, node.ID, "passive", res)
+	got, _ := store.getNode(node.ID)
+	if got.DisabledByGuard {
+		t.Fatal("passive missing-thinking with cross-verify must not quarantine immediately")
+	}
+	if got.ThinkingStrikes < 1 {
+		t.Fatal("thinking strikes should accumulate")
+	}
+	// Active confirmation quarantines without re-scheduling.
+	applyObservation(store, node.ID, "active", res)
+	got, _ = store.getNode(node.ID)
+	if !got.DisabledByGuard {
+		t.Fatal("active missing-thinking confirmation should quarantine")
+	}
+	endCrossVerify(node.ID)
+}
+
+func TestSoftCrossVerifySchedulesInsteadOfQuarantine(t *testing.T) {
+	store := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	node, err := store.createNode("n1", "http://127.0.0.1:7951", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.createNode("n2", "http://127.0.0.1:7952", true, false, 10); err != nil {
+		t.Fatal(err)
+	}
+	pol := store.policy()
+	pol.SoftCrossVerify = true
+	pol.ConsecutiveSoft = 1
+	pol.MinHealthyNodes = 1
+	if err := store.updatePolicy(pol); err != nil {
+		t.Fatal(err)
+	}
+	res := qualityResult{Classification: "soft", HasThinking: true, OutputTokens: 64, TPS: 600}
+	applyObservation(store, node.ID, "passive", res)
+	got, _ := store.getNode(node.ID)
+	if got.DisabledByGuard {
+		t.Fatal("soft cross-verify must defer quarantine")
+	}
+	applyObservation(store, node.ID, "active", res)
+	got, _ = store.getNode(node.ID)
+	if !got.DisabledByGuard {
+		t.Fatal("active soft confirmation should quarantine")
+	}
+	endCrossVerify(node.ID)
 }
 
 func TestManualDisabledAuthIsNotRestored(t *testing.T) {

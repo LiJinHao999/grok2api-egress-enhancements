@@ -25,14 +25,20 @@ type policyConfig struct {
 	MinGenerationMs      int64   `json:"min_generation_ms"`
 	MinOutputTokens      int64   `json:"min_output_tokens"`
 	Model                string  `json:"model"`
-	DisableAuthOnHard bool `json:"disable_auth_on_hard"`
+	DisableAuthOnHard    bool    `json:"disable_auth_on_hard"`
 	// ThinkingGuard enables missing-thinking 降智 detection. When false, quality
 	// classification falls back to the original soft/hard Token/s thresholds only.
+	// Absent in old state.json → default true (see normalizePolicy).
 	ThinkingGuard bool `json:"thinking_guard"`
-	// ThinkingCrossVerify, when ThinkingGuard is on, defers missing-thinking hard
-	// quarantine until a follow-up active quality probe also lacks thinking.
-	// May delay isolation and spend extra probe tokens.
-	ThinkingCrossVerify  bool `json:"thinking_cross_verify"`
+	// ConsecutiveMissingThinking is how many consecutive missing-thinking samples
+	// on the same egress are required before isolation / cross-verify. Default 1.
+	ConsecutiveMissingThinking int `json:"consecutive_missing_thinking"`
+	// ThinkingCrossVerify defers missing-thinking isolation until an active probe
+	// also lacks thinking. Default true. May delay isolation and spend probe tokens.
+	ThinkingCrossVerify bool `json:"thinking_cross_verify"`
+	// SoftCrossVerify defers soft-TPS isolation until an active probe confirms the
+	// anomaly. Default false. May delay isolation and spend probe tokens.
+	SoftCrossVerify      bool `json:"soft_cross_verify"`
 	MaxOutputTokensProbe int  `json:"max_output_tokens"`
 }
 
@@ -52,6 +58,7 @@ type nodeRecord struct {
 	QuarantinedUntil     float64   `json:"quarantined_until,omitempty"`
 	ErrorStrikes         int       `json:"error_strikes"`
 	SoftStrikes          int       `json:"soft_strikes"`
+	ThinkingStrikes      int       `json:"thinking_strikes"`
 	LastClassification   string    `json:"last_classification,omitempty"`
 	LastOutputTPS        float64   `json:"last_output_tps,omitempty"`
 	LastFirstTokenMs     int64     `json:"last_first_token_ms,omitempty"`
@@ -130,22 +137,107 @@ type stateStore struct {
 
 func defaultPolicy() policyConfig {
 	return policyConfig{
-		Mode:                 "hybrid",
-		ActiveIntervalSec:    1800,
-		PassivePollSec:       5,
-		QuarantineSec:        120,
-		SoftTPS:              500,
-		HardTPS:              1000,
-		ConsecutiveSoft:      2,
-		ConsecutiveErrors:    2,
-		MinHealthyNodes:      1,
-		MinGenerationMs:      1000,
-		MinOutputTokens:      32,
-		Model:                "grok-4.5",
-		DisableAuthOnHard:    true,
-		ThinkingGuard:        true,
-		ThinkingCrossVerify:  false,
-		MaxOutputTokensProbe: 384,
+		Mode:                       "hybrid",
+		ActiveIntervalSec:          1800,
+		PassivePollSec:             5,
+		QuarantineSec:              120,
+		SoftTPS:                    500,
+		HardTPS:                    1000,
+		ConsecutiveSoft:            2,
+		ConsecutiveErrors:          2,
+		MinHealthyNodes:            1,
+		MinGenerationMs:            1000,
+		MinOutputTokens:            32,
+		Model:                      "grok-4.5",
+		DisableAuthOnHard:          true,
+		ThinkingGuard:              true,
+		ConsecutiveMissingThinking: 1,
+		ThinkingCrossVerify:        true,
+		SoftCrossVerify:            false,
+		MaxOutputTokensProbe:       384,
+	}
+}
+
+// normalizePolicy fills zero / missing fields with defaults.
+// Bool feature flags that default to true cannot be distinguished from explicit
+// false after a plain Unmarshal; load paths pass the raw policy object so absent
+// keys become defaults instead of false.
+func normalizePolicy(p *policyConfig, rawPolicy map[string]any) {
+	if p == nil {
+		return
+	}
+	def := defaultPolicy()
+	if p.Mode == "" {
+		p.Mode = def.Mode
+	}
+	if p.ActiveIntervalSec <= 0 {
+		p.ActiveIntervalSec = def.ActiveIntervalSec
+	}
+	if p.PassivePollSec <= 0 {
+		p.PassivePollSec = def.PassivePollSec
+	}
+	if p.QuarantineSec <= 0 {
+		p.QuarantineSec = def.QuarantineSec
+	}
+	if p.SoftTPS <= 0 {
+		p.SoftTPS = def.SoftTPS
+	}
+	if p.HardTPS <= 0 {
+		p.HardTPS = def.HardTPS
+	}
+	if p.ConsecutiveSoft <= 0 {
+		p.ConsecutiveSoft = def.ConsecutiveSoft
+	}
+	if p.ConsecutiveErrors <= 0 {
+		p.ConsecutiveErrors = def.ConsecutiveErrors
+	}
+	if p.MinHealthyNodes <= 0 {
+		p.MinHealthyNodes = def.MinHealthyNodes
+	}
+	if p.MinGenerationMs <= 0 {
+		p.MinGenerationMs = def.MinGenerationMs
+	}
+	if p.MinOutputTokens <= 0 {
+		p.MinOutputTokens = def.MinOutputTokens
+	}
+	if p.Model == "" {
+		p.Model = def.Model
+	}
+	if p.MaxOutputTokensProbe <= 0 {
+		p.MaxOutputTokensProbe = def.MaxOutputTokensProbe
+	}
+	if p.ConsecutiveMissingThinking <= 0 {
+		p.ConsecutiveMissingThinking = def.ConsecutiveMissingThinking
+	}
+	if rawPolicy != nil {
+		if _, ok := rawPolicy["thinking_guard"]; !ok {
+			if _, ok2 := rawPolicy["thinkingGuard"]; !ok2 {
+				p.ThinkingGuard = def.ThinkingGuard
+			}
+		}
+		if _, ok := rawPolicy["thinking_cross_verify"]; !ok {
+			if _, ok2 := rawPolicy["thinkingCrossVerify"]; !ok2 {
+				p.ThinkingCrossVerify = def.ThinkingCrossVerify
+			}
+		}
+		if _, ok := rawPolicy["soft_cross_verify"]; !ok {
+			if _, ok2 := rawPolicy["softCrossVerify"]; !ok2 {
+				p.SoftCrossVerify = def.SoftCrossVerify
+			}
+		}
+		if _, ok := rawPolicy["disable_auth_on_hard"]; !ok {
+			if _, ok2 := rawPolicy["disableAuthOnHard"]; !ok2 {
+				p.DisableAuthOnHard = def.DisableAuthOnHard
+			}
+		}
+		if _, ok := rawPolicy["consecutive_missing_thinking"]; !ok {
+			if _, ok2 := rawPolicy["consecutiveMissingThinking"]; !ok2 {
+				p.ConsecutiveMissingThinking = def.ConsecutiveMissingThinking
+			}
+		}
+	}
+	if !p.ThinkingGuard {
+		p.ThinkingCrossVerify = false
 	}
 }
 
@@ -183,30 +275,19 @@ func (s *stateStore) load() error {
 	if data.NextID <= 0 {
 		data.NextID = 1
 	}
+	// Preserve raw policy keys so newly introduced bool defaults stay ON when an
+	// older state.json omitted them (plain bool zero value would look like false).
+	var rawRoot map[string]any
+	_ = json.Unmarshal(raw, &rawRoot)
+	var rawPolicy map[string]any
+	if rp, ok := rawRoot["policy"].(map[string]any); ok {
+		rawPolicy = rp
+	}
 	if data.Policy.HardTPS <= 0 {
 		data.Policy = defaultPolicy()
+		rawPolicy = nil
 	}
-	if data.Policy.MinGenerationMs <= 0 {
-		data.Policy.MinGenerationMs = 1000
-	}
-	if data.Policy.MinOutputTokens <= 0 {
-		data.Policy.MinOutputTokens = 32
-	}
-	if data.Policy.MaxOutputTokensProbe <= 0 {
-		data.Policy.MaxOutputTokensProbe = 384
-	}
-	if data.Policy.Mode == "" {
-		data.Policy.Mode = "hybrid"
-	}
-	if data.Policy.ActiveIntervalSec <= 0 {
-		data.Policy.ActiveIntervalSec = 1800
-	}
-	if data.Policy.PassivePollSec <= 0 {
-		data.Policy.PassivePollSec = 5
-	}
-	if data.Policy.QuarantineSec <= 0 {
-		data.Policy.QuarantineSec = 120
-	}
+	normalizePolicy(&data.Policy, rawPolicy)
 	// hydrate private proxy field
 	for _, n := range data.Nodes {
 		n.ProxyURL = n.ProxyURLStored
@@ -326,6 +407,12 @@ func (s *stateStore) updatePolicy(p policyConfig) error {
 	if p.ConsecutiveErrors <= 0 {
 		p.ConsecutiveErrors = 2
 	}
+	if p.ConsecutiveMissingThinking <= 0 {
+		p.ConsecutiveMissingThinking = 1
+	}
+	if p.ConsecutiveMissingThinking > 50 {
+		return fmt.Errorf("连续缺 thinking 次数需在 1 到 50 之间")
+	}
 	if p.QuarantineSec <= 0 {
 		p.QuarantineSec = 120
 	}
@@ -349,6 +436,9 @@ func (s *stateStore) updatePolicy(p policyConfig) error {
 	}
 	if p.MaxOutputTokensProbe < 16 || p.MaxOutputTokensProbe > 4096 {
 		return fmt.Errorf("主动探测最大输出需在 16 到 4096 Token 之间")
+	}
+	if !p.ThinkingGuard {
+		p.ThinkingCrossVerify = false
 	}
 	s.data.Policy = p
 	return s.persistLocked()
@@ -634,6 +724,7 @@ func publicNode(n *nodeRecord) map[string]any {
 		"quarantined_until":    n.QuarantinedUntil,
 		"error_strikes":        n.ErrorStrikes,
 		"soft_strikes":         n.SoftStrikes,
+		"thinking_strikes":     n.ThinkingStrikes,
 		"last_classification":  n.LastClassification,
 		"last_output_tps":      n.LastOutputTPS,
 		"last_first_token_ms":  n.LastFirstTokenMs,

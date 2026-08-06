@@ -452,11 +452,18 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 			if v, ok := raw["thinkingGuard"].(bool); ok {
 				p.ThinkingGuard = v
 			}
+			p.ConsecutiveMissingThinking = intPick(raw, p.ConsecutiveMissingThinking, "consecutive_missing_thinking", "consecutiveMissingThinking")
 			if v, ok := raw["thinking_cross_verify"].(bool); ok {
 				p.ThinkingCrossVerify = v
 			}
 			if v, ok := raw["thinkingCrossVerify"].(bool); ok {
 				p.ThinkingCrossVerify = v
+			}
+			if v, ok := raw["soft_cross_verify"].(bool); ok {
+				p.SoftCrossVerify = v
+			}
+			if v, ok := raw["softCrossVerify"].(bool); ok {
+				p.SoftCrossVerify = v
 			}
 			// Cross-verify only makes sense with thinking guard.
 			if !p.ThinkingGuard {
@@ -719,6 +726,7 @@ func buildStatus() map[string]any {
 			"quarantined_until":   n.QuarantinedUntil,
 			"error_strikes":       n.ErrorStrikes,
 			"soft_strikes":        n.SoftStrikes,
+				"thinking_strikes":    n.ThinkingStrikes,
 			"last_classification": n.LastClassification,
 			"last_output_tps":     n.LastOutputTPS,
 			"last_first_token_ms": n.LastFirstTokenMs,
