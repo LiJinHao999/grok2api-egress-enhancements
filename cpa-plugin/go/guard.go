@@ -1205,29 +1205,32 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 		store.bumpStat(source, res.Classification, res.OutputTokens)
 		return
 	}
-	// Per-account 降智 stats:
+	// Per-account 降智 stats (independent of node isolation / cross-verify):
 	// - sample: real generation outcomes (healthy/soft/hard), not errors/ignored
-	// - degraded: final quality-degrade hits (missing-thinking hard, hard quarantine,
-	//   or soft that reached isolation). Soft recheck queue alone is not yet 降智.
+	// - degraded: this observation itself is a quality-degrade hit for THIS auth
+	// Passive missing-thinking immediately counts as degrade for the audited account.
+	// Cross-verify probes use their own AuthID and are recorded separately — do NOT
+	// merge passive-trigger account with the recheck account, and do not wait for
+	// cross-verify confirmation before attributing the passive hit.
 	if res.AuthID != "" && res.Classification != "error" && res.Classification != "ignored" && res.Classification != "unknown" {
 		degraded := false
 		reason := res.Error
 		switch res.Classification {
 		case "hard":
-			// Cross-verify schedule must NOT mark degrade yet (avoid +2).
-			if queueThinking && !doQuarantine {
-				degraded = false
-				if reason == "" {
+			// Account stats follow the observation itself. Queuing a cross-verify
+			// only defers node isolation; it must not suppress this auth's degrade.
+			degraded = true
+			if reason == "" {
+				if res.ErrorKind == "missing_thinking" || !res.HasThinking {
+					reason = missingThinkingReason
+				} else if res.ErrorKind == "probe_timeout" {
+					reason = probeTimeoutReason
+				} else if res.ErrorKind == "probe_unstable" {
+					reason = probeUnstableReason
+				} else if nodeCopy.LastReason != "" {
 					reason = nodeCopy.LastReason
-				}
-			} else {
-				degraded = true
-				if reason == "" {
-					if res.ErrorKind == "missing_thinking" || !res.HasThinking {
-						reason = missingThinkingReason
-					} else {
-						reason = fmt.Sprintf("硬阈值 Token/s=%.1f", res.TPS)
-					}
+				} else {
+					reason = fmt.Sprintf("硬阈值 Token/s=%.1f", res.TPS)
 				}
 			}
 		case "soft":
@@ -1239,6 +1242,9 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 					reason = fmt.Sprintf("连续软阈值 Token/s=%.1f", res.TPS)
 				}
 			}
+		case "healthy":
+			// Explicit healthy (e.g. cross-verify found thinking): sample only.
+			degraded = false
 		}
 		store.recordAuthObservation(res.AuthID, res.AuthLabel, source, nodeCopy.ID, nodeCopy.Name, res.Classification, reason, res.TPS, degraded)
 	}

@@ -147,7 +147,9 @@ type statistics struct {
 	Actions   actionStats `json:"actions"`
 }
 
-// authDegradeRecord tracks per-account 降智 hits (final quality-degrade events).
+// authDegradeRecord tracks per-account 降智 hits.
+// Each observation is attributed to the AuthID that produced it (passive audit
+// account and cross-verify probe account are never merged).
 type authDegradeRecord struct {
 	AuthID        string  `json:"auth_id"`
 	Label         string  `json:"label,omitempty"`

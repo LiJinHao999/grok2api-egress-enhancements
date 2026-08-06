@@ -473,26 +473,70 @@ func TestApplyObservationRecordsAuthStats(t *testing.T) {
 	if _, err := store.createNode("n2", "http://127.0.0.1:7952", true, false, 10); err != nil {
 		t.Fatal(err)
 	}
-	res := qualityResult{
+	// Passive missing-thinking immediately counts as degrade for the audited account,
+	// even when ThinkingCrossVerify queues a recheck (node isolation is deferred).
+	passive := qualityResult{
 		Classification: "hard",
 		HasThinking:    false,
 		OutputTokens:   64,
 		TPS:            10,
-		AuthID:         "user@x",
-		AuthLabel:      "user@x",
+		AuthID:         "heidi@x",
+		AuthLabel:      "heidi@x",
 		Error:          missingThinkingReason,
 		ErrorKind:      "missing_thinking",
 	}
-	// Passive missing-thinking with ThinkingCrossVerify default ON only samples.
-	applyObservation(store, node.ID, "passive", res)
+	applyObservation(store, node.ID, "passive", passive)
 	items := store.listAuthDegradeStats()
-	if len(items) != 1 || items[0].SampleCount != 1 || items[0].DegradedCount != 0 {
-		t.Fatalf("pre-cross-verify should sample only: %+v", items[0])
+	if len(items) != 1 || items[0].AuthID != "heidi@x" || items[0].SampleCount != 1 || items[0].DegradedCount != 1 {
+		t.Fatalf("passive missing-thinking should degrade that account immediately: %+v", items)
 	}
-	applyObservation(store, node.ID, "active", res)
+
+	// Cross-verify uses a different account that is healthy: record that account
+	// as a normal sample only — do not merge into the passive account.
+	crossOK := qualityResult{
+		Classification: "healthy",
+		HasThinking:    true,
+		OutputTokens:   80,
+		TPS:            20,
+		AuthID:         "probe@x",
+		AuthLabel:      "probe@x",
+	}
+	applyObservation(store, node.ID, "soft-recheck", crossOK)
 	items = store.listAuthDegradeStats()
-	if len(items) != 1 || items[0].DegradedCount != 1 || items[0].SampleCount != 2 {
-		t.Fatalf("after confirm want degraded=1 samples=2 got %+v", items[0])
+	byID := map[string]*authDegradeRecord{}
+	for _, it := range items {
+		byID[it.AuthID] = it
+	}
+	if heidi := byID["heidi@x"]; heidi == nil || heidi.DegradedCount != 1 || heidi.SampleCount != 1 {
+		t.Fatalf("passive account stats must stay independent: %+v", heidi)
+	}
+	if probe := byID["probe@x"]; probe == nil || probe.DegradedCount != 0 || probe.SampleCount != 1 {
+		t.Fatalf("cross-verify healthy account should sample only: %+v", probe)
+	}
+
+	// Cross-verify with a third account that is also missing thinking: that
+	// probe account is degraded on its own, without touching heidi@x.
+	crossBad := qualityResult{
+		Classification: "hard",
+		HasThinking:    false,
+		OutputTokens:   40,
+		TPS:            8,
+		AuthID:         "other@x",
+		AuthLabel:      "other@x",
+		Error:          missingThinkingReason,
+		ErrorKind:      "missing_thinking",
+	}
+	applyObservation(store, node.ID, "active", crossBad)
+	items = store.listAuthDegradeStats()
+	byID = map[string]*authDegradeRecord{}
+	for _, it := range items {
+		byID[it.AuthID] = it
+	}
+	if heidi := byID["heidi@x"]; heidi == nil || heidi.DegradedCount != 1 || heidi.SampleCount != 1 {
+		t.Fatalf("heidi must remain 1/1 after other accounts: %+v", heidi)
+	}
+	if other := byID["other@x"]; other == nil || other.DegradedCount != 1 || other.SampleCount != 1 {
+		t.Fatalf("cross-verify missing-thinking account should degrade itself: %+v", other)
 	}
 }
 
