@@ -25,11 +25,15 @@ type policyConfig struct {
 	MinGenerationMs      int64   `json:"min_generation_ms"`
 	MinOutputTokens      int64   `json:"min_output_tokens"`
 	Model                string  `json:"model"`
-	DisableAuthOnHard    bool    `json:"disable_auth_on_hard"`
+	DisableAuthOnHard bool `json:"disable_auth_on_hard"`
 	// ThinkingGuard enables missing-thinking 降智 detection. When false, quality
 	// classification falls back to the original soft/hard Token/s thresholds only.
-	ThinkingGuard        bool    `json:"thinking_guard"`
-	MaxOutputTokensProbe int     `json:"max_output_tokens"`
+	ThinkingGuard bool `json:"thinking_guard"`
+	// ThinkingCrossVerify, when ThinkingGuard is on, defers missing-thinking hard
+	// quarantine until a follow-up active quality probe also lacks thinking.
+	// May delay isolation and spend extra probe tokens.
+	ThinkingCrossVerify  bool `json:"thinking_cross_verify"`
+	MaxOutputTokensProbe int  `json:"max_output_tokens"`
 }
 
 type nodeRecord struct {
@@ -140,6 +144,7 @@ func defaultPolicy() policyConfig {
 		Model:                "grok-4.5",
 		DisableAuthOnHard:    true,
 		ThinkingGuard:        true,
+		ThinkingCrossVerify:  false,
 		MaxOutputTokensProbe: 384,
 	}
 }

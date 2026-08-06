@@ -174,6 +174,58 @@ func TestProbeUnstableErrDetection(t *testing.T) {
 	}
 }
 
+
+func TestThinkingCrossVerifyPolicyRequiresGuard(t *testing.T) {
+	pol := defaultPolicy()
+	if !pol.ThinkingGuard {
+		t.Fatal("default ThinkingGuard should be on")
+	}
+	if pol.ThinkingCrossVerify {
+		t.Fatal("default ThinkingCrossVerify should be off")
+	}
+	// classify still hard on missing thinking when guard on (cross-verify is apply-time only)
+	if got := classifyQuality(100, 64, false, pol); got != "hard" {
+		t.Fatalf("missing thinking with guard=%q, want hard", got)
+	}
+	pol.ThinkingCrossVerify = true
+	if got := classifyQuality(100, 64, false, pol); got != "hard" {
+		t.Fatalf("cross-verify must not change classifyQuality itself: %q", got)
+	}
+}
+
+func TestMaybeScheduleThinkingCrossVerifyGates(t *testing.T) {
+	store := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	node, err := store.createNode("n1", "http://127.0.0.1:7951", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pol := store.policy()
+	pol.ThinkingGuard = true
+	pol.ThinkingCrossVerify = true
+	if err := store.updatePolicy(pol); err != nil {
+		t.Fatal(err)
+	}
+	res := qualityResult{Classification: "hard", HasThinking: false, OutputTokens: 64, TPS: 10}
+	if !maybeScheduleThinkingCrossVerify(store, node.ID, "passive", res, store.policy()) {
+		t.Fatal("passive missing-thinking should schedule cross-verify")
+	}
+	// second call should suppress without launching another (inflight)
+	if !maybeScheduleThinkingCrossVerify(store, node.ID, "passive", res, store.policy()) {
+		t.Fatal("inflight should still suppress hard")
+	}
+	endThinkingCrossVerify(node.ID)
+	// active source must not defer
+	if maybeScheduleThinkingCrossVerify(store, node.ID, "active", res, store.policy()) {
+		t.Fatal("active probe must not defer quarantine")
+	}
+	// disabled option
+	pol.ThinkingCrossVerify = false
+	_ = store.updatePolicy(pol)
+	if maybeScheduleThinkingCrossVerify(store, node.ID, "passive", res, store.policy()) {
+		t.Fatal("disabled cross-verify must not schedule")
+	}
+}
+
 func TestManualDisabledAuthIsNotRestored(t *testing.T) {
 	if isGuardDisabledAuth(authFile{Disabled: true, Raw: map[string]any{"disabled_reason": "operator: maintenance"}}) {
 		t.Fatal("operator-disabled auth must not be treated as guard-managed")

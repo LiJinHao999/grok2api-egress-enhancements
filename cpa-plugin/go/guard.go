@@ -826,10 +826,95 @@ func anyInt(v any) int64 {
 	}
 }
 
+// thinkingCrossVerifyInflight prevents stacked follow-up probes for the same node
+// while a missing-thinking cross-verify is already running.
+var (
+	thinkingCrossVerifyMu       sync.Mutex
+	thinkingCrossVerifyInflight = map[string]struct{}{}
+)
+
+func beginThinkingCrossVerify(nodeID string) bool {
+	thinkingCrossVerifyMu.Lock()
+	defer thinkingCrossVerifyMu.Unlock()
+	if _, ok := thinkingCrossVerifyInflight[nodeID]; ok {
+		return false
+	}
+	thinkingCrossVerifyInflight[nodeID] = struct{}{}
+	return true
+}
+
+func endThinkingCrossVerify(nodeID string) {
+	thinkingCrossVerifyMu.Lock()
+	defer thinkingCrossVerifyMu.Unlock()
+	delete(thinkingCrossVerifyInflight, nodeID)
+}
+
+// maybeScheduleThinkingCrossVerify launches one active quality probe to confirm a
+// passive missing-thinking hit. Returns true if the hard quarantine was deferred.
+func maybeScheduleThinkingCrossVerify(store *stateStore, nodeID, source string, res qualityResult, pol policyConfig) bool {
+	if store == nil || nodeID == "" {
+		return false
+	}
+	if !pol.ThinkingGuard || !pol.ThinkingCrossVerify {
+		return false
+	}
+	// Only defer pure missing-thinking hard hits from non-active sources.
+	// Active probes are already the confirmation sample.
+	if source == "active" || source == "cross_verify" {
+		return false
+	}
+	if res.Classification != "hard" || res.HasThinking {
+		return false
+	}
+	if res.ErrorKind == "probe_unstable" {
+		return false
+	}
+	if !beginThinkingCrossVerify(nodeID) {
+		return true // already pending; still suppress this hard hit
+	}
+	n, ok := store.getNode(nodeID)
+	name := nodeID
+	if ok && n != nil {
+		name = n.Name
+	}
+	_, _ = store.updateNode(nodeID, func(node *nodeRecord) error {
+		node.LastClassification = "soft"
+		node.LastReason = "缺少 thinking，等待交叉验证探测（可能延迟隔离并增加 Token 消耗）"
+		node.LastSource = source
+		node.LastObservedAt = float64(time.Now().Unix())
+		node.LastOutputTPS = res.TPS
+		node.LastOutputTokens = res.OutputTokens
+		node.LastDurationMs = res.DurationMs
+		node.LastFirstTokenMs = res.FirstTokenMs
+		return nil
+	})
+	store.appendEvent(guardEvent{
+		Event:          "thinking_cross_verify_scheduled",
+		NodeID:         nodeID,
+		NodeName:       name,
+		Classification: "soft",
+		OutputTPS:      res.TPS,
+		Reason:         "缺少 thinking_content，触发交叉验证探测（可能延迟隔离并增加 Token 消耗）",
+	})
+	store.bumpStat(source, "soft", res.OutputTokens)
+	go func(id string) {
+		defer endThinkingCrossVerify(id)
+		if _, err := runNodeQuality(store, id); err != nil {
+			log.Printf("thinking cross-verify probe failed node=%s err=%v", id, err)
+		}
+	}(nodeID)
+	return true
+}
+
 func applyObservation(store *stateStore, nodeID, source string, res qualityResult) {
 	pol := store.policy()
 	if res.Classification == "error" && res.ErrorKind != "transport_error" {
 		res.Classification = "ignored"
+	}
+	// Missing-thinking hard hit under cross-verify: schedule an active probe and
+	// do not quarantine yet. Active/cross_verify results still apply immediately.
+	if maybeScheduleThinkingCrossVerify(store, nodeID, source, res, pol) {
+		return
 	}
 	now := float64(time.Now().Unix())
 	var (

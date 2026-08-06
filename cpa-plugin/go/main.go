@@ -452,6 +452,16 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 			if v, ok := raw["thinkingGuard"].(bool); ok {
 				p.ThinkingGuard = v
 			}
+			if v, ok := raw["thinking_cross_verify"].(bool); ok {
+				p.ThinkingCrossVerify = v
+			}
+			if v, ok := raw["thinkingCrossVerify"].(bool); ok {
+				p.ThinkingCrossVerify = v
+			}
+			// Cross-verify only makes sense with thinking guard.
+			if !p.ThinkingGuard {
+				p.ThinkingCrossVerify = false
+			}
 			if err := store.updatePolicy(p); err != nil {
 				return managementJSON(http.StatusBadRequest, errMsg("invalidPolicy", err.Error()))
 			}
