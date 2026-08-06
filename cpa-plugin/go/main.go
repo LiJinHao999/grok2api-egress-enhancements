@@ -75,7 +75,7 @@ import (
 
 const (
 	pluginName          = "grok2api-egress"
-	pluginVersion       = "1.1.18"
+	pluginVersion       = "1.1.22"
 	resourcePath        = "/status"
 	managementAPIPath   = "/v0/management/grok2api-egress/api"
 	resourceContentType = "text/html; charset=utf-8"
@@ -87,6 +87,12 @@ var pageTemplate string
 
 //go:embed tokens.css
 var tokenCSS string
+
+//go:embed accounts-panel.js
+var accountsPanelJS string
+
+//go:embed accounts-panel.css
+var accountsPanelCSS string
 
 type envelope struct {
 	OK     bool            `json:"ok"`
@@ -386,7 +392,7 @@ func handleManagement(request []byte) ([]byte, error) {
 		return okEnvelope(managementResponse{
 			StatusCode: http.StatusOK,
 			Headers:    http.Header{"content-type": []string{resourceContentType}},
-			Body:       []byte(strings.Replace(pageTemplate, "/*__HALLMARK_TOKENS__*/", tokenCSS, 1)),
+			Body:       []byte(renderPageHTML()),
 		})
 	case path == managementAPIPath:
 		return handleUIProxy(req)
@@ -432,6 +438,17 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 			return managementJSON(http.StatusMethodNotAllowed, errMsg("methodNotAllowed", "method not allowed"))
 		}
 		return managementJSON(http.StatusOK, buildStatus())
+
+	case path == "/auth-stats" || path == "/quality-guard/auth-stats":
+		if method == http.MethodGet {
+			items := store.listAuthDegradeStats()
+			return managementJSON(http.StatusOK, map[string]any{"data": map[string]any{"items": items, "total": len(items)}, "items": items, "total": len(items)})
+		}
+		if method == http.MethodDelete {
+			store.clearAuthDegradeStats()
+			return managementJSON(http.StatusOK, map[string]any{"data": map[string]any{"cleared": true}, "ok": true})
+		}
+		return managementJSON(http.StatusMethodNotAllowed, errMsg("methodNotAllowed", "method not allowed"))
 
 	case path == "/policy" || path == "/quality-guard/config":
 		if method == http.MethodGet {
@@ -486,6 +503,28 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 			}
 			if v, ok := raw["disableAuthOnHard"].(bool); ok {
 				p.DisableAuthOnHard = v
+			}
+			if v, ok := raw["thinking_guard"].(bool); ok {
+				p.ThinkingGuard = v
+			}
+			if v, ok := raw["thinkingGuard"].(bool); ok {
+				p.ThinkingGuard = v
+			}
+			p.ConsecutiveMissingThinking = intPick(raw, p.ConsecutiveMissingThinking, "consecutive_missing_thinking", "consecutiveMissingThinking")
+			if v, ok := raw["thinking_cross_verify"].(bool); ok {
+				p.ThinkingCrossVerify = v
+			}
+			if v, ok := raw["thinkingCrossVerify"].(bool); ok {
+				p.ThinkingCrossVerify = v
+			}
+			if v, ok := raw["soft_cross_verify"].(bool); ok {
+				p.SoftCrossVerify = v
+			}
+			if v, ok := raw["softCrossVerify"].(bool); ok {
+				p.SoftCrossVerify = v
+			}
+			if !p.ThinkingGuard {
+				p.ThinkingCrossVerify = false
 			}
 			if kws, ok := stringSlicePick(raw, "isolation_keywords", "isolationKeywords"); ok {
 				p.IsolationKeywords = kws
@@ -852,24 +891,29 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 func publicPolicy(p policyConfig) map[string]any {
 	hasKey := strings.TrimSpace(p.ProbeAPIKey) != ""
 	return map[string]any{
-		"mode":                    p.Mode,
-		"active_interval_seconds": p.ActiveIntervalSec,
-		"passive_poll_seconds":    p.PassivePollSec,
-		"quarantine_seconds":      p.QuarantineSec,
-		"soft_tps":                p.SoftTPS,
-		"hard_tps":                p.HardTPS,
-		"consecutive_soft":        p.ConsecutiveSoft,
-		"consecutive_errors":      p.ConsecutiveErrors,
-		"min_healthy_nodes":       p.MinHealthyNodes,
-		"min_generation_ms":       p.MinGenerationMs,
-		"min_output_tokens":       p.MinOutputTokens,
-		"model":                   p.Model,
-		"disable_auth_on_hard":    p.DisableAuthOnHard,
-		"max_output_tokens":       p.MaxOutputTokensProbe,
-		"isolation_keywords":      p.IsolationKeywords,
-		"probe_api_base":          p.ProbeAPIBase,
-		"probe_api_key_set":       hasKey,
-		"probe_api_key":           "",
+		"mode":                         p.Mode,
+		"active_interval_seconds":      p.ActiveIntervalSec,
+		"passive_poll_seconds":         p.PassivePollSec,
+		"quarantine_seconds":           p.QuarantineSec,
+		"soft_tps":                     p.SoftTPS,
+		"hard_tps":                     p.HardTPS,
+		"consecutive_soft":             p.ConsecutiveSoft,
+		"consecutive_errors":           p.ConsecutiveErrors,
+		"min_healthy_nodes":            p.MinHealthyNodes,
+		"min_generation_ms":            p.MinGenerationMs,
+		"min_output_tokens":            p.MinOutputTokens,
+		"model":                        p.Model,
+		"disable_auth_on_hard":         p.DisableAuthOnHard,
+		"thinking_guard":               p.ThinkingGuard,
+		"consecutive_missing_thinking": p.ConsecutiveMissingThinking,
+		"thinking_cross_verify":        p.ThinkingCrossVerify,
+		"soft_cross_verify":            p.SoftCrossVerify,
+		"max_output_tokens":            p.MaxOutputTokensProbe,
+		"isolation_keywords":           p.IsolationKeywords,
+		"probe_api_base":               p.ProbeAPIBase,
+		"probe_api_key_set":            hasKey,
+		"probe_api_key":                "",
+		"policy_schema":                p.PolicySchema,
 	}
 }
 
@@ -886,6 +930,7 @@ func buildStatus() map[string]any {
 			"quarantined_until":           n.QuarantinedUntil,
 			"error_strikes":               n.ErrorStrikes,
 			"soft_strikes":                n.SoftStrikes,
+			"thinking_strikes":            n.ThinkingStrikes,
 			"last_classification":         n.LastClassification,
 			"last_output_tps":             n.LastOutputTPS,
 			"last_first_token_ms":         n.LastFirstTokenMs,
@@ -919,6 +964,7 @@ func buildStatus() map[string]any {
 	}
 	pol := store.policy()
 	st := store.stats()
+	authStats := store.listAuthDegradeStats()
 	return map[string]any{
 		"available":     true,
 		"updatedAt":     store.snapshot().UpdatedAt,
@@ -926,6 +972,7 @@ func buildStatus() map[string]any {
 		"editable":      true,
 		"nodes":         nodeMap,
 		"statistics":    st,
+		"authStats":     authStats,
 		"recentEvents":  store.events(),
 		"quality_queue": qualitySched.snapshot(),
 		"plugin":        pluginName,
@@ -935,6 +982,14 @@ func buildStatus() map[string]any {
 		"clash":         clashStatusPayload(),
 		"hint":          "纯 CPA 出口守护：可对接本机 Clash PerfectAI；降智时走 Clash API 切换叶子节点，账号统一走本机 mixed-port。质量检测全局串行排队，避免 Clash 出口交叉。",
 	}
+}
+
+func renderPageHTML() string {
+	out := pageTemplate
+	out = strings.Replace(out, "/*__HALLMARK_TOKENS__*/", tokenCSS, 1)
+	out = strings.Replace(out, "/*__ACCOUNTS_PANEL_CSS__*/", accountsPanelCSS, 1)
+	out = strings.Replace(out, "/*__ACCOUNTS_PANEL_JS__*/", accountsPanelJS, 1)
+	return out
 }
 
 func handleUsage(request []byte) ([]byte, error) {

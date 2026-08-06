@@ -62,10 +62,10 @@ func TestXAITokenAccountingDoesNotDoubleCountReasoning(t *testing.T) {
 
 func TestSmallOutputIsIgnoredBeforeTPSThreshold(t *testing.T) {
 	pol := defaultPolicy()
-	if got := classifyQuality(5000, pol.MinOutputTokens-1, pol); got != "ignored" {
+	if got := classifyQuality(5000, pol.MinOutputTokens-1, true, pol); got != "ignored" {
 		t.Fatalf("small output classification=%q, want ignored", got)
 	}
-	if got := classifyQuality(5000, pol.MinOutputTokens, pol); got != "hard" {
+	if got := classifyQuality(5000, pol.MinOutputTokens, true, pol); got != "hard" {
 		t.Fatalf("threshold output classification=%q, want hard", got)
 	}
 }
@@ -424,18 +424,75 @@ func TestStoreCreateNodesIsAllOrNothing(t *testing.T) {
 }
 
 func TestRenderStatusPage(t *testing.T) {
-	page := strings.Replace(pageTemplate, "/*__HALLMARK_TOKENS__*/", tokenCSS, 1)
+	page := renderPageHTML()
 	for _, want := range []string{
 		"出口守护", "纯 CPA", "data-batch=\"enable\"", "重平衡账号", "批量添加", "/nodes/import",
 		"页面每 15 秒刷新", "最短生成窗口", "X-Grok2API-Egress-UI",
 		"queue-banner", "测试队列", "质量检测队列空闲", "quality_queue", "hasThinking",
+		"账号降智统计", "EgressAccountsPanel", "panel-accounts-host",
 	} {
 		if !strings.Contains(page, want) {
 			t.Fatalf("missing %q", want)
 		}
 	}
-	if strings.Contains(page, "/*__HALLMARK_TOKENS__*/") {
-		t.Fatal("tokens not replaced in test helper path only")
+	if strings.Contains(page, "/*__HALLMARK_TOKENS__*/") || strings.Contains(page, "/*__ACCOUNTS_PANEL_JS__*/") {
+		t.Fatal("embed placeholders not replaced")
+	}
+}
+
+func TestRecordAuthDegradeStats(t *testing.T) {
+	store := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	store.recordAuthObservation("a1@x", "a1@x", "passive", "1", "n1", "hard", "响应缺少 thinking_content（降智）", 10, true)
+	store.recordAuthObservation("a1@x", "a1@x", "passive", "1", "n1", "healthy", "", 8, false)
+	store.recordAuthObservation("b2@x", "b2@x", "passive", "2", "n2", "hard", "响应缺少 thinking_content（降智）", 12, true)
+	items := store.listAuthDegradeStats()
+	if len(items) != 2 {
+		t.Fatalf("auth stats len=%d, want 2", len(items))
+	}
+	var a1 *authDegradeRecord
+	for _, it := range items {
+		if it.AuthID == "a1@x" {
+			a1 = it
+		}
+	}
+	if a1 == nil || a1.DegradedCount != 1 || a1.SampleCount != 2 {
+		t.Fatalf("a1 stats=%+v", a1)
+	}
+	store.clearAuthDegradeStats()
+	if len(store.listAuthDegradeStats()) != 0 {
+		t.Fatal("clearAuthDegradeStats should empty list")
+	}
+}
+
+func TestApplyObservationRecordsAuthStats(t *testing.T) {
+	store := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	node, err := store.createNode("n1", "http://127.0.0.1:7951", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.createNode("n2", "http://127.0.0.1:7952", true, false, 10); err != nil {
+		t.Fatal(err)
+	}
+	res := qualityResult{
+		Classification: "hard",
+		HasThinking:    false,
+		OutputTokens:   64,
+		TPS:            10,
+		AuthID:         "user@x",
+		AuthLabel:      "user@x",
+		Error:          missingThinkingReason,
+		ErrorKind:      "missing_thinking",
+	}
+	// Passive missing-thinking with ThinkingCrossVerify default ON only samples.
+	applyObservation(store, node.ID, "passive", res)
+	items := store.listAuthDegradeStats()
+	if len(items) != 1 || items[0].SampleCount != 1 || items[0].DegradedCount != 0 {
+		t.Fatalf("pre-cross-verify should sample only: %+v", items[0])
+	}
+	applyObservation(store, node.ID, "active", res)
+	items = store.listAuthDegradeStats()
+	if len(items) != 1 || items[0].DegradedCount != 1 || items[0].SampleCount != 2 {
+		t.Fatalf("after confirm want degraded=1 samples=2 got %+v", items[0])
 	}
 }
 

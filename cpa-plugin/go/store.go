@@ -26,15 +26,32 @@ type policyConfig struct {
 	MinOutputTokens      int64   `json:"min_output_tokens"`
 	Model                string  `json:"model"`
 	DisableAuthOnHard    bool    `json:"disable_auth_on_hard"`
-	MaxOutputTokensProbe int     `json:"max_output_tokens"`
+	// ThinkingGuard enables missing-thinking 降智 detection. When false, quality
+	// classification still records HasThinking but does not force hard isolation.
+	// Absent in old state.json → default true (see normalizePolicyFlags).
+	ThinkingGuard bool `json:"thinking_guard"`
+	// ConsecutiveMissingThinking is how many consecutive missing-thinking samples
+	// on the same egress are required before isolation / recheck. Default 1.
+	ConsecutiveMissingThinking int `json:"consecutive_missing_thinking"`
+	// ThinkingCrossVerify defers missing-thinking isolation until an active probe
+	// also lacks thinking (Clash branch uses soft-recheck queue). Default true.
+	ThinkingCrossVerify bool `json:"thinking_cross_verify"`
+	// SoftCrossVerify defers soft-TPS isolation until an active probe confirms.
+	// Clash branch already queues thinking recheck on soft; this flag keeps that
+	// behavior toggleable from the panel. Default true.
+	SoftCrossVerify      bool `json:"soft_cross_verify"`
+	MaxOutputTokensProbe int  `json:"max_output_tokens"`
 	// ProbeAPIBase / ProbeAPIKey: public OpenAI-compatible endpoint used for
 	// quality probes so free-usage cooling is recorded by the normal gateway
 	// (instead of bypassing via cli-chat-proxy with raw xAI tokens).
 	ProbeAPIBase string `json:"probe_api_base"`
 	ProbeAPIKey  string `json:"probe_api_key"`
-	// IsolationKeywords lists request-body substrings that quarantine the
+	// IsolationKeywords lists response-body substrings that quarantine the
 	// currently selected egress after auth. Empty disables keyword isolation.
 	IsolationKeywords []string `json:"isolation_keywords"`
+	// PolicySchema tracks policy feature revisions. Bump when new defaults must be
+	// force-migrated once for existing state.json files.
+	PolicySchema int `json:"policy_schema,omitempty"`
 }
 
 type nodeRecord struct {
@@ -57,6 +74,7 @@ type nodeRecord struct {
 	QuarantinedUntil     float64 `json:"quarantined_until,omitempty"`
 	ErrorStrikes         int     `json:"error_strikes"`
 	SoftStrikes          int     `json:"soft_strikes"`
+	ThinkingStrikes      int     `json:"thinking_strikes"`
 	LastClassification   string  `json:"last_classification,omitempty"`
 	LastOutputTPS        float64 `json:"last_output_tps,omitempty"`
 	LastFirstTokenMs     int64   `json:"last_first_token_ms,omitempty"`
@@ -129,6 +147,20 @@ type statistics struct {
 	Actions   actionStats `json:"actions"`
 }
 
+// authDegradeRecord tracks per-account 降智 hits (final quality-degrade events).
+type authDegradeRecord struct {
+	AuthID        string  `json:"auth_id"`
+	Label         string  `json:"label,omitempty"`
+	DegradedCount int64   `json:"degraded_count"`
+	SampleCount   int64   `json:"sample_count"`
+	LastAt        float64 `json:"last_at,omitempty"`
+	LastReason    string  `json:"last_reason,omitempty"`
+	LastNodeID    string  `json:"last_node_id,omitempty"`
+	LastNodeName  string  `json:"last_node_name,omitempty"`
+	LastOutputTPS float64 `json:"last_output_tps,omitempty"`
+	LastSource    string  `json:"last_source,omitempty"`
+}
+
 // clashUIConfig is panel-editable Clash connection settings.
 // Non-empty fields override the CPA plugin YAML config so friends can
 // set group / API endpoint without touching host config files.
@@ -144,14 +176,15 @@ type clashUIConfig struct {
 }
 
 type guardState struct {
-	Version   int                    `json:"version"`
-	Policy    policyConfig           `json:"policy"`
-	ClashUI   clashUIConfig          `json:"clash_ui,omitempty"`
-	Nodes     map[string]*nodeRecord `json:"nodes"`
-	Events    []guardEvent           `json:"events"`
-	Stats     statistics             `json:"statistics"`
-	NextID    int                    `json:"next_id"`
-	UpdatedAt float64                `json:"updated_at"`
+	Version   int                           `json:"version"`
+	Policy    policyConfig                  `json:"policy"`
+	ClashUI   clashUIConfig                 `json:"clash_ui,omitempty"`
+	Nodes     map[string]*nodeRecord        `json:"nodes"`
+	Events    []guardEvent                  `json:"events"`
+	Stats     statistics                    `json:"statistics"`
+	AuthStats map[string]*authDegradeRecord `json:"auth_stats"`
+	NextID    int                           `json:"next_id"`
+	UpdatedAt float64                       `json:"updated_at"`
 }
 
 type stateStore struct {
@@ -162,23 +195,124 @@ type stateStore struct {
 
 func defaultPolicy() policyConfig {
 	return policyConfig{
-		Mode:                 "hybrid",
-		ActiveIntervalSec:    1800,
-		PassivePollSec:       5,
-		QuarantineSec:        120,
-		SoftTPS:              500,
-		HardTPS:              1000,
-		ConsecutiveSoft:      2,
-		ConsecutiveErrors:    2,
-		MinHealthyNodes:      1,
-		MinGenerationMs:      1000,
-		MinOutputTokens:      32,
-		Model:                "grok-4.5",
-		DisableAuthOnHard:    true,
-		MaxOutputTokensProbe: 384,
-		ProbeAPIBase:         "",
-		ProbeAPIKey:          "",
-		IsolationKeywords:    nil,
+		Mode:                       "hybrid",
+		ActiveIntervalSec:          1800,
+		PassivePollSec:             5,
+		QuarantineSec:              120,
+		SoftTPS:                    500,
+		HardTPS:                    1000,
+		ConsecutiveSoft:            2,
+		ConsecutiveErrors:          2,
+		MinHealthyNodes:            1,
+		MinGenerationMs:            1000,
+		MinOutputTokens:            32,
+		Model:                      "grok-4.5",
+		DisableAuthOnHard:          true,
+		ThinkingGuard:              true,
+		ConsecutiveMissingThinking: 1,
+		ThinkingCrossVerify:        true,
+		SoftCrossVerify:            true,
+		MaxOutputTokensProbe:       384,
+		ProbeAPIBase:               "",
+		ProbeAPIKey:                "",
+		IsolationKeywords:          nil,
+		PolicySchema:               3,
+	}
+}
+
+// normalizePolicyFlags fills zero / missing fields with defaults.
+// Bool feature flags that default to true cannot be distinguished from explicit
+// false after a plain Unmarshal; load paths pass the raw policy object so absent
+// keys become defaults instead of false.
+func normalizePolicyFlags(p *policyConfig, rawPolicy map[string]any) {
+	if p == nil {
+		return
+	}
+	def := defaultPolicy()
+	if p.Mode == "" {
+		p.Mode = def.Mode
+	}
+	if p.ActiveIntervalSec <= 0 {
+		p.ActiveIntervalSec = def.ActiveIntervalSec
+	}
+	if p.PassivePollSec <= 0 {
+		p.PassivePollSec = def.PassivePollSec
+	}
+	if p.QuarantineSec <= 0 {
+		p.QuarantineSec = def.QuarantineSec
+	}
+	if p.SoftTPS <= 0 {
+		p.SoftTPS = def.SoftTPS
+	}
+	if p.HardTPS <= 0 {
+		p.HardTPS = def.HardTPS
+	}
+	if p.ConsecutiveSoft <= 0 {
+		p.ConsecutiveSoft = def.ConsecutiveSoft
+	}
+	if p.ConsecutiveErrors <= 0 {
+		p.ConsecutiveErrors = def.ConsecutiveErrors
+	}
+	if p.MinHealthyNodes <= 0 {
+		p.MinHealthyNodes = def.MinHealthyNodes
+	}
+	if p.MinGenerationMs <= 0 {
+		p.MinGenerationMs = def.MinGenerationMs
+	}
+	if p.MinOutputTokens <= 0 {
+		p.MinOutputTokens = def.MinOutputTokens
+	}
+	if p.Model == "" {
+		p.Model = def.Model
+	}
+	if p.MaxOutputTokensProbe <= 0 {
+		p.MaxOutputTokensProbe = def.MaxOutputTokensProbe
+	}
+	if p.ConsecutiveMissingThinking <= 0 {
+		p.ConsecutiveMissingThinking = def.ConsecutiveMissingThinking
+	}
+
+	has := func(keys ...string) bool {
+		if rawPolicy == nil {
+			return false
+		}
+		for _, k := range keys {
+			if _, ok := rawPolicy[k]; ok {
+				return true
+			}
+		}
+		return false
+	}
+	if !has("thinking_guard", "thinkingGuard") {
+		p.ThinkingGuard = def.ThinkingGuard
+	}
+	if !has("disable_auth_on_hard", "disableAuthOnHard") {
+		p.DisableAuthOnHard = def.DisableAuthOnHard
+	}
+
+	// policy_schema migrations are one-shot product default upgrades.
+	// schema < 2: thinking redesign defaults
+	// schema < 3: soft cross-verify defaults to on
+	if p.PolicySchema < 2 {
+		if !has("consecutive_missing_thinking", "consecutiveMissingThinking") {
+			p.ConsecutiveMissingThinking = def.ConsecutiveMissingThinking
+		}
+		p.ThinkingCrossVerify = def.ThinkingCrossVerify
+		p.SoftCrossVerify = def.SoftCrossVerify
+		p.PolicySchema = def.PolicySchema
+	} else if p.PolicySchema < def.PolicySchema {
+		p.SoftCrossVerify = def.SoftCrossVerify
+		p.PolicySchema = def.PolicySchema
+	} else {
+		if !has("thinking_cross_verify", "thinkingCrossVerify") {
+			p.ThinkingCrossVerify = def.ThinkingCrossVerify
+		}
+		if !has("soft_cross_verify", "softCrossVerify") {
+			p.SoftCrossVerify = def.SoftCrossVerify
+		}
+	}
+	if !p.ThinkingGuard {
+		p.ThinkingCrossVerify = false
 	}
 }
 
@@ -218,12 +352,13 @@ func newStateStore(path string) *stateStore {
 	invalidateAuthListCache()
 	s := &stateStore{path: path}
 	s.data = guardState{
-		Version: 1,
-		Policy:  defaultPolicy(),
-		Nodes:   map[string]*nodeRecord{},
-		Events:  nil,
-		Stats:   statistics{StartedAt: float64(time.Now().Unix())},
-		NextID:  1,
+		Version:   1,
+		Policy:    defaultPolicy(),
+		Nodes:     map[string]*nodeRecord{},
+		Events:    nil,
+		Stats:     statistics{StartedAt: float64(time.Now().Unix())},
+		AuthStats: map[string]*authDegradeRecord{},
+		NextID:    1,
 	}
 	_ = s.load()
 	return s
@@ -246,38 +381,34 @@ func (s *stateStore) load() error {
 	if data.Nodes == nil {
 		data.Nodes = map[string]*nodeRecord{}
 	}
+	if data.AuthStats == nil {
+		data.AuthStats = map[string]*authDegradeRecord{}
+	}
 	if data.NextID <= 0 {
 		data.NextID = 1
 	}
+	// Preserve raw policy keys so newly introduced bool defaults stay ON when an
+	// older state.json omitted them (plain bool zero value would look like false).
+	var rawRoot map[string]any
+	_ = json.Unmarshal(raw, &rawRoot)
+	var rawPolicy map[string]any
+	if rp, ok := rawRoot["policy"].(map[string]any); ok {
+		rawPolicy = rp
+	}
+	beforeSchema := 0
+	if rawPolicy != nil {
+		if v, ok := rawPolicy["policy_schema"].(float64); ok {
+			beforeSchema = int(v)
+		}
+	}
 	if data.Policy.HardTPS <= 0 {
 		data.Policy = defaultPolicy()
+		rawPolicy = nil
 	}
-	if data.Policy.MinGenerationMs <= 0 {
-		data.Policy.MinGenerationMs = 1000
-	}
-	if data.Policy.MinOutputTokens <= 0 {
-		data.Policy.MinOutputTokens = 32
-	}
-	if data.Policy.MaxOutputTokensProbe <= 0 {
-		data.Policy.MaxOutputTokensProbe = 384
-	}
+	normalizePolicyFlags(&data.Policy, rawPolicy)
 	data.Policy.IsolationKeywords = normalizeIsolationKeywords(data.Policy.IsolationKeywords)
 	data.Policy.ProbeAPIBase = strings.TrimRight(strings.TrimSpace(data.Policy.ProbeAPIBase), "/")
 	data.Policy.ProbeAPIKey = strings.TrimSpace(data.Policy.ProbeAPIKey)
-	// Public probe API left empty on purpose: quality probes use cli-chat-proxy +
-	// per-account tokens via TestPort. Panel can still set probe_api_* later.
-	if data.Policy.Mode == "" {
-		data.Policy.Mode = "hybrid"
-	}
-	if data.Policy.ActiveIntervalSec <= 0 {
-		data.Policy.ActiveIntervalSec = 1800
-	}
-	if data.Policy.PassivePollSec <= 0 {
-		data.Policy.PassivePollSec = 5
-	}
-	if data.Policy.QuarantineSec <= 0 {
-		data.Policy.QuarantineSec = 120
-	}
 	// hydrate private proxy field
 	for _, n := range data.Nodes {
 		n.ProxyURL = n.ProxyURLStored
@@ -290,6 +421,10 @@ func (s *stateStore) load() error {
 		}
 	}
 	s.data = data
+	// Persist once when redesign migration ran so defaults become explicit keys.
+	if beforeSchema < defaultPolicy().PolicySchema {
+		_ = s.persistLocked()
+	}
 	return nil
 }
 
@@ -364,6 +499,18 @@ func (s *stateStore) updatePolicy(p policyConfig) error {
 	}
 	if p.ConsecutiveErrors <= 0 {
 		p.ConsecutiveErrors = 2
+	}
+	if p.ConsecutiveMissingThinking <= 0 {
+		p.ConsecutiveMissingThinking = 1
+	}
+	if p.ConsecutiveMissingThinking > 50 {
+		p.ConsecutiveMissingThinking = 50
+	}
+	if !p.ThinkingGuard {
+		p.ThinkingCrossVerify = false
+	}
+	if p.PolicySchema < 3 {
+		p.PolicySchema = 3
 	}
 	if p.QuarantineSec <= 0 {
 		p.QuarantineSec = 120
@@ -646,6 +793,95 @@ func (s *stateStore) events() []guardEvent {
 	out := make([]guardEvent, len(s.data.Events))
 	copy(out, s.data.Events)
 	return out
+}
+
+func (s *stateStore) recordAuthObservation(authID, label, source, nodeID, nodeName, class, reason string, tps float64, degraded bool) {
+	authID = strings.TrimSpace(authID)
+	if authID == "" || s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.data.AuthStats == nil {
+		s.data.AuthStats = map[string]*authDegradeRecord{}
+	}
+	rec := s.data.AuthStats[authID]
+	if rec == nil {
+		rec = &authDegradeRecord{AuthID: authID}
+		s.data.AuthStats[authID] = rec
+	}
+	if label != "" {
+		rec.Label = label
+	}
+	rec.SampleCount++
+	if degraded {
+		rec.DegradedCount++
+	}
+	rec.LastAt = float64(time.Now().Unix())
+	rec.LastSource = source
+	if reason != "" {
+		rec.LastReason = reason
+	} else if degraded {
+		rec.LastReason = "响应缺少 thinking_content（降智）"
+	}
+	if nodeID != "" {
+		rec.LastNodeID = nodeID
+	}
+	if nodeName != "" {
+		rec.LastNodeName = nodeName
+	}
+	if tps > 0 {
+		rec.LastOutputTPS = tps
+	}
+	_ = class // kept for API symmetry / future filtering
+	_ = s.persistLocked()
+}
+
+func authDegradeRate(rec *authDegradeRecord) float64 {
+	if rec == nil || rec.SampleCount <= 0 {
+		return 0
+	}
+	return float64(rec.DegradedCount) / float64(rec.SampleCount)
+}
+
+func (s *stateStore) listAuthDegradeStats() []*authDegradeRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]*authDegradeRecord, 0, len(s.data.AuthStats))
+	for _, rec := range s.data.AuthStats {
+		if rec == nil {
+			continue
+		}
+		cp := *rec
+		out = append(out, &cp)
+	}
+	// 100% degrade rate first, then by degrade count, rate, recency, id.
+	sort.Slice(out, func(i, j int) bool {
+		fullI := out[i].SampleCount > 0 && out[i].DegradedCount == out[i].SampleCount
+		fullJ := out[j].SampleCount > 0 && out[j].DegradedCount == out[j].SampleCount
+		if fullI != fullJ {
+			return fullI
+		}
+		if out[i].DegradedCount != out[j].DegradedCount {
+			return out[i].DegradedCount > out[j].DegradedCount
+		}
+		rateI, rateJ := authDegradeRate(out[i]), authDegradeRate(out[j])
+		if rateI != rateJ {
+			return rateI > rateJ
+		}
+		if out[i].LastAt != out[j].LastAt {
+			return out[i].LastAt > out[j].LastAt
+		}
+		return out[i].AuthID < out[j].AuthID
+	})
+	return out
+}
+
+func (s *stateStore) clearAuthDegradeStats() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.data.AuthStats = map[string]*authDegradeRecord{}
+	_ = s.persistLocked()
 }
 
 func (s *stateStore) stats() statistics {
