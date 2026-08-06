@@ -8,6 +8,7 @@
   <title>出口守护</title>
   <style>
 /*__HALLMARK_TOKENS__*/
+/*__ACCOUNTS_PANEL_CSS__*/
     * { box-sizing: border-box; border-color: var(--border); }
     html, body { margin: 0; min-width: 0; overflow-x: clip; background: var(--background); color: var(--foreground); }
     body { font-family: var(--font-body); font-size: var(--text-md); line-height: 1.5; -webkit-font-smoothing: antialiased; }
@@ -69,6 +70,18 @@
     td { font-size: var(--text-xs); }
     tbody tr:last-child td { border-bottom: 0; }
     tbody tr:hover td { background: color-mix(in oklch, var(--secondary) 55%, transparent); }
+    tbody tr.row-quarantined td { background: var(--danger-surface); }
+    tbody tr.row-quarantined:hover td { background: color-mix(in oklch, var(--danger-surface) 80%, var(--secondary)); }
+    tbody tr.row-quarantined td.actions-col { background: var(--danger-surface); }
+    tbody tr.row-quarantined:hover td.actions-col { background: color-mix(in oklch, var(--danger-surface) 80%, var(--secondary)); }
+    tbody tr.row-disabled td { color: var(--muted-foreground); opacity: 0.72; }
+    tbody tr.row-disabled .node-name,
+    tbody tr.row-disabled .node-name + .subtext { text-decoration: line-through; text-decoration-thickness: 1px; }
+    tbody tr.row-disabled:hover td { background: color-mix(in oklch, var(--muted) 45%, transparent); }
+    tbody tr.row-disabled td.actions-col { background: var(--card); }
+    .node-card.row-quarantined { background: var(--danger-surface); border-color: color-mix(in oklch, var(--destructive) 35%, var(--border)); }
+    .node-card.row-disabled { opacity: 0.72; color: var(--muted-foreground); }
+    .node-card.row-disabled strong { text-decoration: line-through; text-decoration-thickness: 1px; }
     .check-cell { width: 2.5rem; text-align: center; }
     .node-name { max-width: 14rem; font-weight: 620; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .subtext { margin-top: var(--space-3xs); color: var(--muted-foreground); font-size: var(--text-2xs); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 22rem; }
@@ -130,6 +143,15 @@
     .field .help { min-height: 1lh; margin: var(--space-3xs) 0 0; color: var(--muted-foreground); font-size: var(--text-2xs); }
     .check-row { min-height: 2.75rem; display: flex; align-items: center; justify-content: space-between; gap: var(--space-sm); padding: 0 var(--space-xs); border-radius: var(--radius-sm); background: var(--muted); }
     .check-row label { margin: 0; }
+    .policy-section { grid-column: 1 / -1; display: grid; gap: var(--space-sm); padding: var(--space-sm); border: var(--rule-hairline) solid var(--border); border-radius: var(--radius-sm); background: color-mix(in oklch, var(--muted) 35%, transparent); }
+    .policy-section h4 { margin: 0; font-size: var(--text-sm); font-weight: 650; }
+    .policy-section .section-note { margin: 0; color: var(--muted-foreground); font-size: var(--text-2xs); }
+    .policy-section .form-grid { margin: 0; }
+    .policy-section.is-disabled { opacity: 0.55; }
+    .panel-switch { display: inline-flex; align-items: center; gap: var(--space-3xs); padding: 0.15rem; border: var(--rule-hairline) solid var(--border); border-radius: var(--radius-sm); background: var(--muted); }
+    .panel-switch .button { min-height: 1.9rem; border: 0; background: transparent; box-shadow: none; }
+    .panel-switch .button.active { background: var(--card); color: var(--foreground); }
+    .panel[hidden] { display: none !important; }
     .modal-actions { justify-content: flex-end; padding: var(--space-sm); border-top: var(--rule-hairline) solid var(--border); }
     .toast-region { position: fixed; right: var(--space-sm); bottom: var(--space-sm); z-index: 30; width: min(22rem, calc(100% - 2rem)); display: grid; gap: var(--space-2xs); }
     .toast { padding: var(--space-xs) var(--space-sm); border: var(--rule-hairline) solid var(--border); border-radius: var(--radius-sm); background: var(--popover); color: var(--popover-foreground); box-shadow: var(--shadow); font-size: var(--text-xs); animation: toast-in var(--dur-medium) var(--ease-out); }
@@ -184,6 +206,10 @@
       </div>
       <div class="head-actions">
         <span class="status-line"><span id="service-dot" class="status-dot"></span><span id="service-text">正在连接</span></span>
+        <div class="panel-switch" role="tablist" aria-label="面板切换">
+          <button id="panel-btn-nodes" class="button active" type="button" role="tab" aria-selected="true" data-panel="nodes">节点面板</button>
+          <button id="panel-btn-accounts" class="button" type="button" role="tab" aria-selected="false" data-panel="accounts">账号降智统计</button>
+        </div>
         <button id="theme-button" class="button icon ghost" type="button" title="切换深浅色" aria-label="切换深浅色">◐</button>
         <button id="refresh-button" class="button" type="button" title="刷新页面快照，不会立即运行真实模型质量检测">刷新显示</button>
       </div>
@@ -196,6 +222,7 @@
       <div class="metric"><div class="metric-label">已隔离</div><div id="metric-quarantined" class="metric-value">-</div><div id="metric-next" class="metric-detail">严格质量恢复</div></div>
     </section>
 
+    <div id="panel-nodes" class="panel stack" data-panel-root="nodes">
     <section class="section" aria-labelledby="nodes-title">
       <div class="section-head">
         <div><h2 id="nodes-title">出口节点</h2><p id="nodes-freshness">页面每 15 秒刷新；节点健康状态随请求审计或主动检测更新，代理凭据不会回显</p></div>
@@ -242,6 +269,9 @@
         <dl id="policy-view" class="policy"></dl>
       </section>
     </div>
+    </div>
+
+    <div id="panel-accounts-host"></div>
   </main>
 
   <div id="node-modal" class="modal-layer" hidden>
@@ -281,15 +311,34 @@
           <div class="field"><label for="policy-active">主动检测间隔（秒）</label><input id="policy-active" type="number" min="60" max="86400"></div>
           <div class="field"><label for="policy-passive">审计轮询间隔（秒）</label><input id="policy-passive" type="number" min="1" max="300"></div>
           <div class="field"><label for="policy-quarantine">隔离复测间隔（秒）</label><input id="policy-quarantine" type="number" min="30" max="86400"></div>
-          <div class="field"><label for="policy-soft">软阈值 Token/s</label><input id="policy-soft" type="number" min="1" max="9999" step="1"></div>
-          <div class="field"><label for="policy-hard">硬阈值 Token/s</label><input id="policy-hard" type="number" min="2" max="10000" step="1"></div>
-          <div class="field"><label for="policy-soft-count">连续软异常次数</label><input id="policy-soft-count" type="number" min="1" max="20"></div>
+          <div class="field"><label for="policy-min-healthy">最低健康节点数</label><input id="policy-min-healthy" type="number" min="1" max="1000"></div>
           <div class="field"><label for="policy-error-count">连续错误次数</label><input id="policy-error-count" type="number" min="1" max="20"></div>
+          <div class="field"><label for="policy-model">主动探测模型</label><input id="policy-model" maxlength="120" autocomplete="off"></div>
+          <div class="field"><label for="policy-max-output">主动探测最大输出 Token</label><input id="policy-max-output" type="number" min="16" max="4096"></div>
           <div class="field"><label for="policy-min-generation">最短生成窗口（毫秒）</label><input id="policy-min-generation" type="number" min="200" max="10000"></div>
           <div class="field"><label for="policy-min-output">最小判定 Token 数</label><input id="policy-min-output" type="number" min="1" max="10000"></div>
-          <div class="field"><label for="policy-max-output">主动探测最大输出 Token</label><input id="policy-max-output" type="number" min="16" max="4096"></div>
-          <div class="field"><label for="policy-model">主动探测模型</label><input id="policy-model" maxlength="120" autocomplete="off"></div>
-          <div class="field"><label for="policy-min-healthy">最低健康节点数</label><input id="policy-min-healthy" type="number" min="1" max="1000"></div>
+
+          <section class="policy-section" id="policy-section-tps" aria-labelledby="policy-section-tps-title">
+            <h4 id="policy-section-tps-title">Token/s 阈值</h4>
+            <p class="section-note">有 thinking 时（或关闭 thinking 判定时）仍按软/硬 Token/s 阈值评估出口质量。</p>
+            <div class="form-grid">
+              <div class="field"><label for="policy-soft">软阈值 Token/s</label><input id="policy-soft" type="number" min="1" max="9999" step="1"></div>
+              <div class="field"><label for="policy-hard">硬阈值 Token/s</label><input id="policy-hard" type="number" min="2" max="10000" step="1"></div>
+              <div class="field"><label for="policy-soft-count">连续软异常次数</label><input id="policy-soft-count" type="number" min="1" max="20"></div>
+              <div class="field full check-row"><div><label for="policy-soft-cross-verify">软阈值交叉验证探测</label><p class="help">与主动的质量探测进行交叉验证，连续软异常达到次数后不立即隔离，先做一次主动质量探测；复测仍异常才隔离。</p></div><input id="policy-soft-cross-verify" type="checkbox"></div>
+            </div>
+          </section>
+
+          <section class="policy-section" id="policy-section-thinking" aria-labelledby="policy-section-thinking-title">
+            <h4 id="policy-section-thinking-title">Thinking 降智判定</h4>
+            <p class="section-note">以响应是否含 thinking / reasoning 作为降智主信号；可与交叉验证组合，避免单次误杀。</p>
+            <div class="form-grid">
+              <div class="field full check-row"><div><label for="policy-thinking-guard">启用 thinking 降智判定</label><p class="help">开启后：同一出口连续缺少 thinking_content 达到设定次数则隔离；有 thinking 时回落 Token/s 阈值</p></div><input id="policy-thinking-guard" type="checkbox"></div>
+              <div class="field" id="policy-missing-count-wrap"><label for="policy-missing-thinking-count">连续缺 thinking 次数</label><input id="policy-missing-thinking-count" type="number" min="1" max="50"><p class="help">同一出口连续多少次无 thinking 才动作；默认 1</p></div>
+              <div class="field full check-row" id="policy-thinking-cv-wrap"><div><label for="policy-thinking-cross-verify">thinking 交叉验证探测</label><p class="help">与主动的质量探测进行交叉验证，达到连续缺 thinking 次数后不立即隔离，先做一次主动质量探测；复测仍无 thinking 才判定降智。</p></div><input id="policy-thinking-cross-verify" type="checkbox"></div>
+            </div>
+          </section>
+
           <div class="field full check-row"><div><label for="policy-disable-auth">迁移失败时停用原节点账号</label><p class="help">启用可防止坏出口继续接收请求；手动停用账号不会被自动恢复</p></div><input id="policy-disable-auth" type="checkbox"></div>
         </div>
         <div class="modal-actions"><button class="button" type="button" data-close="policy-modal">取消</button><button id="save-policy" class="button primary" type="submit">保存策略</button></div>
@@ -314,11 +363,26 @@
   <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
 
   <script>
+  /*__ACCOUNTS_PANEL_JS__*/
+
   (() => {
     'use strict';
     const PLUGIN_BASE = '/v0/resource/plugins/grok2api-egress';
     const MANAGEMENT_API = '/v0/management/grok2api-egress/api';
-    const state = { status: null, nodes: [], selected: new Set(), search: '', editing: null, confirm: null, loading: false, autoTimer: 0 };
+    const state = {
+      panel: localStorage.getItem('egress-guard-panel') || 'nodes',
+      authSearch: '',
+      authPage: 1,
+      authPageSize: 20,
+      status: null,
+      nodes: [],
+      selected: new Set(),
+      search: '',
+      editing: null,
+      confirm: null,
+      loading: false,
+      autoTimer: 0
+    };
     const $ = (id) => document.getElementById(id);
     const esc = (value) => String(value ?? '').replace(/[&<>'"]/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]));
     const number = (value) => new Intl.NumberFormat('zh-CN').format(Number(value || 0));
@@ -416,7 +480,33 @@
       }
     }
     function render() {
+      applyPanel();
       renderMetrics(); renderNodes(); renderStatistics(); renderEvents(); renderPolicy();
+      if (window.EgressAccountsPanel) window.EgressAccountsPanel.render(state);
+    }
+    function applyPanel() {
+      const panel = state.panel === 'accounts' ? 'accounts' : 'nodes';
+      state.panel = panel;
+      localStorage.setItem('egress-guard-panel', panel);
+      const nodesPanel = $('panel-nodes');
+      const accountsPanel = $('panel-accounts');
+      if (nodesPanel) nodesPanel.hidden = panel !== 'nodes';
+      if (accountsPanel) accountsPanel.hidden = panel !== 'accounts';
+      const btnNodes = $('panel-btn-nodes');
+      const btnAccounts = $('panel-btn-accounts');
+      if (btnNodes) {
+        btnNodes.classList.toggle('active', panel === 'nodes');
+        btnNodes.setAttribute('aria-selected', panel === 'nodes' ? 'true' : 'false');
+      }
+      if (btnAccounts) {
+        btnAccounts.classList.toggle('active', panel === 'accounts');
+        btnAccounts.setAttribute('aria-selected', panel === 'accounts' ? 'true' : 'false');
+      }
+    }
+    function setPanel(panel) {
+      state.panel = panel === 'accounts' ? 'accounts' : 'nodes';
+      applyPanel();
+      if (window.EgressAccountsPanel) window.EgressAccountsPanel.render(state);
     }
     function renderMetrics() {
       const status = state.status || {};
@@ -435,12 +525,29 @@
       $('metric-quarantined').className = 'metric-value ' + (quarantined ? 'tone-bad' : 'tone-good');
       $('metric-next').textContent = quarantined ? '等待真实模型复测' : '当前无隔离节点';
     }
+    function nodeGuard(node) { return state.status?.nodes?.[node.id] || {}; }
+    function nodeRank(node) {
+      const guard = nodeGuard(node);
+      if (!node.enabled) return 2; // 停用沉底
+      if (guard.disabled_by_guard) return 1; // 隔离居中
+      return 0; // 正常置顶
+    }
     function filteredNodes() {
       const query = state.search.trim().toLowerCase();
-      if (!query) return state.nodes;
-      return state.nodes.filter((node) => [node.id,node.name,node.exitIp].some((value) => String(value || '').toLowerCase().includes(query)));
+      const list = !query
+        ? state.nodes.slice()
+        : state.nodes.filter((node) => [node.id,node.name,node.exitIp].some((value) => String(value || '').toLowerCase().includes(query)));
+      return list.sort((a, b) => {
+        const rank = nodeRank(a) - nodeRank(b);
+        if (rank !== 0) return rank;
+        return String(a.id || '').localeCompare(String(b.id || ''));
+      });
     }
-    function nodeGuard(node) { return state.status?.nodes?.[node.id] || {}; }
+    function nodeRowClass(node, guard) {
+      if (!node.enabled) return 'row-disabled';
+      if (guard.disabled_by_guard) return 'row-quarantined';
+      return '';
+    }
     function nodeBadge(node, guard) {
       if (guard.disabled_by_guard) return '<span class="badge bad">已隔离</span>';
       if (!node.enabled) return '<span class="badge muted">已停用</span>';
@@ -497,7 +604,8 @@
         const observed = guard.last_observed_at || guard.last_probe_at;
         const reason = guard.last_reason || node.probeStatus || '-';
         const cd = quarantineCountdown(guard);
-        return '<tr data-id="' + esc(node.id) + '">' +
+        const rowClass = nodeRowClass(node, guard);
+        return '<tr class="' + rowClass + '" data-id="' + esc(node.id) + '">' +
           '<td class="check-cell"><input type="checkbox" data-action="select" ' + (state.selected.has(node.id) ? 'checked' : '') + ' aria-label="选择 ' + esc(node.name) + '"></td>' +
           '<td><div class="node-name" title="' + esc(node.name) + '">' + esc(node.name) + '</div><div class="subtext">ID ' + esc(node.id) + ' · ' + (node.proxyPool ? '代理池' : '固定代理') + '</div></td>' +
           '<td>' + nodeBadge(node, guard) + '<div class="subtext" title="' + esc(reason) + '">' + esc(reason) + (cd ? ' · ' + cd : '') + '</div></td>' +
@@ -513,7 +621,8 @@
         const observed = guard.last_observed_at || guard.last_probe_at;
         const reason = guard.last_reason || node.probeStatus || '-';
         const cd = quarantineCountdown(guard);
-        return '<article class="node-card" data-id="' + esc(node.id) + '">' +
+        const rowClass = nodeRowClass(node, guard);
+        return '<article class="node-card ' + rowClass + '" data-id="' + esc(node.id) + '">' +
           '<div class="node-card-head"><div><label><input type="checkbox" data-action="select" ' + (state.selected.has(node.id) ? 'checked' : '') + '> <strong>' + esc(node.name) + '</strong></label>' +
           '<div class="subtext">ID ' + esc(node.id) + ' · ' + (node.proxyPool ? '代理池' : '固定代理') + '</div></div>' + nodeBadge(node, guard) + '</div>' +
           '<div class="subtext" title="' + esc(reason) + '">' + esc(reason) + (cd ? ' · ' + cd : '') + '</div>' +
@@ -542,14 +651,32 @@
     function renderEvents() {
       const events = state.status?.recentEvents || [];
       if (!events.length) { $('events-list').innerHTML = '<div class="empty">暂无守护事件</div>'; return; }
-      const names = {node_quarantined:'节点已隔离',node_restored:'节点已恢复',quality_probe_completed:'质量检测完成',node_rotated:'出口 IP 已轮换',node_rotation_failed:'换 IP 失败',quarantine_suppressed:'隔离已抑制',accounts_migrated:'账号已迁移',accounts_migration_failed:'账号迁移失败'};
+      const names = {node_quarantined:'节点已隔离',node_restored:'节点已恢复',quality_probe_completed:'质量检测完成',thinking_cross_verify_scheduled:'thinking 交叉验证已调度',soft_cross_verify_scheduled:'软阈值交叉验证已调度',node_rotated:'出口 IP 已轮换',node_rotation_failed:'换 IP 失败',quarantine_suppressed:'隔离已抑制',accounts_migrated:'账号已迁移',accounts_migration_failed:'账号迁移失败'};
       $('events-list').innerHTML = events.slice().reverse().map((event) => '<div class="event"><div><strong>' + esc(names[event.event] || event.event || '守护事件') + ' · ' + esc(event.node_name || ('节点 ' + event.node_id)) + '</strong><small>' + esc(event.reason || event.classification || '-') + (event.output_tps ? ' · ' + Number(event.output_tps).toFixed(1) + ' Token/s' : '') + '</small></div><time>' + relative(event.ts) + '</time></div>').join('');
     }
     function renderPolicy() {
       const cfg = state.status?.config;
       $('edit-policy').disabled = !cfg;
       if (!cfg) { $('policy-view').innerHTML = '<div class="empty">策略状态不可用</div>'; return; }
-      const values = [['模式',modeName(cfg.mode)],['主动间隔',cfg.active_interval_seconds + ' 秒'],['被动轮询',cfg.passive_poll_seconds + ' 秒'],['软 / 硬阈值',cfg.soft_tps + ' / ' + cfg.hard_tps],['连续异常',cfg.consecutive_soft + ' / ' + cfg.consecutive_errors],['最短生成窗口',(cfg.min_generation_ms || 1000) + ' ms'],['最小判定 Token',cfg.min_output_tokens || 32],['隔离复测',cfg.quarantine_seconds + ' 秒'],['最低健康节点',cfg.min_healthy_nodes],['探测输出',(cfg.max_output_tokens || 384) + ' Token'],['模型',cfg.model],['迁移失败停用',cfg.disable_auth_on_hard ? '是' : '否']];
+      const thinkingOn = cfg.thinking_guard !== false;
+      const values = [
+        ['模式', modeName(cfg.mode)],
+        ['主动间隔', cfg.active_interval_seconds + ' 秒'],
+        ['被动轮询', cfg.passive_poll_seconds + ' 秒'],
+        ['隔离复测', cfg.quarantine_seconds + ' 秒'],
+        ['软 / 硬阈值', cfg.soft_tps + ' / ' + cfg.hard_tps],
+        ['连续软/错', cfg.consecutive_soft + ' / ' + cfg.consecutive_errors],
+        ['软阈值交叉验证', cfg.soft_cross_verify !== false ? '开' : '关'],
+        ['thinking 降智', thinkingOn ? '开' : '关'],
+        ['连续缺 thinking', thinkingOn ? String(cfg.consecutive_missing_thinking || 1) : '-'],
+        ['thinking 交叉验证', thinkingOn && cfg.thinking_cross_verify !== false ? '开' : '关'],
+        ['最短生成窗口', (cfg.min_generation_ms || 1000) + ' ms'],
+        ['最小判定 Token', cfg.min_output_tokens || 32],
+        ['探测输出', (cfg.max_output_tokens || 384) + ' Token'],
+        ['模型', cfg.model],
+        ['最低健康节点', cfg.min_healthy_nodes],
+        ['迁移失败停用', cfg.disable_auth_on_hard !== false ? '是' : '否']
+      ];
       $('policy-view').innerHTML = values.map((value) => '<div><dt>' + value[0] + '</dt><dd>' + esc(value[1]) + '</dd></div>').join('');
     }
     function openModal(id) { $(id).hidden = false; document.body.style.overflow = 'hidden'; $(id).querySelector('input,select,textarea,button')?.focus(); }
@@ -577,7 +704,17 @@
       if (!cfg) return;
       $('policy-mode').value = cfg.mode; $('policy-active').value = cfg.active_interval_seconds; $('policy-passive').value = cfg.passive_poll_seconds;
       $('policy-quarantine').value = cfg.quarantine_seconds; $('policy-soft').value = cfg.soft_tps; $('policy-hard').value = cfg.hard_tps;
-      $('policy-soft-count').value = cfg.consecutive_soft; $('policy-error-count').value = cfg.consecutive_errors; $('policy-min-generation').value = cfg.min_generation_ms || 1000; $('policy-min-output').value = cfg.min_output_tokens || 32; $('policy-max-output').value = cfg.max_output_tokens || 384; $('policy-model').value = cfg.model || 'grok-4.5'; $('policy-disable-auth').checked = cfg.disable_auth_on_hard !== false; $('policy-min-healthy').value = cfg.min_healthy_nodes;
+      $('policy-soft-count').value = cfg.consecutive_soft; $('policy-error-count').value = cfg.consecutive_errors;
+      $('policy-min-generation').value = cfg.min_generation_ms || 1000; $('policy-min-output').value = cfg.min_output_tokens || 32;
+      $('policy-max-output').value = cfg.max_output_tokens || 384; $('policy-model').value = cfg.model || 'grok-4.5';
+      $('policy-min-healthy').value = cfg.min_healthy_nodes;
+      $('policy-thinking-guard').checked = cfg.thinking_guard !== false;
+      $('policy-missing-thinking-count').value = cfg.consecutive_missing_thinking || 1;
+      // defaults-on flags: absent/undefined => on
+      $('policy-thinking-cross-verify').checked = cfg.thinking_guard !== false && cfg.thinking_cross_verify !== false;
+      $('policy-soft-cross-verify').checked = cfg.soft_cross_verify !== false;
+      $('policy-disable-auth').checked = cfg.disable_auth_on_hard !== false;
+      syncPolicyFormDependencies();
       openModal('policy-modal');
     }
     function parseBulkNodes(raw) {
@@ -750,21 +887,82 @@
       } catch (error) { toast(error.message, 'error'); }
       finally { busy(button, false); }
     });
+    function syncPolicyFormDependencies() {
+      const on = $('policy-thinking-guard').checked;
+      $('policy-thinking-cross-verify').disabled = !on;
+      $('policy-missing-thinking-count').disabled = !on;
+      const section = $('policy-section-thinking');
+      if (section) section.classList.toggle('is-disabled', !on);
+      if (!on) {
+        // Keep checkbox visual off while parent disabled; value ignored on save.
+        $('policy-thinking-cross-verify').checked = false;
+      }
+    }
+    $('policy-thinking-guard').addEventListener('change', () => {
+      if ($('policy-thinking-guard').checked) {
+        // Re-enable with defaults-on cross-verify when user turns guard back on.
+        $('policy-thinking-cross-verify').checked = true;
+      }
+      syncPolicyFormDependencies();
+    });
     $('policy-form').addEventListener('submit', async (event) => {
       event.preventDefault();
       const button = $('save-policy');
-      const body = {mode:$('policy-mode').value,activeIntervalSeconds:Number($('policy-active').value),passivePollSeconds:Number($('policy-passive').value),softTPS:Number($('policy-soft').value),hardTPS:Number($('policy-hard').value),consecutiveSoft:Number($('policy-soft-count').value),consecutiveErrors:Number($('policy-error-count').value),minGenerationMs:Number($('policy-min-generation').value),minOutputTokens:Number($('policy-min-output').value),maxOutputTokens:Number($('policy-max-output').value),model:$('policy-model').value.trim(),disableAuthOnHard:$('policy-disable-auth').checked,quarantineSeconds:Number($('policy-quarantine').value),minHealthyNodes:Number($('policy-min-healthy').value)};
+      const thinkingOn = $('policy-thinking-guard').checked;
+      const body = {
+        mode: $('policy-mode').value,
+        activeIntervalSeconds: Number($('policy-active').value),
+        passivePollSeconds: Number($('policy-passive').value),
+        softTPS: Number($('policy-soft').value),
+        hardTPS: Number($('policy-hard').value),
+        consecutiveSoft: Number($('policy-soft-count').value),
+        consecutiveErrors: Number($('policy-error-count').value),
+        minGenerationMs: Number($('policy-min-generation').value),
+        minOutputTokens: Number($('policy-min-output').value),
+        maxOutputTokens: Number($('policy-max-output').value),
+        model: $('policy-model').value.trim(),
+        thinkingGuard: thinkingOn,
+        consecutiveMissingThinking: Number($('policy-missing-thinking-count').value) || 1,
+        thinkingCrossVerify: thinkingOn && $('policy-thinking-cross-verify').checked,
+        softCrossVerify: $('policy-soft-cross-verify').checked,
+        disableAuthOnHard: $('policy-disable-auth').checked,
+        quarantineSeconds: Number($('policy-quarantine').value),
+        minHealthyNodes: Number($('policy-min-healthy').value)
+      };
       if (body.softTPS >= body.hardTPS) { toast('软阈值必须低于硬阈值', 'error'); return; }
       busy(button, true);
       try { await api('/quality-guard/config', {method:'PUT', body}); toast('守护策略已保存'); closeModal('policy-modal'); await load(true); }
       catch (error) { toast(error.message, 'error'); }
       finally { busy(button, false); }
     });
-    document.addEventListener('click', (event) => { const close = event.target.closest('[data-close]'); if (close) closeModal(close.dataset.close); });
+    document.addEventListener('click', (event) => {
+      const close = event.target.closest('[data-close]');
+      if (close) closeModal(close.dataset.close);
+      const tab = event.target.closest('[data-panel]');
+      if (tab && tab.dataset.panel) setPanel(tab.dataset.panel);
+    });
     $('confirm-action').addEventListener('click', () => { if (state.confirm) state.confirm($('confirm-action')); });
     document.addEventListener('keydown', (event) => { if (event.key === 'Escape') ['node-modal','bulk-node-modal','policy-modal','confirm-modal','accounts-modal'].forEach((id) => { if (!$(id).hidden) closeModal(id); }); });
     const savedTheme = localStorage.getItem('grok2api-egress-theme');
     document.documentElement.dataset.theme = savedTheme || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+    $('panel-btn-nodes').addEventListener('click', () => setPanel('nodes'));
+    $('panel-btn-accounts').addEventListener('click', () => setPanel('accounts'));
+    if (window.EgressAccountsPanel) {
+      window.EgressAccountsPanel.mount({
+        host: $('panel-accounts-host'),
+        state,
+        api,
+        toast,
+        busy,
+        esc,
+        number,
+        time,
+        relative,
+        load,
+        setPanel,
+      });
+    }
+    applyPanel();
     load();
     state.autoTimer = window.setInterval(() => { if (document.visibilityState === 'visible') load(true); }, 15000);
   })();
