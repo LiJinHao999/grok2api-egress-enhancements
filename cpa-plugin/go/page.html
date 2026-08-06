@@ -69,6 +69,18 @@
     td { font-size: var(--text-xs); }
     tbody tr:last-child td { border-bottom: 0; }
     tbody tr:hover td { background: color-mix(in oklch, var(--secondary) 55%, transparent); }
+    tbody tr.row-quarantined td { background: var(--danger-surface); }
+    tbody tr.row-quarantined:hover td { background: color-mix(in oklch, var(--danger-surface) 80%, var(--secondary)); }
+    tbody tr.row-quarantined td.actions-col { background: var(--danger-surface); }
+    tbody tr.row-quarantined:hover td.actions-col { background: color-mix(in oklch, var(--danger-surface) 80%, var(--secondary)); }
+    tbody tr.row-disabled td { color: var(--muted-foreground); opacity: 0.72; }
+    tbody tr.row-disabled .node-name,
+    tbody tr.row-disabled .node-name + .subtext { text-decoration: line-through; text-decoration-thickness: 1px; }
+    tbody tr.row-disabled:hover td { background: color-mix(in oklch, var(--muted) 45%, transparent); }
+    tbody tr.row-disabled td.actions-col { background: var(--card); }
+    .node-card.row-quarantined { background: var(--danger-surface); border-color: color-mix(in oklch, var(--destructive) 35%, var(--border)); }
+    .node-card.row-disabled { opacity: 0.72; color: var(--muted-foreground); }
+    .node-card.row-disabled strong { text-decoration: line-through; text-decoration-thickness: 1px; }
     .check-cell { width: 2.5rem; text-align: center; }
     .node-name { max-width: 14rem; font-weight: 620; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .subtext { margin-top: var(--space-3xs); color: var(--muted-foreground); font-size: var(--text-2xs); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 22rem; }
@@ -290,6 +302,7 @@
           <div class="field"><label for="policy-max-output">主动探测最大输出 Token</label><input id="policy-max-output" type="number" min="16" max="4096"></div>
           <div class="field"><label for="policy-model">主动探测模型</label><input id="policy-model" maxlength="120" autocomplete="off"></div>
           <div class="field"><label for="policy-min-healthy">最低健康节点数</label><input id="policy-min-healthy" type="number" min="1" max="1000"></div>
+          <div class="field full check-row"><div><label for="policy-thinking-guard">启用 thinking 降智判定</label><p class="help">开启后：无 thinking_content 且输出足够则 hard；有 thinking 时仍走原 Token/s 软硬阈值兜底</p></div><input id="policy-thinking-guard" type="checkbox"></div>
           <div class="field full check-row"><div><label for="policy-disable-auth">迁移失败时停用原节点账号</label><p class="help">启用可防止坏出口继续接收请求；手动停用账号不会被自动恢复</p></div><input id="policy-disable-auth" type="checkbox"></div>
         </div>
         <div class="modal-actions"><button class="button" type="button" data-close="policy-modal">取消</button><button id="save-policy" class="button primary" type="submit">保存策略</button></div>
@@ -435,12 +448,29 @@
       $('metric-quarantined').className = 'metric-value ' + (quarantined ? 'tone-bad' : 'tone-good');
       $('metric-next').textContent = quarantined ? '等待真实模型复测' : '当前无隔离节点';
     }
+    function nodeGuard(node) { return state.status?.nodes?.[node.id] || {}; }
+    function nodeRank(node) {
+      const guard = nodeGuard(node);
+      if (!node.enabled) return 2; // 停用沉底
+      if (guard.disabled_by_guard) return 1; // 隔离居中
+      return 0; // 正常置顶
+    }
     function filteredNodes() {
       const query = state.search.trim().toLowerCase();
-      if (!query) return state.nodes;
-      return state.nodes.filter((node) => [node.id,node.name,node.exitIp].some((value) => String(value || '').toLowerCase().includes(query)));
+      const list = !query
+        ? state.nodes.slice()
+        : state.nodes.filter((node) => [node.id,node.name,node.exitIp].some((value) => String(value || '').toLowerCase().includes(query)));
+      return list.sort((a, b) => {
+        const rank = nodeRank(a) - nodeRank(b);
+        if (rank !== 0) return rank;
+        return String(a.id || '').localeCompare(String(b.id || ''));
+      });
     }
-    function nodeGuard(node) { return state.status?.nodes?.[node.id] || {}; }
+    function nodeRowClass(node, guard) {
+      if (!node.enabled) return 'row-disabled';
+      if (guard.disabled_by_guard) return 'row-quarantined';
+      return '';
+    }
     function nodeBadge(node, guard) {
       if (guard.disabled_by_guard) return '<span class="badge bad">已隔离</span>';
       if (!node.enabled) return '<span class="badge muted">已停用</span>';
@@ -497,7 +527,8 @@
         const observed = guard.last_observed_at || guard.last_probe_at;
         const reason = guard.last_reason || node.probeStatus || '-';
         const cd = quarantineCountdown(guard);
-        return '<tr data-id="' + esc(node.id) + '">' +
+        const rowClass = nodeRowClass(node, guard);
+        return '<tr class="' + rowClass + '" data-id="' + esc(node.id) + '">' +
           '<td class="check-cell"><input type="checkbox" data-action="select" ' + (state.selected.has(node.id) ? 'checked' : '') + ' aria-label="选择 ' + esc(node.name) + '"></td>' +
           '<td><div class="node-name" title="' + esc(node.name) + '">' + esc(node.name) + '</div><div class="subtext">ID ' + esc(node.id) + ' · ' + (node.proxyPool ? '代理池' : '固定代理') + '</div></td>' +
           '<td>' + nodeBadge(node, guard) + '<div class="subtext" title="' + esc(reason) + '">' + esc(reason) + (cd ? ' · ' + cd : '') + '</div></td>' +
@@ -513,7 +544,8 @@
         const observed = guard.last_observed_at || guard.last_probe_at;
         const reason = guard.last_reason || node.probeStatus || '-';
         const cd = quarantineCountdown(guard);
-        return '<article class="node-card" data-id="' + esc(node.id) + '">' +
+        const rowClass = nodeRowClass(node, guard);
+        return '<article class="node-card ' + rowClass + '" data-id="' + esc(node.id) + '">' +
           '<div class="node-card-head"><div><label><input type="checkbox" data-action="select" ' + (state.selected.has(node.id) ? 'checked' : '') + '> <strong>' + esc(node.name) + '</strong></label>' +
           '<div class="subtext">ID ' + esc(node.id) + ' · ' + (node.proxyPool ? '代理池' : '固定代理') + '</div></div>' + nodeBadge(node, guard) + '</div>' +
           '<div class="subtext" title="' + esc(reason) + '">' + esc(reason) + (cd ? ' · ' + cd : '') + '</div>' +
@@ -549,7 +581,7 @@
       const cfg = state.status?.config;
       $('edit-policy').disabled = !cfg;
       if (!cfg) { $('policy-view').innerHTML = '<div class="empty">策略状态不可用</div>'; return; }
-      const values = [['模式',modeName(cfg.mode)],['主动间隔',cfg.active_interval_seconds + ' 秒'],['被动轮询',cfg.passive_poll_seconds + ' 秒'],['软 / 硬阈值',cfg.soft_tps + ' / ' + cfg.hard_tps],['连续异常',cfg.consecutive_soft + ' / ' + cfg.consecutive_errors],['最短生成窗口',(cfg.min_generation_ms || 1000) + ' ms'],['最小判定 Token',cfg.min_output_tokens || 32],['隔离复测',cfg.quarantine_seconds + ' 秒'],['最低健康节点',cfg.min_healthy_nodes],['探测输出',(cfg.max_output_tokens || 384) + ' Token'],['模型',cfg.model],['迁移失败停用',cfg.disable_auth_on_hard ? '是' : '否']];
+      const values = [['模式',modeName(cfg.mode)],['主动间隔',cfg.active_interval_seconds + ' 秒'],['被动轮询',cfg.passive_poll_seconds + ' 秒'],['软 / 硬阈值',cfg.soft_tps + ' / ' + cfg.hard_tps],['连续异常',cfg.consecutive_soft + ' / ' + cfg.consecutive_errors],['最短生成窗口',(cfg.min_generation_ms || 1000) + ' ms'],['最小判定 Token',cfg.min_output_tokens || 32],['隔离复测',cfg.quarantine_seconds + ' 秒'],['最低健康节点',cfg.min_healthy_nodes],['探测输出',(cfg.max_output_tokens || 384) + ' Token'],['模型',cfg.model],['thinking 降智判定',cfg.thinking_guard !== false ? '开' : '关'],['迁移失败停用',cfg.disable_auth_on_hard ? '是' : '否']];
       $('policy-view').innerHTML = values.map((value) => '<div><dt>' + value[0] + '</dt><dd>' + esc(value[1]) + '</dd></div>').join('');
     }
     function openModal(id) { $(id).hidden = false; document.body.style.overflow = 'hidden'; $(id).querySelector('input,select,textarea,button')?.focus(); }
@@ -577,7 +609,7 @@
       if (!cfg) return;
       $('policy-mode').value = cfg.mode; $('policy-active').value = cfg.active_interval_seconds; $('policy-passive').value = cfg.passive_poll_seconds;
       $('policy-quarantine').value = cfg.quarantine_seconds; $('policy-soft').value = cfg.soft_tps; $('policy-hard').value = cfg.hard_tps;
-      $('policy-soft-count').value = cfg.consecutive_soft; $('policy-error-count').value = cfg.consecutive_errors; $('policy-min-generation').value = cfg.min_generation_ms || 1000; $('policy-min-output').value = cfg.min_output_tokens || 32; $('policy-max-output').value = cfg.max_output_tokens || 384; $('policy-model').value = cfg.model || 'grok-4.5'; $('policy-disable-auth').checked = cfg.disable_auth_on_hard !== false; $('policy-min-healthy').value = cfg.min_healthy_nodes;
+      $('policy-soft-count').value = cfg.consecutive_soft; $('policy-error-count').value = cfg.consecutive_errors; $('policy-min-generation').value = cfg.min_generation_ms || 1000; $('policy-min-output').value = cfg.min_output_tokens || 32; $('policy-max-output').value = cfg.max_output_tokens || 384; $('policy-model').value = cfg.model || 'grok-4.5'; $('policy-thinking-guard').checked = cfg.thinking_guard !== false; $('policy-disable-auth').checked = cfg.disable_auth_on_hard !== false; $('policy-min-healthy').value = cfg.min_healthy_nodes;
       openModal('policy-modal');
     }
     function parseBulkNodes(raw) {
@@ -753,7 +785,7 @@
     $('policy-form').addEventListener('submit', async (event) => {
       event.preventDefault();
       const button = $('save-policy');
-      const body = {mode:$('policy-mode').value,activeIntervalSeconds:Number($('policy-active').value),passivePollSeconds:Number($('policy-passive').value),softTPS:Number($('policy-soft').value),hardTPS:Number($('policy-hard').value),consecutiveSoft:Number($('policy-soft-count').value),consecutiveErrors:Number($('policy-error-count').value),minGenerationMs:Number($('policy-min-generation').value),minOutputTokens:Number($('policy-min-output').value),maxOutputTokens:Number($('policy-max-output').value),model:$('policy-model').value.trim(),disableAuthOnHard:$('policy-disable-auth').checked,quarantineSeconds:Number($('policy-quarantine').value),minHealthyNodes:Number($('policy-min-healthy').value)};
+      const body = {mode:$('policy-mode').value,activeIntervalSeconds:Number($('policy-active').value),passivePollSeconds:Number($('policy-passive').value),softTPS:Number($('policy-soft').value),hardTPS:Number($('policy-hard').value),consecutiveSoft:Number($('policy-soft-count').value),consecutiveErrors:Number($('policy-error-count').value),minGenerationMs:Number($('policy-min-generation').value),minOutputTokens:Number($('policy-min-output').value),maxOutputTokens:Number($('policy-max-output').value),model:$('policy-model').value.trim(),thinkingGuard:$('policy-thinking-guard').checked,disableAuthOnHard:$('policy-disable-auth').checked,quarantineSeconds:Number($('policy-quarantine').value),minHealthyNodes:Number($('policy-min-healthy').value)};
       if (body.softTPS >= body.hardTPS) { toast('软阈值必须低于硬阈值', 'error'); return; }
       busy(button, true);
       try { await api('/quality-guard/config', {method:'PUT', body}); toast('守护策略已保存'); closeModal('policy-modal'); await load(true); }

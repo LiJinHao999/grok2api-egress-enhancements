@@ -443,6 +443,15 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 			if v, ok := raw["disable_auth_on_hard"].(bool); ok {
 				p.DisableAuthOnHard = v
 			}
+			if v, ok := raw["disableAuthOnHard"].(bool); ok {
+				p.DisableAuthOnHard = v
+			}
+			if v, ok := raw["thinking_guard"].(bool); ok {
+				p.ThinkingGuard = v
+			}
+			if v, ok := raw["thinkingGuard"].(bool); ok {
+				p.ThinkingGuard = v
+			}
 			if err := store.updatePolicy(p); err != nil {
 				return managementJSON(http.StatusBadRequest, errMsg("invalidPolicy", err.Error()))
 			}

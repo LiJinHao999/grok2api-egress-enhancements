@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -59,13 +60,117 @@ func TestXAITokenAccountingDoesNotDoubleCountReasoning(t *testing.T) {
 	}
 }
 
-func TestSmallOutputIsIgnoredBeforeTPSThreshold(t *testing.T) {
+func TestThinkingPresenceIsPrimaryQualitySignal(t *testing.T) {
 	pol := defaultPolicy()
-	if got := classifyQuality(5000, pol.MinOutputTokens-1, pol); got != "ignored" {
-		t.Fatalf("small output classification=%q, want ignored", got)
+	pol.ThinkingGuard = true
+	// Small output without thinking is not enough evidence.
+	if got := classifyQuality(5000, pol.MinOutputTokens-1, false, pol); got != "ignored" {
+		t.Fatalf("small output without thinking=%q, want ignored", got)
 	}
-	if got := classifyQuality(5000, pol.MinOutputTokens, pol); got != "hard" {
-		t.Fatalf("threshold output classification=%q, want hard", got)
+	// Enough output but no thinking → 降智 / hard.
+	if got := classifyQuality(5000, pol.MinOutputTokens, false, pol); got != "hard" {
+		t.Fatalf("no-thinking classification=%q, want hard", got)
+	}
+	// Thinking present falls back to original Token/s thresholds.
+	if got := classifyQuality(5000, pol.MinOutputTokens, true, pol); got != "hard" {
+		t.Fatalf("with-thinking high TPS classification=%q, want hard", got)
+	}
+	if got := classifyQuality(10, 200, true, pol); got != "healthy" {
+		t.Fatalf("with-thinking low TPS classification=%q, want healthy", got)
+	}
+	if got := classifyQuality(750, 200, true, pol); got != "soft" {
+		t.Fatalf("with-thinking mid TPS classification=%q, want soft", got)
+	}
+}
+
+func TestThinkingGuardOffFallsBackToTPSOnly(t *testing.T) {
+	pol := defaultPolicy()
+	pol.ThinkingGuard = false
+	if got := classifyQuality(5000, 200, false, pol); got != "hard" {
+		t.Fatalf("guard off high TPS=%q, want hard", got)
+	}
+	if got := classifyQuality(10, 200, false, pol); got != "healthy" {
+		t.Fatalf("guard off low TPS without thinking=%q, want healthy", got)
+	}
+}
+
+func TestRecordHasThinkingFallsBackToReasoningTokens(t *testing.T) {
+	if recordHasThinking(map[string]any{
+		"Detail": map[string]any{"reasoning_tokens": float64(12)},
+	}) != true {
+		t.Fatal("reasoning_tokens in Detail should count as thinking")
+	}
+	if recordHasThinking(map[string]any{
+		"delta": map[string]any{"thinking_content": "step 1"},
+	}) != true {
+		t.Fatal("thinking_content should count as thinking")
+	}
+	if recordHasThinking(map[string]any{
+		"output_tokens": float64(64),
+	}) != false {
+		t.Fatal("plain output without reasoning must not count as thinking")
+	}
+}
+
+func TestAccountQuotaExhaustedDetection(t *testing.T) {
+	for _, test := range []struct {
+		status int
+		body   string
+		want   bool
+	}{
+		{200, "free-usage-exhausted for plan", true},
+		{403, "FREE_USAGE_EXHAUSTED", true},
+		{400, "subscription:free-usage limit", true},
+		{400, "Included Free Usage has ended", true},
+		{429, "rate limit exceeded", true},
+		{429, "quota remaining 0", true},
+		{429, "daily usage cap", true},
+		{200, "quota exhausted on account", true},
+		{429, "please slow down", false},
+		{500, "internal error", false},
+	} {
+		if got := isAccountQuotaExhausted(test.status, test.body); got != test.want {
+			t.Fatalf("isAccountQuotaExhausted(%d, %q)=%v, want %v", test.status, test.body, got, test.want)
+		}
+	}
+}
+
+func TestShouldRetryProbeWithNextAuth(t *testing.T) {
+	if !shouldRetryProbeWithNextAuth(true, 429, "free-usage-exhausted", "account_error") {
+		t.Fatal("quota exhaustion must retry next auth")
+	}
+	if shouldRetryProbeWithNextAuth(false, 429, "free-usage-exhausted", "account_error") {
+		t.Fatal("no next auth must not retry")
+	}
+	if !shouldRetryProbeWithNextAuth(true, 401, "invalid or expired token", "account_error") {
+		t.Fatal("auth error must retry next auth")
+	}
+	if shouldRetryProbeWithNextAuth(true, 502, "bad gateway", "upstream_error") {
+		t.Fatal("upstream error must not switch auth")
+	}
+}
+
+func TestProbeUnstableErrDetection(t *testing.T) {
+	for _, msg := range []string{
+		"read: connection reset by peer",
+		"unexpected EOF",
+		"http2: stream closed",
+		"tls: handshake failure",
+		"i/o timeout",
+	} {
+		if !isProbeUnstableErr(errors.New(msg)) {
+			t.Fatalf("expected unstable for %q", msg)
+		}
+	}
+	if isProbeUnstableErr(errors.New("json: cannot unmarshal")) {
+		t.Fatal("parse errors are not probe instability")
+	}
+	res := probeUnstableResult(qualityResult{Model: "grok-4.5"}, errors.New("connection reset by peer"), 1234)
+	if res.Classification != "hard" || res.ErrorKind != "probe_unstable" {
+		t.Fatalf("unstable result=%+v", res)
+	}
+	if !strings.Contains(res.Error, "断流不稳定") {
+		t.Fatalf("error text=%q", res.Error)
 	}
 }
 
