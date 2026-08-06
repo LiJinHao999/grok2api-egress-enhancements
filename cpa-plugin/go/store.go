@@ -215,25 +215,34 @@ func normalizePolicy(p *policyConfig, rawPolicy map[string]any) {
 				p.ThinkingGuard = def.ThinkingGuard
 			}
 		}
-		if _, ok := rawPolicy["thinking_cross_verify"]; !ok {
-			if _, ok2 := rawPolicy["thinkingCrossVerify"]; !ok2 {
-				p.ThinkingCrossVerify = def.ThinkingCrossVerify
-			}
-		}
-		if _, ok := rawPolicy["soft_cross_verify"]; !ok {
-			if _, ok2 := rawPolicy["softCrossVerify"]; !ok2 {
-				p.SoftCrossVerify = def.SoftCrossVerify
-			}
-		}
 		if _, ok := rawPolicy["disable_auth_on_hard"]; !ok {
 			if _, ok2 := rawPolicy["disableAuthOnHard"]; !ok2 {
 				p.DisableAuthOnHard = def.DisableAuthOnHard
 			}
 		}
-		if _, ok := rawPolicy["consecutive_missing_thinking"]; !ok {
-			if _, ok2 := rawPolicy["consecutiveMissingThinking"]; !ok2 {
-				p.ConsecutiveMissingThinking = def.ConsecutiveMissingThinking
+		// Redesign migration: older state never had consecutive_missing_thinking /
+		// soft_cross_verify. Re-apply the new product defaults even if an intermediate
+		// build had already persisted thinking_cross_verify=false.
+		_, hasMissingCount := rawPolicy["consecutive_missing_thinking"]
+		if !hasMissingCount {
+			_, hasMissingCount = rawPolicy["consecutiveMissingThinking"]
+		}
+		_, hasSoftCV := rawPolicy["soft_cross_verify"]
+		if !hasSoftCV {
+			_, hasSoftCV = rawPolicy["softCrossVerify"]
+		}
+		if !hasMissingCount {
+			p.ConsecutiveMissingThinking = def.ConsecutiveMissingThinking
+			p.ThinkingCrossVerify = def.ThinkingCrossVerify
+		} else {
+			if _, ok := rawPolicy["thinking_cross_verify"]; !ok {
+				if _, ok2 := rawPolicy["thinkingCrossVerify"]; !ok2 {
+					p.ThinkingCrossVerify = def.ThinkingCrossVerify
+				}
 			}
+		}
+		if !hasSoftCV {
+			p.SoftCrossVerify = def.SoftCrossVerify
 		}
 	}
 	if !p.ThinkingGuard {
@@ -288,6 +297,22 @@ func (s *stateStore) load() error {
 		rawPolicy = nil
 	}
 	normalizePolicy(&data.Policy, rawPolicy)
+	// Persist migrated defaults so subsequent boots see explicit keys (not only memory).
+	if rawPolicy != nil {
+		_, hasMissingCount := rawPolicy["consecutive_missing_thinking"]
+		if !hasMissingCount {
+			_, hasMissingCount = rawPolicy["consecutiveMissingThinking"]
+		}
+		if !hasMissingCount {
+			// force rewrite with migrated policy
+			s.data = data
+			for _, n := range data.Nodes {
+				n.ProxyURL = n.ProxyURLStored
+			}
+			_ = s.persistLocked()
+			return nil
+		}
+	}
 	// hydrate private proxy field
 	for _, n := range data.Nodes {
 		n.ProxyURL = n.ProxyURLStored

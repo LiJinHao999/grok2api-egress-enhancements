@@ -213,17 +213,44 @@ func TestNormalizePolicyFillsAbsentBoolDefaults(t *testing.T) {
 	if p.ConsecutiveMissingThinking != 1 {
 		t.Fatalf("absent consecutive_missing_thinking=%d, want 1", p.ConsecutiveMissingThinking)
 	}
-	// Explicit false must be preserved.
-	p2 := policyConfig{HardTPS: 1000, SoftTPS: 500, ThinkingGuard: false}
+	// Intermediate build may have persisted thinking_cross_verify=false before redesign.
+	// Missing consecutive_missing_thinking still means "pre-redesign" → upgrade defaults.
+	pMid := policyConfig{HardTPS: 1000, SoftTPS: 500, ThinkingGuard: true, ThinkingCrossVerify: false}
+	normalizePolicy(&pMid, map[string]any{
+		"hard_tps":               1000,
+		"soft_tps":               500,
+		"thinking_guard":         true,
+		"thinking_cross_verify":  false,
+	})
+	if !pMid.ThinkingCrossVerify {
+		t.Fatal("pre-redesign state must migrate thinking_cross_verify to default on")
+	}
+	if pMid.ConsecutiveMissingThinking != 1 {
+		t.Fatalf("migrated consecutive_missing_thinking=%d, want 1", pMid.ConsecutiveMissingThinking)
+	}
+	// After redesign, explicit false + present consecutive count must be preserved.
+	p2 := policyConfig{HardTPS: 1000, SoftTPS: 500, ThinkingGuard: true, ThinkingCrossVerify: false, ConsecutiveMissingThinking: 2}
 	normalizePolicy(&p2, map[string]any{
+		"hard_tps":                     1000,
+		"soft_tps":                     500,
+		"thinking_guard":               true,
+		"thinking_cross_verify":        false,
+		"consecutive_missing_thinking": 2,
+	})
+	if p2.ThinkingCrossVerify {
+		t.Fatal("explicit thinking_cross_verify=false after redesign must stay false")
+	}
+	// Explicit thinking_guard=false must stay false and force cross-verify off.
+	p3 := policyConfig{HardTPS: 1000, SoftTPS: 500, ThinkingGuard: false}
+	normalizePolicy(&p3, map[string]any{
 		"hard_tps":       1000,
 		"soft_tps":       500,
 		"thinking_guard": false,
 	})
-	if p2.ThinkingGuard {
+	if p3.ThinkingGuard {
 		t.Fatal("explicit thinking_guard=false must stay false")
 	}
-	if p2.ThinkingCrossVerify {
+	if p3.ThinkingCrossVerify {
 		t.Fatal("thinking cross-verify must be forced off when guard is off")
 	}
 }
