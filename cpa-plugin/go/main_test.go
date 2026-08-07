@@ -365,7 +365,7 @@ func TestSoftCrossVerifySchedulesInsteadOfQuarantine(t *testing.T) {
 
 
 
-func TestAuthDegradeSkipsCrossVerifySchedule(t *testing.T) {
+func TestAuthDegradeCountsPassiveEvenWhenCrossVerifyScheduled(t *testing.T) {
 	store := newStateStore(filepath.Join(t.TempDir(), "state.json"))
 	node, err := store.createNode("n1", "http://127.0.0.1:7951", true, false, 10)
 	if err != nil {
@@ -382,25 +382,63 @@ func TestAuthDegradeSkipsCrossVerifySchedule(t *testing.T) {
 	if err := store.updatePolicy(pol); err != nil {
 		t.Fatal(err)
 	}
-	res := qualityResult{
+	passive := qualityResult{
 		Classification: "hard",
 		HasThinking:    false,
 		OutputTokens:   64,
 		TPS:            10,
-		AuthID:         "user@x",
-		AuthLabel:      "user@x",
+		AuthID:         "passive@x",
+		AuthLabel:      "passive@x",
 		Error:          "响应缺少 thinking_content（降智）",
 	}
-	applyObservation(store, node.ID, "passive", res)
+	applyObservation(store, node.ID, "passive", passive)
 	items := store.listAuthDegradeStats()
-	if len(items) != 1 || items[0].SampleCount != 1 || items[0].DegradedCount != 0 {
-		t.Fatalf("pre-cross-verify should sample only, not degrade: %+v", items)
+	if len(items) != 1 || items[0].AuthID != "passive@x" || items[0].SampleCount != 1 || items[0].DegradedCount != 1 {
+		t.Fatalf("passive missing-thinking must count degrade immediately: %+v", items)
 	}
-	// Active confirmation counts as one degrade.
-	applyObservation(store, node.ID, "active", res)
+	// Cross-verify uses a different account and must not merge into the passive one.
+	// Healthy retest → only the probe account gets a normal sample.
+	probeOK := qualityResult{
+		Classification: "healthy",
+		HasThinking:    true,
+		OutputTokens:   80,
+		TPS:            40,
+		AuthID:         "probe@x",
+		AuthLabel:      "probe@x",
+	}
+	applyObservation(store, node.ID, "active", probeOK)
 	items = store.listAuthDegradeStats()
-	if len(items) != 1 || items[0].DegradedCount != 1 || items[0].SampleCount != 2 {
-		t.Fatalf("after confirm want degraded=1 samples=2 got %+v", items[0])
+	byID := map[string]*authDegradeRecord{}
+	for _, it := range items {
+		byID[it.AuthID] = it
+	}
+	if p := byID["passive@x"]; p == nil || p.DegradedCount != 1 || p.SampleCount != 1 {
+		t.Fatalf("passive stats must stay degrade=1 sample=1, got %+v", p)
+	}
+	if p := byID["probe@x"]; p == nil || p.DegradedCount != 0 || p.SampleCount != 1 {
+		t.Fatalf("healthy cross-verify account must be sample=1 degrade=0, got %+v", p)
+	}
+	// Same probe account missing thinking on a later retest counts only for itself.
+	probeBad := qualityResult{
+		Classification: "hard",
+		HasThinking:    false,
+		OutputTokens:   64,
+		TPS:            10,
+		AuthID:         "probe@x",
+		AuthLabel:      "probe@x",
+		Error:          "响应缺少 thinking_content（降智）",
+	}
+	applyObservation(store, node.ID, "active", probeBad)
+	items = store.listAuthDegradeStats()
+	byID = map[string]*authDegradeRecord{}
+	for _, it := range items {
+		byID[it.AuthID] = it
+	}
+	if p := byID["passive@x"]; p == nil || p.DegradedCount != 1 || p.SampleCount != 1 {
+		t.Fatalf("passive must remain untouched after other-account retest: %+v", p)
+	}
+	if p := byID["probe@x"]; p == nil || p.DegradedCount != 1 || p.SampleCount != 2 {
+		t.Fatalf("probe missing-thinking want degrade=1 sample=2, got %+v", p)
 	}
 	endCrossVerify(node.ID)
 }
