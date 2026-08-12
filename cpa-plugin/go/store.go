@@ -133,6 +133,9 @@ type degradationRecord struct {
 	FirstTokenMs int64   `json:"first_token_ms,omitempty"`
 	DurationMs   int64   `json:"duration_ms,omitempty"`
 	TPS          float64 `json:"tps,omitempty"`
+	// WindowAuths snapshots the node's account-window count at degrade time.
+	WindowAuths    int `json:"window_auths,omitempty"`
+	WindowMaxAuths int `json:"window_max_auths,omitempty"`
 }
 
 type probeStats struct {

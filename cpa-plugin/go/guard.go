@@ -714,18 +714,20 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 			reason = missingThinkingReason
 		}
 		store.recordDegradation(degradationRecord{
-			TS:           now,
-			NodeID:       updated.ID,
-			NodeName:     updated.Name,
-			AuthID:       res.AuthID,
-			ExitIP:       updated.ExitIP,
-			Class:        "hard",
-			Reason:       reason,
-			ErrorKind:    res.ErrorKind,
-			OutputTokens: res.OutputTokens,
-			FirstTokenMs: res.FirstTokenMs,
-			DurationMs:   res.DurationMs,
-			TPS:          res.TPS,
+			TS:             now,
+			NodeID:         updated.ID,
+			NodeName:       updated.Name,
+			AuthID:         res.AuthID,
+			ExitIP:         updated.ExitIP,
+			Class:          "hard",
+			Reason:         reason,
+			ErrorKind:      res.ErrorKind,
+			OutputTokens:   res.OutputTokens,
+			FirstTokenMs:   res.FirstTokenMs,
+			DurationMs:     res.DurationMs,
+			TPS:            res.TPS,
+			WindowAuths:    len(updated.NodeWindowAuths),
+			WindowMaxAuths: pol.NodeWindowMaxAuths,
 		})
 	}
 	// Per-account 降智 stats:

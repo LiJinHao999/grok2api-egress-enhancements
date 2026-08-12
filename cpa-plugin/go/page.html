@@ -316,8 +316,8 @@
         <p id="degradation-summary">被动观测捕获的降智样本（响应缺少 thinking），保留时间、账号、出口 IP 与指标用于画像分析；最多保留最近 200 条。</p>
         <div class="table-wrap">
           <table class="rotation-table">
-            <thead><tr><th>时间</th><th>节点</th><th>账号</th><th>出口 IP</th><th>分类</th><th>原因</th><th class="numeric">Token</th><th class="numeric">首字</th></tr></thead>
-            <tbody id="degradation-list"><tr><td colspan="8" class="loading">等待降智事件</td></tr></tbody>
+            <thead><tr><th>时间</th><th>节点</th><th>账号</th><th>出口 IP</th><th class="numeric">窗口账号</th><th>分类</th><th>原因</th><th class="numeric">Token</th><th class="numeric">首字</th></tr></thead>
+            <tbody id="degradation-list"><tr><td colspan="9" class="loading">等待降智事件</td></tr></tbody>
           </table>
         </div>
       </div>
@@ -747,12 +747,13 @@
       const list = $('degradation-list');
       if (!list) return;
       const rows = Array.isArray(state.status?.degradations) ? state.status.degradations.slice().reverse() : [];
-      if (!rows.length) { list.innerHTML = '<tr><td colspan="8" class="empty">暂无降智事件</td></tr>'; return; }
+      if (!rows.length) { list.innerHTML = '<tr><td colspan="9" class="empty">暂无降智事件</td></tr>'; return; }
       list.innerHTML = rows.map((d) => {
         return '<tr><td>' + time(d.ts, true) + '</td>' +
           '<td>' + esc(d.node_name || d.node_id || '-') + '</td>' +
           '<td>' + esc(d.auth_id || '-') + '</td>' +
           '<td>' + esc(d.exit_ip || '-') + '</td>' +
+          '<td class="numeric">' + (d.window_auths ? d.window_auths + ' / ' + (d.window_max_auths || '-') : '-') + '</td>' +
           '<td><span class="badge bad">降智</span></td>' +
           '<td>' + esc(d.reason || '-') + '</td>' +
           '<td class="numeric">' + (d.output_tokens ? number(d.output_tokens) : '-') + '</td>' +
