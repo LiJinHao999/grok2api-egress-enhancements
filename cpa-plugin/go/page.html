@@ -494,7 +494,7 @@
             <p class="section-note">节点在窗口时长内累计使用的账号数达到上限后，自动停用该节点冷却（不参与调度与探测），冷却结束后自动恢复，用于规避同一出口 IP 短时间内使用多个账号的批量标记。</p>
             <div class="form-grid">
               <div class="field"><label for="policy-node-window-auths">窗口账号数上限</label><input id="policy-node-window-auths" type="number" min="0" max="50"><p class="help">窗口内累计账号数达到该值即冷却；0 表示关闭该功能；默认 3</p></div>
-              <div class="field"><label for="policy-node-window-hours">窗口时长（小时）</label><input id="policy-node-window-hours" type="number" min="1" max="168"><p class="help">冷却时长与滚动窗口跨度；默认 24</p></div>
+              <div class="field"><label for="policy-node-window-hours">窗口时长（分钟）</label><input id="policy-node-window-hours" type="number" min="60" max="10080"><p class="help">冷却时长与滚动窗口跨度（分钟）；默认 1440（24 小时）</p></div>
             </div>
           </section>
         </div>
@@ -848,7 +848,6 @@
       if (node.source === 'clash' && (node.clashActive || guard.clash_active)) extra = '<span class="badge good">Clash 当前</span> ';
       else if (node.source === 'clash') extra = '<span class="badge muted">Clash</span> ';
       if (guard.error_strikes) return extra + '<span class="badge warn">观测失败</span>';
-      if (guard.last_classification === 'hard') return extra + '<span class="badge warn">可疑</span>';
       if (guard.last_classification === 'healthy') return extra + '<span class="badge good">健康</span>';
       return extra + '<span class="badge muted">待检测</span>';
     }
@@ -981,12 +980,12 @@
         return '<tr class="' + rowClass + '" data-id="' + esc(node.id) + '">' +
           '<td class="check-cell"><input type="checkbox" data-action="select" ' + (state.selected.has(node.id) ? 'checked' : '') + ' aria-label="选择 ' + esc(node.name) + '"></td>' +
           '<td><div class="node-name" title="' + esc(node.name) + '">' + esc(node.name) + '</div><div class="subtext">ID ' + esc(node.id) + ' · ' + (node.proxyPool ? '代理池' : '固定代理') + (!node.enabled ? ' · 停用' : '') + '</div></td>' +
-          '<td>' + nodeBadge(node, guard) + '<div class="subtext" title="' + esc(reason) + '">' + esc(reason) + (cd ? ' · ' + cd : '') + '</div></td>' +
+          '<td style="width:11rem">' + nodeBadge(node, guard) + '<div class="subtext" title="' + esc(reason) + '">' + esc(reason) + (cd ? ' · ' + cd : '') + '</div></td>' +
           '<td><div title="真实健康响应累计使用时长（不含空闲选中）">' + (avail.serviceMs ? formatDurationMs(avail.serviceMs) : '-') + '<div class="subtext">正常 ' + number(avail.healthyObs) + ' · 降智观测 ' + number(avail.degradedObs) + '</div></div><div class="subtext" title="降智墙钟时长">' + (avail.quarantineMs ? ('降智 ' + formatDurationMs(avail.quarantineMs)) : '无降智记录') + (avail.totalActive ? (' · 累计使用 ' + formatDurationMs(avail.totalActive)) : '') + '</div></td>' +
           '<td><div>' + esc(node.exitIp || '-') + '</div><div class="subtext">出口 IP</div></td>' +
           '<td class="numeric ' + tpsClass + '">' + (observed ? Number(guard.last_output_tps || 0).toFixed(1) : '-') + '</td>' +
           '<td class="numeric">' + (guard.last_first_token_ms ? number(guard.last_first_token_ms) + ' ms' : '-') + '</td>' +
-          '<td><div>' + winfo.count + ' / ' + winfo.max + '</div><div class="subtext">' + (guard.disabled_by_node_window ? (windowCountdown(guard) || '冷却中') : '24h 窗口账号') + '</div></td>' +
+          '<td><div>' + winfo.count + ' / ' + winfo.max + '</div><div class="subtext">' + (guard.disabled_by_node_window ? (windowCountdown(guard) || '冷却中') : '窗口账号') + '</div>' + (guard.disabled_by_node_window && guard.node_window_until ? '<div class="subtext">' + time(Number(guard.node_window_until), true) + ' 到期</div>' : '') + '</td>' +
           '<td class="actions-col">' + actionButtons(node) + '</td></tr>';
       }).join('');
       $('node-cards').innerHTML = nodes.map((node) => {
@@ -1102,7 +1101,7 @@
       if ($('policy-node-auto-disable')) $('policy-node-auto-disable').checked = cfg.node_auto_disable !== false;
       if ($('policy-node-auto-count')) $('policy-node-auto-count').value = cfg.node_auto_disable_min_quarantines || 3;
       if ($('policy-node-window-auths')) $('policy-node-window-auths').value = cfg.node_window_max_auths ?? 3;
-      if ($('policy-node-window-hours')) $('policy-node-window-hours').value = cfg.node_window_hours || 24;
+      if ($('policy-node-window-hours')) $('policy-node-window-hours').value = Math.round((cfg.node_window_hours || 24) * 60);
       syncPolicyFormDependencies();
       openModal('policy-modal');
     }
@@ -1412,7 +1411,7 @@
         policySchema: Number(state.status?.config?.policy_schema) || 5,
         minHealthyNodes: Number($('policy-min-healthy').value),
         nodeWindowMaxAuths: Number($('policy-node-window-auths')?.value ?? 0),
-        nodeWindowHours: Number($('policy-node-window-hours')?.value ?? 24)
+        nodeWindowHours: (Number($('policy-node-window-hours')?.value) || 1440) / 60
       };
       busy(button, true);
       try { await api('/quality-guard/config', {method:'PUT', body}); toast('守护策略已保存'); closeModal('policy-modal'); await load(true); }
