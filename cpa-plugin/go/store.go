@@ -118,6 +118,23 @@ type guardEvent struct {
 	OutputTPS      float64 `json:"output_tps,omitempty"`
 }
 
+// degradationRecord keeps one detected quality-degrade sample (missing-thinking
+// hard hit or transport error) with account/IP attribution for profiling.
+type degradationRecord struct {
+	TS           float64 `json:"ts"`
+	NodeID       string  `json:"node_id,omitempty"`
+	NodeName     string  `json:"node_name,omitempty"`
+	AuthID       string  `json:"auth_id,omitempty"`
+	ExitIP       string  `json:"exit_ip,omitempty"`
+	Class        string  `json:"class"`
+	Reason       string  `json:"reason,omitempty"`
+	ErrorKind    string  `json:"error_kind,omitempty"`
+	OutputTokens int64   `json:"output_tokens,omitempty"`
+	FirstTokenMs int64   `json:"first_token_ms,omitempty"`
+	DurationMs   int64   `json:"duration_ms,omitempty"`
+	TPS          float64 `json:"tps,omitempty"`
+}
+
 type probeStats struct {
 	Total        int64 `json:"total"`
 	Healthy      int64 `json:"healthy"`
@@ -181,9 +198,10 @@ type guardState struct {
 	Version   int                           `json:"version"`
 	Policy    policyConfig                  `json:"policy"`
 	ClashUI   clashUIConfig                 `json:"clash_ui,omitempty"`
-	Nodes     map[string]*nodeRecord        `json:"nodes"`
-	Events    []guardEvent                  `json:"events"`
-	Stats     statistics                    `json:"statistics"`
+	Nodes         map[string]*nodeRecord        `json:"nodes"`
+	Events        []guardEvent                  `json:"events"`
+	Degradations  []degradationRecord           `json:"degradations,omitempty"`
+	Stats         statistics                    `json:"statistics"`
 	AuthStats map[string]*authDegradeRecord `json:"auth_stats"`
 	NextID    int                           `json:"next_id"`
 	UpdatedAt float64                       `json:"updated_at"`
@@ -780,6 +798,30 @@ func (s *stateStore) events() []guardEvent {
 	defer s.mu.Unlock()
 	out := make([]guardEvent, len(s.data.Events))
 	copy(out, s.data.Events)
+	return out
+}
+
+func (s *stateStore) recordDegradation(d degradationRecord) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if d.TS == 0 {
+		d.TS = float64(time.Now().Unix())
+	}
+	s.data.Degradations = append(s.data.Degradations, d)
+	if len(s.data.Degradations) > 200 {
+		s.data.Degradations = s.data.Degradations[len(s.data.Degradations)-200:]
+	}
+	_ = s.persistLocked()
+}
+
+func (s *stateStore) degradations() []degradationRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]degradationRecord, len(s.data.Degradations))
+	copy(out, s.data.Degradations)
 	return out
 }
 

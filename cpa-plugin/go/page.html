@@ -310,6 +310,19 @@
       </div>
     </section>
 
+    <section id="degradation-banner" class="queue-banner" aria-label="降智事件记录">
+      <div>
+        <strong id="degradation-title">降智事件记录</strong>
+        <p id="degradation-summary">被动观测捕获的降智样本（缺 thinking 与传输故障），保留时间、账号、出口 IP 与指标用于画像分析；最多保留最近 200 条。</p>
+        <div class="table-wrap">
+          <table class="rotation-table">
+            <thead><tr><th>时间</th><th>节点</th><th>账号</th><th>出口 IP</th><th>分类</th><th>原因</th><th class="numeric">Token</th><th class="numeric">首字</th></tr></thead>
+            <tbody id="degradation-list"><tr><td colspan="8" class="loading">等待降智事件</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
     <div id="panel-ops" class="panel-view stack" data-panel-view="ops">
     <section class="section" aria-labelledby="nodes-title">
       <div class="section-head">
@@ -475,6 +488,15 @@
               <div class="field" id="policy-node-auto-count-wrap"><label for="policy-node-auto-count">累计隔离次数阈值</label><input id="policy-node-auto-count" type="number" min="1" max="100"><p class="help">同一出口累计隔离达到该次数（含）后自动停用；默认 3</p></div>
             </div>
           </section>
+
+          <section class="policy-section" id="policy-section-node-window" aria-labelledby="policy-section-node-window-title">
+            <h4 id="policy-section-node-window-title">节点账号窗口</h4>
+            <p class="section-note">节点在窗口时长内累计使用的账号数达到上限后，自动停用该节点冷却（不参与调度与探测），冷却结束后自动恢复，用于规避同一出口 IP 短时间内使用多个账号的批量标记。</p>
+            <div class="form-grid">
+              <div class="field"><label for="policy-node-window-auths">窗口账号数上限</label><input id="policy-node-window-auths" type="number" min="0" max="50"><p class="help">窗口内累计账号数达到该值即冷却；0 表示关闭该功能；默认 3</p></div>
+              <div class="field"><label for="policy-node-window-hours">窗口时长（小时）</label><input id="policy-node-window-hours" type="number" min="1" max="168"><p class="help">冷却时长与滚动窗口跨度；默认 24</p></div>
+            </div>
+          </section>
         </div>
         <div class="modal-actions"><button class="button" type="button" data-close="policy-modal">取消</button><button id="save-policy" class="button primary" type="submit">保存策略</button></div>
       </form>
@@ -620,7 +642,7 @@
       }
     }
     function render() {
-      renderMetrics(); renderRotation(); renderNodes(); renderStatistics(); renderEvents(); renderPolicy(); renderClash(); renderAnalytics();
+      renderMetrics(); renderRotation(); renderDegradations(); renderNodes(); renderStatistics(); renderEvents(); renderPolicy(); renderClash(); renderAnalytics();
       if (window.EgressAccountsPanel) window.EgressAccountsPanel.render(state);
     }
     function switchPanel(name) {
@@ -719,6 +741,25 @@
           '<td class="numeric">' + (r.candidates ?? '-') + '</td>' +
           '<td class="numeric">' + (r.eligible ?? '-') + '</td>' +
           '<td>' + outcome + '</td></tr>';
+      }).join('');
+    }
+    function renderDegradations() {
+      const list = $('degradation-list');
+      if (!list) return;
+      const rows = Array.isArray(state.status?.degradations) ? state.status.degradations.slice().reverse() : [];
+      if (!rows.length) { list.innerHTML = '<tr><td colspan="8" class="empty">暂无降智事件</td></tr>'; return; }
+      list.innerHTML = rows.map((d) => {
+        const badge = d.class === 'hard'
+          ? '<span class="badge bad">降智</span>'
+          : '<span class="badge warn">传输故障</span>';
+        return '<tr><td>' + time(d.ts, true) + '</td>' +
+          '<td>' + esc(d.node_name || d.node_id || '-') + '</td>' +
+          '<td>' + esc(d.auth_id || '-') + '</td>' +
+          '<td>' + esc(d.exit_ip || '-') + '</td>' +
+          '<td>' + badge + '</td>' +
+          '<td>' + esc(d.reason || '-') + '</td>' +
+          '<td class="numeric">' + (d.output_tokens ? number(d.output_tokens) : '-') + '</td>' +
+          '<td class="numeric">' + (d.first_token_ms ? number(d.first_token_ms) + ' ms' : '-') + '</td></tr>';
       }).join('');
     }
     function renderMetrics() {
@@ -1060,6 +1101,8 @@
       $('policy-auth-auto-disable').checked = cfg.auth_auto_disable !== false;
       if ($('policy-node-auto-disable')) $('policy-node-auto-disable').checked = cfg.node_auto_disable !== false;
       if ($('policy-node-auto-count')) $('policy-node-auto-count').value = cfg.node_auto_disable_min_quarantines || 3;
+      if ($('policy-node-window-auths')) $('policy-node-window-auths').value = cfg.node_window_max_auths ?? 3;
+      if ($('policy-node-window-hours')) $('policy-node-window-hours').value = cfg.node_window_hours || 24;
       syncPolicyFormDependencies();
       openModal('policy-modal');
     }
@@ -1367,7 +1410,9 @@
         nodeAutoDisable: $('policy-node-auto-disable') ? $('policy-node-auto-disable').checked : true,
         nodeAutoDisableMinQuarantines: Number($('policy-node-auto-count')?.value) || 3,
         policySchema: Number(state.status?.config?.policy_schema) || 5,
-        minHealthyNodes: Number($('policy-min-healthy').value)
+        minHealthyNodes: Number($('policy-min-healthy').value),
+        nodeWindowMaxAuths: Number($('policy-node-window-auths')?.value ?? 0),
+        nodeWindowHours: Number($('policy-node-window-hours')?.value ?? 24)
       };
       busy(button, true);
       try { await api('/quality-guard/config', {method:'PUT', body}); toast('守护策略已保存'); closeModal('policy-modal'); await load(true); }

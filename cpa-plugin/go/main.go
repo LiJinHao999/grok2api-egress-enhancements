@@ -939,6 +939,7 @@ func buildStatus() map[string]any {
 		"authStats":         authStats,
 		"authDisabledCount": store.countPluginDisabledAuths(),
 		"recentEvents":      store.events(),
+		"degradations":      store.degradations(),
 		"rotation":          recentRotation(50),
 		"plugin":            pluginName,
 		"version":           pluginVersion,

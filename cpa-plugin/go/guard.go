@@ -706,6 +706,32 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 		store.bumpStat(source, res.Classification, res.OutputTokens)
 		return
 	}
+	// Persist degrade samples for profiling: missing-thinking hard hits and
+	// transport errors both degrade the exit. Account/request errors are not
+	// egress quality samples.
+	if updated.LastClassification == "hard" || (updated.LastClassification == "error" && res.ErrorKind == "transport_error") {
+		reason := res.Error
+		switch {
+		case updated.LastClassification == "hard" && reason == "":
+			reason = missingThinkingReason
+		case updated.LastClassification == "error" && reason == "":
+			reason = "传输故障 " + res.ErrorKind
+		}
+		store.recordDegradation(degradationRecord{
+			TS:           now,
+			NodeID:       updated.ID,
+			NodeName:     updated.Name,
+			AuthID:       res.AuthID,
+			ExitIP:       updated.ExitIP,
+			Class:        updated.LastClassification,
+			Reason:       reason,
+			ErrorKind:    res.ErrorKind,
+			OutputTokens: res.OutputTokens,
+			FirstTokenMs: res.FirstTokenMs,
+			DurationMs:   res.DurationMs,
+			TPS:          res.TPS,
+		})
+	}
 	// Per-account 降智 stats:
 	// - sample: real generation outcomes (healthy/hard quality), not errors/ignored
 	// - degraded: this observation itself is a quality-degrade hit for THIS auth
@@ -1065,6 +1091,16 @@ func handlePassiveUsage(store *stateStore, record map[string]any) {
 				Classification: class,
 				OutputTPS:      tps,
 				Reason:         fmt.Sprintf("usage 未映射到出口节点 auth=%s idx=%s tokens=%d dur=%dms ttft=%dms", authID, authIndex, outTokens, durMs, ttftMs),
+			})
+			store.recordDegradation(degradationRecord{
+				TS:           float64(time.Now().Unix()),
+				AuthID:       authKey,
+				Class:        "hard",
+				Reason:       res.Error,
+				OutputTokens: outTokens,
+				FirstTokenMs: ttftMs,
+				DurationMs:   durMs,
+				TPS:          tps,
 			})
 		}
 		// Unmapped egress: still attribute account samples.
