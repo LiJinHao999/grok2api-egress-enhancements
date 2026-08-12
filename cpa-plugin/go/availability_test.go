@@ -148,9 +148,11 @@ func TestReQuarantineKeepsOriginalStart(t *testing.T) {
 	base := float64(1_700_000_000)
 	markNodeQuarantined(n, base)
 	n.DisabledByGuard = true
+	// Low-level markNodeQuarantined still keeps start and does not double-count within
+	// the same stint; cycle bumps for failed recovery live in quarantineNodeOpts.
 	markNodeQuarantined(n, base+100)
 	if n.LastQuarantinedAt != base || n.QuarantineCount != 1 {
-		t.Fatalf("re-quarantine should keep start/count: %+v", n)
+		t.Fatalf("re-quarantine helper should keep start/count: %+v", n)
 	}
 }
 
@@ -193,4 +195,145 @@ func TestApplyObservationCreditsHealthyAndDegraded(t *testing.T) {
 	if score := snap["quality_score"].(float64); score != 50 {
 		t.Fatalf("score want 50 (1/2) got %v", score)
 	}
+}
+
+func TestRecordNodeAuthUsageTriggersWindowDisable(t *testing.T) {
+	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	n, err := s.createNode("n1", "socks5h://127.0.0.1:1080", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, auth := range []string{"auth-1", "auth-2"} {
+		if s.recordNodeAuthUsage(n.ID, auth) {
+			t.Fatalf("premature trigger on %s", auth)
+		}
+	}
+	if !s.recordNodeAuthUsage(n.ID, "auth-3") {
+		t.Fatal("expected window disable trigger at 3 accounts")
+	}
+	got, _ := s.getNode(n.ID)
+	if !got.DisabledByNodeWindow || got.NodeWindowUntil == 0 || got.NodeWindowReason == "" {
+		t.Fatalf("window disable not recorded: %+v", got)
+	}
+	if got.NodeWindowAuths["auth-1"] == 0 || got.NodeWindowAuths["auth-2"] == 0 || got.NodeWindowAuths["auth-3"] == 0 {
+		t.Fatalf("window auths missing: %+v", got.NodeWindowAuths)
+	}
+	// Already cooling off: stragglers must not re-trigger or extend expiry.
+	before := got.NodeWindowUntil
+	if s.recordNodeAuthUsage(n.ID, "auth-4") {
+		t.Fatal("no re-trigger while disabled")
+	}
+	got, _ = s.getNode(n.ID)
+	if got.NodeWindowUntil != before {
+		t.Fatalf("expiry must not extend: before=%v after=%v", before, got.NodeWindowUntil)
+	}
+}
+
+func TestRecordNodeAuthUsageRollingExpiry(t *testing.T) {
+	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	n, err := s.createNode("n1", "socks5h://127.0.0.1:1080", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Seed stale entries older than the 24h window; they must be evicted on the
+	// next record instead of counting toward the limit.
+	s.mu.Lock()
+	n.NodeWindowAuths = map[string]float64{
+		"auth-old-1": float64(time.Now().Unix()) - 25*3600,
+		"auth-old-2": float64(time.Now().Unix()) - 26*3600,
+	}
+	s.mu.Unlock()
+	// A fresh record evicts the stale pair first; if they survived, the first
+	// two fresh records would already hit the threshold of 3.
+	if s.recordNodeAuthUsage(n.ID, "auth-new-1") {
+		t.Fatal("stale entries must be evicted before counting")
+	}
+	if s.recordNodeAuthUsage(n.ID, "auth-new-2") {
+		t.Fatal("stale entries must be evicted before counting")
+	}
+	got, _ := s.getNode(n.ID)
+	if len(got.NodeWindowAuths) != 2 {
+		t.Fatalf("stale entries not evicted: %+v", got.NodeWindowAuths)
+	}
+	if got.NodeWindowAuths["auth-old-1"] != 0 || got.NodeWindowAuths["auth-old-2"] != 0 {
+		t.Fatalf("stale entries survived: %+v", got.NodeWindowAuths)
+	}
+	// Third fresh account reaches the threshold of 3 — trigger is correct now.
+	if !s.recordNodeAuthUsage(n.ID, "auth-new-3") {
+		t.Fatal("expected trigger with 3 fresh accounts")
+	}
+	got, _ = s.getNode(n.ID)
+	if !got.DisabledByNodeWindow || len(got.NodeWindowAuths) != 3 {
+		t.Fatalf("window state wrong: %+v", got)
+	}
+}
+
+func TestNodeSchedulableFlags(t *testing.T) {
+	base := &nodeRecord{Enabled: true}
+	if !nodeSchedulable(base) {
+		t.Fatal("base node must be schedulable")
+	}
+	cases := []struct {
+		name   string
+		mut    func(*nodeRecord)
+		expect bool
+	}{
+		{"disabled", func(n *nodeRecord) { n.Enabled = false }, false},
+		{"guard", func(n *nodeRecord) { n.DisabledByGuard = true }, false},
+		{"operator", func(n *nodeRecord) { n.DisabledByOperator = true }, false},
+		{"window", func(n *nodeRecord) { n.DisabledByNodeWindow = true }, false},
+		{"all", func(n *nodeRecord) {
+			n.Enabled = false
+			n.DisabledByGuard = true
+			n.DisabledByOperator = true
+			n.DisabledByNodeWindow = true
+		}, false},
+	}
+	for _, tc := range cases {
+		n := &nodeRecord{Enabled: true}
+		tc.mut(n)
+		if got := nodeSchedulable(n); got != tc.expect {
+			t.Fatalf("%s: nodeSchedulable=%v want %v", tc.name, got, tc.expect)
+		}
+	}
+	if nodeSchedulable(nil) {
+		t.Fatal("nil node must not be schedulable")
+	}
+}
+
+func TestNodeWindowAutoRestoresAfterCooldown(t *testing.T) {
+	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	n, err := s.createNode("n1", "socks5h://127.0.0.1:1080", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.updateNode(n.ID, func(node *nodeRecord) error {
+		node.DisabledByNodeWindow = true
+		node.NodeWindowUntil = float64(time.Now().Add(-time.Minute).Unix())
+		node.NodeWindowReason = "窗口测试"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if nodeSchedulable(mustNode(s, n.ID)) {
+		t.Fatal("window-disabled node must not be schedulable")
+	}
+	if !s.clearNodeWindow(n.ID) {
+		t.Fatal("clearNodeWindow should clear expired window")
+	}
+	got := mustNode(s, n.ID)
+	if got.DisabledByNodeWindow || got.NodeWindowUntil != 0 || len(got.NodeWindowAuths) != 0 {
+		t.Fatalf("window not cleared: %+v", got)
+	}
+	if !nodeSchedulable(got) {
+		t.Fatal("cleared node must be schedulable again")
+	}
+}
+
+func mustNode(s *stateStore, id string) *nodeRecord {
+	n, ok := s.getNode(id)
+	if !ok {
+		panic("node not found: " + id)
+	}
+	return n
 }

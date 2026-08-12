@@ -75,7 +75,7 @@ import (
 
 const (
 	pluginName          = "grok2api-egress"
-	pluginVersion       = "1.1.23"
+	pluginVersion       = "1.1.36"
 	resourcePath        = "/status"
 	managementAPIPath   = "/v0/management/grok2api-egress/api"
 	resourceContentType = "text/html; charset=utf-8"
@@ -124,12 +124,8 @@ type pluginConfig struct {
 	ClashUnixSocket string `yaml:"clash_unix_socket" json:"clash_unix_socket"`
 	ClashSecret     string `yaml:"clash_secret" json:"clash_secret"` // prefer env; kept for local single-user setups
 	ClashSecretEnv  string `yaml:"clash_secret_env" json:"clash_secret_env"`
-	ClashGroup      string `yaml:"clash_group" json:"clash_group"`
-	ClashProxyURL   string `yaml:"clash_proxy_url" json:"clash_proxy_url"`
-	// Quality probes switch TestGroup and dial TestProxyURL so production traffic
-	// on ClashGroup + ClashProxyURL is never disturbed.
-	ClashTestGroup        string   `yaml:"clash_test_group" json:"clash_test_group"`
-	ClashTestProxyURL     string   `yaml:"clash_test_proxy_url" json:"clash_test_proxy_url"`
+	ClashGroup            string   `yaml:"clash_group" json:"clash_group"`
+	ClashProxyURL         string   `yaml:"clash_proxy_url" json:"clash_proxy_url"`
 	ClashCloseConnections bool     `yaml:"clash_close_connections" json:"clash_close_connections"`
 	ClashSyncOnStart      bool     `yaml:"clash_sync_on_start" json:"clash_sync_on_start"`
 	ClashTimeoutSec       int      `yaml:"clash_timeout_seconds" json:"clash_timeout_seconds"`
@@ -144,12 +140,10 @@ type registration struct {
 }
 
 type registrationCapabilities struct {
-	ManagementAPI          bool `json:"management_api"`
-	UsagePlugin            bool `json:"usage_plugin"`
-	Scheduler              bool `json:"scheduler"`
-	RequestInterceptor     bool `json:"request_interceptor"`
-	ResponseInterceptor    bool `json:"response_interceptor"`
-	StreamChunkInterceptor bool `json:"stream_chunk_interceptor"`
+	ManagementAPI      bool `json:"management_api"`
+	UsagePlugin        bool `json:"usage_plugin"`
+	Scheduler          bool `json:"scheduler"`
+	RequestInterceptor bool `json:"request_interceptor"`
 }
 
 type managementRegistration struct {
@@ -251,7 +245,6 @@ func cliproxyPluginShutdown() {
 	if workerCancel != nil {
 		workerCancel()
 	}
-	stopQualityWorker()
 }
 
 func handleMethod(method string, request []byte) ([]byte, error) {
@@ -264,7 +257,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 	case pluginabi.MethodManagementRegister:
 		return okEnvelope(managementRegistration{
 			Routes:    []managementRoute{{Method: http.MethodPost, Path: "/grok2api-egress/api", Description: "CPA 出口守护 UI API"}},
-			Resources: []managementResource{{Path: resourcePath, Menu: "出口守护", Description: "纯 CPA 出口节点 · 降智隔离 · 质量检测（不依赖 Grok2API）"}},
+			Resources: []managementResource{{Path: resourcePath, Menu: "出口守护", Description: "纯 CPA 出口节点 · 降智隔离 · 被动观测（不依赖 Grok2API）"}},
 		})
 	case pluginabi.MethodManagementHandle:
 		return handleManagement(request)
@@ -276,10 +269,6 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return handleRequestIntercept(request, false)
 	case pluginabi.MethodRequestInterceptAfter:
 		return handleRequestIntercept(request, true)
-	case pluginabi.MethodResponseInterceptAfter:
-		return handleResponseIntercept(request)
-	case pluginabi.MethodResponseInterceptStreamChunk:
-		return handleStreamChunkIntercept(request)
 	default:
 		return errorEnvelope("unknown_method", "unknown method: "+method), nil
 	}
@@ -323,7 +312,12 @@ func configure(raw []byte) error {
 	clashCached = nil
 	clashCfgSnap = clashRuntimeConfig{}
 	clashMu.Unlock()
-	store = newStateStore(cfg.StateFile)
+	// 仅在 state_file 路径变化时才重建 store。CPA 在 auth 文件写入(自动刷新/
+	// 导入)时会触发插件 reconfigure;无条件重建会让运行中的观测记账写进旧
+	// store,随后被新 store 的周期持久化覆盖(记账/事件/统计全部丢失)。
+	if store == nil || store.path != cfg.StateFile {
+		store = newStateStore(cfg.StateFile)
+	}
 	if workerCancel != nil {
 		workerCancel()
 	}
@@ -362,8 +356,6 @@ func pluginRegistration() registration {
 				{Name: "clash_secret", Type: pluginapi.ConfigFieldTypeString, Description: "Clash secret（优先用 clash_secret_env）"},
 				{Name: "clash_group", Type: pluginapi.ConfigFieldTypeString, Description: "生产策略组（账号流量），默认 🏜️ PerfectAI"},
 				{Name: "clash_proxy_url", Type: pluginapi.ConfigFieldTypeString, Description: "生产 mixed-port，例如 http://172.19.0.1:7890"},
-				{Name: "clash_test_group", Type: pluginapi.ConfigFieldTypeString, Description: "质量探测专用策略组，例如 ➖ PerfectAI_TestPort"},
-				{Name: "clash_test_proxy_url", Type: pluginapi.ConfigFieldTypeString, Description: "质量探测专用代理，例如 http://172.19.0.1:7953"},
 				{Name: "clash_close_connections", Type: pluginapi.ConfigFieldTypeBoolean, Description: "生产组切换后关闭旧连接"},
 				{Name: "clash_sync_on_start", Type: pluginapi.ConfigFieldTypeBoolean, Description: "启动时从 PerfectAI 同步节点"},
 				{Name: "clash_timeout_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "Clash API 超时（秒）"},
@@ -371,7 +363,7 @@ func pluginRegistration() registration {
 				{Name: "clash_prefer_keywords", Type: pluginapi.ConfigFieldTypeArray, Description: "同步时优先这些关键词"},
 			},
 		},
-		Capabilities: registrationCapabilities{ManagementAPI: true, UsagePlugin: true, Scheduler: true, RequestInterceptor: true, ResponseInterceptor: true, StreamChunkInterceptor: true},
+		Capabilities: registrationCapabilities{ManagementAPI: true, UsagePlugin: true, Scheduler: true, RequestInterceptor: true},
 	}
 }
 
@@ -441,7 +433,7 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 
 	case path == "/auth-stats" || path == "/quality-guard/auth-stats":
 		if method == http.MethodGet {
-			items := store.listAuthDegradeStats()
+			items := store.listPublicAuthDegradeStats()
 			return managementJSON(http.StatusOK, map[string]any{"data": map[string]any{"items": items, "total": len(items)}, "items": items, "total": len(items)})
 		}
 		if method == http.MethodDelete {
@@ -449,6 +441,82 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 			return managementJSON(http.StatusOK, map[string]any{"data": map[string]any{"cleared": true}, "ok": true})
 		}
 		return managementJSON(http.StatusMethodNotAllowed, errMsg("methodNotAllowed", "method not allowed"))
+
+	case path == "/auth-stats/disabled" || path == "/quality-guard/auth-stats/disabled":
+		if method != http.MethodGet {
+			return managementJSON(http.StatusMethodNotAllowed, errMsg("methodNotAllowed", "method not allowed"))
+		}
+		items := listPluginDisabledAuthSummaries()
+		return managementJSON(http.StatusOK, map[string]any{
+			"data":  map[string]any{"items": items, "total": len(items), "disabled_count": len(items)},
+			"items": items, "total": len(items),
+		})
+
+	case path == "/auth-stats/disable" || path == "/quality-guard/auth-stats/disable":
+		if method != http.MethodPost {
+			return managementJSON(http.StatusMethodNotAllowed, errMsg("methodNotAllowed", "method not allowed"))
+		}
+		var raw map[string]any
+		_ = json.Unmarshal(body, &raw)
+		ids := stringIDs(raw["ids"])
+		reason, _ := raw["reason"].(string)
+		items := make([]map[string]any, 0, len(ids))
+		ok := 0
+		for _, id := range ids {
+			id = strings.TrimSpace(id)
+			if id == "" {
+				continue
+			}
+			a, err := disableAuthByID(id, "manual", reason)
+			entry := map[string]any{"auth_id": id, "ok": err == nil}
+			if err != nil {
+				entry["error"] = err.Error()
+			} else {
+				ok++
+				entry["label"] = firstNonEmpty(a.Email, a.Name, a.ID, a.Index)
+			}
+			if err == nil {
+				store.markAuthDisabled(id, "manual", authDisableReason(a))
+				store.appendEvent(guardEvent{Event: "auth_manual_disabled", AuthID: id, Reason: authDisableReason(a)})
+			}
+			items = append(items, entry)
+		}
+		return managementJSON(http.StatusOK, map[string]any{"ok": true, "disabled": ok, "items": items, "data": map[string]any{"disabled": ok, "items": items}})
+
+	case path == "/auth-stats/enable" || path == "/quality-guard/auth-stats/enable":
+		if method != http.MethodPost {
+			return managementJSON(http.StatusMethodNotAllowed, errMsg("methodNotAllowed", "method not allowed"))
+		}
+		var raw map[string]any
+		_ = json.Unmarshal(body, &raw)
+		ids := stringIDs(raw["ids"])
+		resetStats := true
+		if v, ok := raw["reset_stats"].(bool); ok {
+			resetStats = v
+		}
+		items := make([]map[string]any, 0, len(ids))
+		ok := 0
+		for _, id := range ids {
+			id = strings.TrimSpace(id)
+			if id == "" {
+				continue
+			}
+			a, err := enableAuthByID(id)
+			entry := map[string]any{"auth_id": id, "ok": err == nil}
+			if err != nil {
+				entry["error"] = err.Error()
+			} else {
+				ok++
+				entry["label"] = firstNonEmpty(a.Email, a.Name, a.ID, a.Index)
+			}
+			if err == nil {
+				store.clearAuthDisabled(id, resetStats)
+				store.appendEvent(guardEvent{Event: "auth_manual_enabled", AuthID: id, Reason: "面板手动恢复账号"})
+			}
+			items = append(items, entry)
+		}
+		return managementJSON(http.StatusOK, map[string]any{"ok": true, "enabled": ok, "items": items, "data": map[string]any{"enabled": ok, "items": items}})
+
 
 	case path == "/policy" || path == "/quality-guard/config":
 		if method == http.MethodGet {
@@ -462,73 +530,27 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 				return managementJSON(http.StatusBadRequest, errMsg("invalidBody", "invalid body"))
 			}
 			p = store.policy()
-			if v, ok := raw["mode"].(string); ok {
-				p.Mode = v
-			}
-			p.ActiveIntervalSec = intPick(raw, p.ActiveIntervalSec, "active_interval_seconds", "activeIntervalSeconds")
-			p.PassivePollSec = intPick(raw, p.PassivePollSec, "passive_poll_seconds", "passivePollSeconds")
-			p.QuarantineSec = intPick(raw, p.QuarantineSec, "quarantine_seconds", "quarantineSeconds")
-			p.SoftTPS = floatPick(raw, p.SoftTPS, "soft_tps", "softTPS")
-			p.HardTPS = floatPick(raw, p.HardTPS, "hard_tps", "hardTPS")
-			p.ConsecutiveSoft = intPick(raw, p.ConsecutiveSoft, "consecutive_soft", "consecutiveSoft")
 			p.ConsecutiveErrors = intPick(raw, p.ConsecutiveErrors, "consecutive_errors", "consecutiveErrors")
 			p.MinHealthyNodes = intPick(raw, p.MinHealthyNodes, "min_healthy_nodes", "minHealthyNodes")
 			p.MinGenerationMs = int64(intPick(raw, int(p.MinGenerationMs), "min_generation_ms", "minGenerationMs"))
 			p.MinOutputTokens = int64(intPick(raw, int(p.MinOutputTokens), "min_output_tokens", "minOutputTokens"))
-			p.MaxOutputTokensProbe = intPick(raw, p.MaxOutputTokensProbe, "max_output_tokens", "maxOutputTokens")
-			if v, ok := raw["model"].(string); ok && v != "" {
-				p.Model = v
+			if v, ok := raw["auth_auto_disable"].(bool); ok {
+				p.AuthAutoDisable = v
 			}
-			if v, ok := raw["probe_api_base"].(string); ok {
-				p.ProbeAPIBase = v
-			} else if v, ok := raw["probeApiBase"].(string); ok {
-				p.ProbeAPIBase = v
+			if v, ok := raw["authAutoDisable"].(bool); ok {
+				p.AuthAutoDisable = v
 			}
-			if v, ok := raw["probe_api_key"].(string); ok {
-				if strings.TrimSpace(v) != "" {
-					p.ProbeAPIKey = v
-				}
-			} else if v, ok := raw["probeApiKey"].(string); ok {
-				if strings.TrimSpace(v) != "" {
-					p.ProbeAPIKey = v
-				}
+			if v, ok := raw["node_auto_disable"].(bool); ok {
+				p.NodeAutoDisable = v
 			}
-			if v, ok := raw["probe_api_key_clear"].(bool); ok && v {
-				p.ProbeAPIKey = ""
-			} else if v, ok := raw["probeApiKeyClear"].(bool); ok && v {
-				p.ProbeAPIKey = ""
+			if v, ok := raw["nodeAutoDisable"].(bool); ok {
+				p.NodeAutoDisable = v
 			}
-			if v, ok := raw["disable_auth_on_hard"].(bool); ok {
-				p.DisableAuthOnHard = v
-			}
-			if v, ok := raw["disableAuthOnHard"].(bool); ok {
-				p.DisableAuthOnHard = v
-			}
-			if v, ok := raw["thinking_guard"].(bool); ok {
-				p.ThinkingGuard = v
-			}
-			if v, ok := raw["thinkingGuard"].(bool); ok {
-				p.ThinkingGuard = v
-			}
-			p.ConsecutiveMissingThinking = intPick(raw, p.ConsecutiveMissingThinking, "consecutive_missing_thinking", "consecutiveMissingThinking")
-			if v, ok := raw["thinking_cross_verify"].(bool); ok {
-				p.ThinkingCrossVerify = v
-			}
-			if v, ok := raw["thinkingCrossVerify"].(bool); ok {
-				p.ThinkingCrossVerify = v
-			}
-			if v, ok := raw["soft_cross_verify"].(bool); ok {
-				p.SoftCrossVerify = v
-			}
-			if v, ok := raw["softCrossVerify"].(bool); ok {
-				p.SoftCrossVerify = v
-			}
-			if !p.ThinkingGuard {
-				p.ThinkingCrossVerify = false
-			}
-			if kws, ok := stringSlicePick(raw, "isolation_keywords", "isolationKeywords"); ok {
-				p.IsolationKeywords = kws
-			}
+			p.NodeAutoDisableMinQuarantines = intPick(raw, p.NodeAutoDisableMinQuarantines, "node_auto_disable_min_quarantines", "nodeAutoDisableMinQuarantines")
+			p.NodeWindowMaxAuths = intPick(raw, p.NodeWindowMaxAuths, "node_window_max_auths", "nodeWindowMaxAuths")
+			p.NodeWindowHours = floatPick(raw, p.NodeWindowHours, "node_window_hours", "nodeWindowHours")
+			// Preserve schema from body when present so load-time migrations do not re-fire.
+			p.PolicySchema = intPick(raw, p.PolicySchema, "policy_schema", "policySchema")
 			if err := store.updatePolicy(p); err != nil {
 				return managementJSON(http.StatusBadRequest, errMsg("invalidPolicy", err.Error()))
 			}
@@ -640,22 +662,6 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 			})
 		}
 
-	case path == "/nodes/test":
-		if method == http.MethodPost {
-			var raw map[string]any
-			_ = json.Unmarshal(body, &raw)
-			ids := stringIDs(raw["ids"])
-			results := make([]map[string]any, 0, len(ids))
-			for _, id := range ids {
-				r, err := runNodeConnectivity(store, id)
-				if err != nil {
-					results = append(results, map[string]any{"id": id, "error": err.Error()})
-				} else {
-					results = append(results, r)
-				}
-			}
-			return managementJSON(http.StatusOK, map[string]any{"data": results, "results": results})
-		}
 
 	case path == "/nodes/rebalance" || path == "/rebalance":
 		if method == http.MethodPost {
@@ -683,7 +689,7 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 					node.Name = strings.TrimSpace(v)
 				}
 				if v, ok := raw["enabled"].(bool); ok {
-					node.Enabled = v
+					applyOperatorEnabledLocked(node, v, "manual", "面板手动停用")
 				}
 				if v, ok := raw["proxyPool"].(bool); ok {
 					node.ProxyPool = v
@@ -716,14 +722,6 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 			return managementJSON(http.StatusOK, map[string]any{"ok": true, "deleted": deleted})
 		}
 
-	case len(parts) == 3 && parts[0] == "nodes" && safeID(parts[1]) && parts[2] == "test":
-		if method == http.MethodPost {
-			r, err := runNodeConnectivity(store, parts[1])
-			if err != nil {
-				return managementJSON(http.StatusBadRequest, errMsg("testFailed", err.Error()))
-			}
-			return managementJSON(http.StatusOK, map[string]any{"data": r})
-		}
 
 	case len(parts) == 3 && parts[0] == "nodes" && safeID(parts[1]) && parts[2] == "accounts":
 		if method == http.MethodGet {
@@ -738,22 +736,6 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 			return managementJSON(http.StatusOK, map[string]any{"data": map[string]any{"items": items, "total": len(items)}, "items": items, "total": len(items)})
 		}
 
-	case len(parts) == 3 && parts[0] == "nodes" && safeID(parts[1]) && (parts[2] == "quality-test" || parts[2] == "quality"):
-		if method == http.MethodPost {
-			r, err := runNodeQuality(store, parts[1])
-			if err != nil {
-				return managementJSON(http.StatusBadRequest, errMsg("qualityFailed", err.Error()))
-			}
-			return managementJSON(http.StatusOK, map[string]any{"data": r})
-		}
-	case len(parts) == 4 && parts[0] == "quality-guard" && parts[1] == "nodes" && safeID(parts[2]) && parts[3] == "test":
-		if method == http.MethodPost {
-			r, err := runNodeQuality(store, parts[2])
-			if err != nil {
-				return managementJSON(http.StatusBadRequest, errMsg("qualityFailed", err.Error()))
-			}
-			return managementJSON(http.StatusOK, map[string]any{"data": r})
-		}
 
 	case path == "/clash" || path == "/clash/status":
 		if method != http.MethodGet {
@@ -791,16 +773,6 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 				in.ProxyURL = v
 			} else if v, ok := raw["proxyUrl"].(string); ok {
 				in.ProxyURL = v
-			}
-			if v, ok := raw["test_group"].(string); ok {
-				in.TestGroup = v
-			} else if v, ok := raw["testGroup"].(string); ok {
-				in.TestGroup = v
-			}
-			if v, ok := raw["test_proxy_url"].(string); ok {
-				in.TestProxyURL = v
-			} else if v, ok := raw["testProxyUrl"].(string); ok {
-				in.TestProxyURL = v
 			}
 			if v, ok := raw["secret"].(string); ok {
 				in.Secret = v
@@ -889,30 +861,16 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 }
 
 func publicPolicy(p policyConfig) map[string]any {
-	hasKey := strings.TrimSpace(p.ProbeAPIKey) != ""
 	return map[string]any{
-		"mode":                         p.Mode,
-		"active_interval_seconds":      p.ActiveIntervalSec,
-		"passive_poll_seconds":         p.PassivePollSec,
-		"quarantine_seconds":           p.QuarantineSec,
-		"soft_tps":                     p.SoftTPS,
-		"hard_tps":                     p.HardTPS,
-		"consecutive_soft":             p.ConsecutiveSoft,
 		"consecutive_errors":           p.ConsecutiveErrors,
 		"min_healthy_nodes":            p.MinHealthyNodes,
 		"min_generation_ms":            p.MinGenerationMs,
 		"min_output_tokens":            p.MinOutputTokens,
-		"model":                        p.Model,
-		"disable_auth_on_hard":         p.DisableAuthOnHard,
-		"thinking_guard":               p.ThinkingGuard,
-		"consecutive_missing_thinking": p.ConsecutiveMissingThinking,
-		"thinking_cross_verify":        p.ThinkingCrossVerify,
-		"soft_cross_verify":            p.SoftCrossVerify,
-		"max_output_tokens":            p.MaxOutputTokensProbe,
-		"isolation_keywords":           p.IsolationKeywords,
-		"probe_api_base":               p.ProbeAPIBase,
-		"probe_api_key_set":            hasKey,
-		"probe_api_key":                "",
+		"auth_auto_disable":                 p.AuthAutoDisable,
+		"node_auto_disable":                 p.NodeAutoDisable,
+		"node_auto_disable_min_quarantines": p.NodeAutoDisableMinQuarantines,
+		"node_window_max_auths":             p.NodeWindowMaxAuths,
+		"node_window_hours":                 p.NodeWindowHours,
 		"policy_schema":                p.PolicySchema,
 	}
 }
@@ -927,9 +885,16 @@ func buildStatus() map[string]any {
 		avail := nodeAvailabilitySnapshot(n, nowUnix)
 		nodeMap[n.ID] = map[string]any{
 			"disabled_by_guard":           n.DisabledByGuard,
+			"disabled_by_operator":       n.DisabledByOperator,
+			"disabled_source":            n.DisabledSource,
+			"disabled_at":                n.DisabledAt,
+			"disabled_reason":            n.DisabledReason,
 			"quarantined_until":           n.QuarantinedUntil,
+			"disabled_by_node_window":     n.DisabledByNodeWindow,
+			"node_window_until":           n.NodeWindowUntil,
+			"node_window_reason":          n.NodeWindowReason,
+			"node_window_auth_count":      len(n.NodeWindowAuths),
 			"error_strikes":               n.ErrorStrikes,
-			"soft_strikes":                n.SoftStrikes,
 			"thinking_strikes":            n.ThinkingStrikes,
 			"last_classification":         n.LastClassification,
 			"last_output_tps":             n.LastOutputTPS,
@@ -939,7 +904,6 @@ func buildStatus() map[string]any {
 			"last_reason":                 n.LastReason,
 			"last_source":                 n.LastSource,
 			"last_observed_at":            n.LastObservedAt,
-			"last_probe_at":               n.LastProbeAt,
 			"source":                      n.Source,
 			"clash_name":                  n.ClashName,
 			"clash_group":                 n.ClashGroup,
@@ -964,23 +928,24 @@ func buildStatus() map[string]any {
 	}
 	pol := store.policy()
 	st := store.stats()
-	authStats := store.listAuthDegradeStats()
+	authStats := store.listPublicAuthDegradeStats()
 	return map[string]any{
-		"available":     true,
-		"updatedAt":     store.snapshot().UpdatedAt,
-		"config":        publicPolicy(pol),
-		"editable":      true,
-		"nodes":         nodeMap,
-		"statistics":    st,
-		"authStats":     authStats,
-		"recentEvents":  store.events(),
-		"quality_queue": qualitySched.snapshot(),
-		"plugin":        pluginName,
-		"version":       pluginVersion,
-		"started_at":    startedAt.Format(time.RFC3339),
-		"engine":        "cpa-native",
-		"clash":         clashStatusPayload(),
-		"hint":          "纯 CPA 出口守护：可对接本机 Clash PerfectAI；降智时走 Clash API 切换叶子节点，账号统一走本机 mixed-port。质量检测全局串行排队，避免 Clash 出口交叉。",
+		"available":         true,
+		"updatedAt":         store.snapshot().UpdatedAt,
+		"config":            publicPolicy(pol),
+		"editable":          true,
+		"nodes":             nodeMap,
+		"statistics":        st,
+		"authStats":         authStats,
+		"authDisabledCount": store.countPluginDisabledAuths(),
+		"recentEvents":      store.events(),
+		"rotation":          recentRotation(50),
+		"plugin":            pluginName,
+		"version":           pluginVersion,
+		"started_at":        startedAt.Format(time.RFC3339),
+		"engine":            "cpa-native",
+		"clash":             clashStatusPayload(),
+		"hint":              "纯 CPA 出口守护：可对接本机 Clash PerfectAI；降智时走 Clash API 切换叶子节点，账号统一走本机 mixed-port。被动观测判定健康，无主动探测流量。",
 	}
 }
 
@@ -1056,46 +1021,6 @@ func stringIDs(v any) []string {
 		out = append(out, t...)
 	}
 	return out
-}
-
-// stringSlicePick extracts a string list from raw under any of the given keys.
-// ok is false when none of the keys are present, so callers can keep the previous value.
-func stringSlicePick(raw map[string]any, keys ...string) ([]string, bool) {
-	for _, k := range keys {
-		v, present := raw[k]
-		if !present {
-			continue
-		}
-		switch t := v.(type) {
-		case nil:
-			return nil, true
-		case []any:
-			out := make([]string, 0, len(t))
-			for _, x := range t {
-				if s, ok := x.(string); ok {
-					out = append(out, s)
-				} else if x != nil {
-					out = append(out, fmt.Sprint(x))
-				}
-			}
-			return out, true
-		case []string:
-			return append([]string{}, t...), true
-		case string:
-			// Allow newline / comma separated textareas.
-			parts := strings.FieldsFunc(t, func(r rune) bool {
-				return r == '\n' || r == '\r' || r == ',' || r == ';'
-			})
-			out := make([]string, 0, len(parts))
-			for _, p := range parts {
-				if s := strings.TrimSpace(p); s != "" {
-					out = append(out, s)
-				}
-			}
-			return out, true
-		}
-	}
-	return nil, false
 }
 
 func intPick(raw map[string]any, def int, keys ...string) int {

@@ -13,3 +13,9 @@ cpa-plugin/**/.env*
 cpa-plugin/**/auths/
 cpa-plugin/**/__pycache__/
 cpa-plugin/**/*.pyc
+
+# MCP tooling artifacts and local backups
+.playwright-mcp/
+.serena/
+cpa-plugin/go/go.mod.bak
+cpa-plugin/go/go.sum.bak

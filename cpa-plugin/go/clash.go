@@ -37,11 +37,8 @@ type clashRuntimeConfig struct {
 	APIURL     string
 	Secret     string
 	UnixSocket string
-	Group      string
-	ProxyURL   string
-	// TestGroup/TestProxyURL isolate quality probes from production traffic.
-	TestGroup        string
-	TestProxyURL     string
+	Group            string
+	ProxyURL         string
 	CloseConnections bool
 	SyncOnStart      bool
 	ExcludeKeywords  []string
@@ -87,8 +84,6 @@ func loadClashRuntimeConfig() clashRuntimeConfig {
 		UnixSocket:       strings.TrimSpace(cfg.ClashUnixSocket),
 		Group:            strings.TrimSpace(cfg.ClashGroup),
 		ProxyURL:         strings.TrimSpace(cfg.ClashProxyURL),
-		TestGroup:        strings.TrimSpace(cfg.ClashTestGroup),
-		TestProxyURL:     strings.TrimSpace(cfg.ClashTestProxyURL),
 		CloseConnections: cfg.ClashCloseConnections,
 		SyncOnStart:      cfg.ClashSyncOnStart,
 		ExcludeKeywords:  append([]string{}, cfg.ClashExcludeKeywords...),
@@ -116,24 +111,12 @@ func loadClashRuntimeConfig() clashRuntimeConfig {
 	if v := strings.TrimSpace(ui.ProxyURL); v != "" {
 		out.ProxyURL = v
 	}
-	if v := strings.TrimSpace(ui.TestGroup); v != "" {
-		out.TestGroup = v
-	}
-	if v := strings.TrimSpace(ui.TestProxyURL); v != "" {
-		out.TestProxyURL = v
-	}
 
 	if out.Group == "" {
 		out.Group = "🏜️ PerfectAI"
 	}
 	if out.ProxyURL == "" {
 		out.ProxyURL = "http://172.19.0.1:7890"
-	}
-	if out.TestGroup == "" {
-		out.TestGroup = "➖ PerfectAI_TestPort"
-	}
-	if out.TestProxyURL == "" {
-		out.TestProxyURL = "http://172.19.0.1:7953"
 	}
 	if out.APIURL == "" && out.UnixSocket == "" {
 		out.APIURL = "http://172.19.0.1:7888"
@@ -174,10 +157,8 @@ func publicClashUIConfig(ui clashUIConfig, runtime clashRuntimeConfig) map[strin
 		"api_url":           firstNonEmpty(strings.TrimSpace(ui.APIURL), runtime.APIURL),
 		"group":             firstNonEmpty(strings.TrimSpace(ui.Group), runtime.Group),
 		"proxy_url":         firstNonEmpty(strings.TrimSpace(ui.ProxyURL), redactProxyURL(runtime.ProxyURL)),
-		"test_group":        firstNonEmpty(strings.TrimSpace(ui.TestGroup), runtime.TestGroup),
-		"test_proxy_url":    firstNonEmpty(strings.TrimSpace(ui.TestProxyURL), redactProxyURL(runtime.TestProxyURL)),
 		"has_secret":        strings.TrimSpace(ui.Secret) != "" || strings.TrimSpace(runtime.Secret) != "",
-		"ui_override":       ui.APIURL != "" || ui.Group != "" || ui.ProxyURL != "" || ui.TestGroup != "" || ui.TestProxyURL != "" || ui.Secret != "" || ui.Enabled != nil,
+		"ui_override":       ui.APIURL != "" || ui.Group != "" || ui.ProxyURL != "" || ui.Secret != "" || ui.Enabled != nil,
 		"updated_at":        ui.UpdatedAt,
 		"unix_socket":       runtime.UnixSocket != "",
 		"close_connections": runtime.CloseConnections,
@@ -227,39 +208,39 @@ func listClashGroups() ([]map[string]any, error) {
 // ensureHealthyClashExit switches PerfectAI (or configured group) off a
 // quarantined/disabled active leaf onto another healthy Clash-sourced node.
 // Returns true when a switch happened (or active was already healthy).
+// ensureHealthyClashExit only moves production PerfectAI when the currently
+// selected leaf is quarantined/disabled. It must NEVER steal a healthy manual
+// selection just because another leaf was probed or the scheduler list is empty.
+//
+// Returns true when production is on a usable leaf (already healthy, or switched).
 func ensureHealthyClashExit(store *stateStore) (bool, error) {
 	if store == nil {
 		return false, nil
 	}
+	// Reconcile ClashActive from live selection (read-only) so marks match reality.
+	if client, err := getClashClient(); err == nil {
+		if now, err2 := client.currentGroupSelection(); err2 == nil && strings.TrimSpace(now) != "" {
+			syncClashActiveFromName(store, now)
+		}
+	}
 	activeID := activeClashNodeID(store)
 	if activeID == "" {
-		// No active mark — try to promote any healthy Clash leaf.
-		for _, n := range store.listNodes() {
-			if n.Source == nodeSourceClash && n.Enabled && !n.DisabledByGuard && n.ClashName != "" {
-				if err := ensureClashSelectedForNode(store, n); err != nil {
-					return false, err
-				}
-				queuePostSwitchProbe(store, n, "")
-				return true, nil
-			}
-		}
-		return false, fmt.Errorf("没有可用的健康 Clash 出口")
+		// Do not invent a production switch when we cannot identify the current leaf.
+		return false, fmt.Errorf("无法确定当前 Clash 出口")
 	}
 	active, ok := store.getNode(activeID)
 	if !ok || active == nil {
 		return false, nil
 	}
-	if active.Enabled && !active.DisabledByGuard {
+	// Keep healthy / merely-unprobed active leaves. Fleet probes on OTHER nodes
+	// must not rotate production away from the operator's selection.
+	if nodeSchedulable(active) {
 		return true, nil
 	}
-	// Active leaf is bad — switch away.
 	if err := switchClashAwayFromNode(store, active); err != nil {
-		// switchClashAwayFromNode may fail when candidates list is empty or Clash API
-		// flaps; fall through to a direct pick of any healthy leaf.
 		for _, n := range store.listNodes() {
-			if n.Source == nodeSourceClash && n.Enabled && !n.DisabledByGuard && n.ClashName != "" && n.ID != active.ID {
+			if n.Source == nodeSourceClash && nodeSchedulable(n) && n.ClashName != "" && n.ID != active.ID {
 				if err2 := ensureClashSelectedForNode(store, n); err2 == nil {
-					queuePostSwitchProbe(store, n, active.Name)
 					return true, nil
 				}
 			}
@@ -269,29 +250,27 @@ func ensureHealthyClashExit(store *stateStore) (bool, error) {
 	return true, nil
 }
 
-// queuePostSwitchProbe enqueues an immediate quality check on a newly selected
-// production leaf. Shared by quarantine switch and emergency failover paths.
-func queuePostSwitchProbe(store *stateStore, chosen *nodeRecord, isolatedName string) {
-	if store == nil || chosen == nil || chosen.ID == "" {
+// syncClashActiveFromName marks the leaf matching name as ClashActive without
+// issuing a select API call (read-only reconciliation with live Clash state).
+func syncClashActiveFromName(store *stateStore, name string) {
+	name = strings.TrimSpace(name)
+	if store == nil || name == "" {
 		return
 	}
-	if _, qerr := queueNodeQuality(store, chosen.ID, "post-switch", false); qerr != nil {
-		log.Printf("egress-guard: post-switch probe enqueue failed node=%s name=%q err=%v",
-			chosen.ID, chosen.Name, qerr)
-		return
+	nowUnix := float64(time.Now().Unix())
+	for _, n := range store.listNodes() {
+		if n.Source != nodeSourceClash {
+			continue
+		}
+		active := n.ClashName == name
+		if n.ClashActive == active {
+			continue
+		}
+		_, _ = store.updateNode(n.ID, func(node *nodeRecord) error {
+			applyClashActiveTransition(node, active, nowUnix)
+			return nil
+		})
 	}
-	reason := fmt.Sprintf("切换后立即复测新出口 %s", chosen.ClashName)
-	if isolatedName != "" {
-		reason = fmt.Sprintf("隔离 %s 后立即复测新出口 %s", isolatedName, chosen.ClashName)
-	}
-	store.appendEvent(guardEvent{
-		Event:    "post_switch_probe_queued",
-		NodeID:   chosen.ID,
-		NodeName: chosen.Name,
-		Reason:   reason,
-	})
-	log.Printf("egress-guard: post-switch probe queued node=%s name=%q after isolating %q",
-		chosen.ID, chosen.Name, isolatedName)
 }
 
 func clashCfgEqual(a, b clashRuntimeConfig) bool {
@@ -301,8 +280,6 @@ func clashCfgEqual(a, b clashRuntimeConfig) bool {
 		a.UnixSocket == b.UnixSocket &&
 		a.Group == b.Group &&
 		a.ProxyURL == b.ProxyURL &&
-		a.TestGroup == b.TestGroup &&
-		a.TestProxyURL == b.TestProxyURL &&
 		a.TimeoutSec == b.TimeoutSec &&
 		a.CloseConnections == b.CloseConnections
 }
@@ -595,12 +572,10 @@ func clashStatusPayload() map[string]any {
 		"unix_socket":       cfg.UnixSocket != "",
 		"group":             cfg.Group,
 		"proxy_url":         redactProxyURL(cfg.ProxyURL),
-		"test_group":        cfg.TestGroup,
-		"test_proxy_url":    redactProxyURL(cfg.TestProxyURL),
 		"close_connections": cfg.CloseConnections,
 		"sync_on_start":     cfg.SyncOnStart,
 		"has_secret":        strings.TrimSpace(cfg.Secret) != "",
-		"ui_override":       ui.APIURL != "" || ui.Group != "" || ui.ProxyURL != "" || ui.TestGroup != "" || ui.TestProxyURL != "" || ui.Secret != "" || ui.Enabled != nil,
+		"ui_override":       ui.APIURL != "" || ui.Group != "" || ui.ProxyURL != "" || ui.Secret != "" || ui.Enabled != nil,
 		"config":            publicClashUIConfig(ui, cfg),
 	}
 	if !cfg.Enabled {
@@ -737,11 +712,14 @@ func syncClashNodes(store *stateStore) (map[string]any, error) {
 	disabledMissing := 0
 	for _, stale := range byClashName {
 		_, _ = store.updateNode(stale.ID, func(n *nodeRecord) error {
-			if n.Enabled {
-				n.Enabled = false
-				disabledMissing++
+			if n.Enabled || !n.DisabledByOperator {
+				if n.Enabled {
+					disabledMissing++
+				}
+				applyOperatorEnabledLocked(n, false, "missing", "Clash 策略组中已不存在该节点")
+			} else {
+				n.LastReason = "Clash 策略组中已不存在该节点"
 			}
-			n.LastReason = "Clash 策略组中已不存在该节点"
 			return nil
 		})
 	}
@@ -776,78 +754,6 @@ func syncClashNodes(store *stateStore) (map[string]any, error) {
 		"now":              nowSel,
 		"proxy_url":        redactProxyURL(proxyURL),
 	}, nil
-}
-
-// qualityProbeProxyURL is the proxy quality probes dial. Prefer the dedicated
-// test mixed-port so probes never share production :7890 sticky sessions.
-func qualityProbeProxyURL(node *nodeRecord) string {
-	cfg := loadClashRuntimeConfig()
-	if v := strings.TrimSpace(cfg.TestProxyURL); v != "" {
-		return v
-	}
-	if node != nil && strings.TrimSpace(node.ProxyURL) != "" {
-		return node.ProxyURL
-	}
-	return strings.TrimSpace(cfg.ProxyURL)
-}
-
-// ensureClashSelectedForQuality switches the TEST selector group to the node
-// leaf. Production PerfectAI is never touched. Connections are not bulk-closed.
-func ensureClashSelectedForQuality(store *stateStore, node *nodeRecord) (string, error) {
-	if node == nil || node.Source != nodeSourceClash || node.ClashName == "" {
-		return "", nil
-	}
-	cfg := loadClashRuntimeConfig()
-	group := strings.TrimSpace(cfg.TestGroup)
-	if group == "" {
-		group = strings.TrimSpace(cfg.Group)
-	}
-	if group == "" {
-		return "", fmt.Errorf("未配置质量探测策略组")
-	}
-	client, err := getClashClient()
-	if err != nil {
-		return group, err
-	}
-	client.cfg.Group = group
-	client.cfg.CloseConnections = false
-
-	now, err := client.currentGroupSelection()
-	if err != nil {
-		return group, err
-	}
-	if now == node.ClashName {
-		if store != nil {
-			store.appendEvent(guardEvent{
-				Event:    "clash_test_switched",
-				NodeID:   node.ID,
-				NodeName: node.Name,
-				Reason:   fmt.Sprintf("测试组 %s 已在 %s", group, now),
-			})
-		}
-		return group, nil
-	}
-	after, err := client.switchTo(node.ClashName)
-	if err != nil {
-		if store != nil {
-			store.appendEvent(guardEvent{
-				Event:    "clash_test_switch_failed",
-				NodeID:   node.ID,
-				NodeName: node.Name,
-				Reason:   fmt.Sprintf("测试组 %s: %s", group, err.Error()),
-			})
-		}
-		return group, err
-	}
-	if store != nil {
-		store.appendEvent(guardEvent{
-			Event:    "clash_test_switched",
-			NodeID:   node.ID,
-			NodeName: node.Name,
-			Reason:   fmt.Sprintf("测试组 %s: %s → %s", group, now, after),
-		})
-	}
-	return group, nil
 }
 
 // ensureClashSelectedForNode switches the Clash group to the node's leaf when
@@ -909,13 +815,9 @@ func ensureClashSelectedForNode(store *stateStore, node *nodeRecord) error {
 }
 
 // switchClashAwayFromNode is called on quarantine: pick another healthy
-// Clash-sourced node and switch PerfectAI to it.
-//
-// After a successful production switch it immediately enqueues a post-switch
-// quality probe on the new leaf. If that probe hard-fails, quarantine runs
-// again and chains: A bad → B → probe B → B bad → C → probe C → … until a
-// leaf stays healthy or no candidates remain. Probes are serial via the
-// quality scheduler so PerfectAI/TestGroup selection stays race-free.
+// Clash-sourced node and switch PerfectAI to it — but ONLY when the quarantined
+// leaf is the one production currently points at. Isolation of non-active
+// leaves must not kick the operator off a good manual exit.
 func switchClashAwayFromNode(store *stateStore, bad *nodeRecord) error {
 	if bad == nil || bad.Source != nodeSourceClash {
 		return nil
@@ -927,22 +829,33 @@ func switchClashAwayFromNode(store *stateStore, bad *nodeRecord) error {
 	if bad.ClashGroup != "" {
 		client.cfg.Group = bad.ClashGroup
 	}
+	if now, errNow := client.currentGroupSelection(); errNow == nil && strings.TrimSpace(now) != "" {
+		if now != bad.ClashName {
+			log.Printf("egress-guard: skip production switch; quarantined %q is not current %q", bad.ClashName, now)
+			store.appendEvent(guardEvent{
+				Event:    "clash_switch_skipped",
+				NodeID:   bad.ID,
+				NodeName: bad.Name,
+				Reason:   fmt.Sprintf("隔离非当前出口 %s（当前仍为 %s），不切换生产组", bad.ClashName, now),
+			})
+			return nil
+		}
+	} else if !bad.ClashActive {
+		log.Printf("egress-guard: skip production switch; node %q not marked ClashActive", bad.Name)
+		return nil
+	}
 	// Prefer recently healthy Clash nodes with different observed exit IP.
 	candidates := verifiedMigrationTargets(store, bad)
 	var chosen *nodeRecord
 	for _, n := range candidates {
-		if n.Source == nodeSourceClash && n.ClashName != "" && n.ClashName != bad.ClashName {
+		if n.Source == nodeSourceClash && n.ClashName != "" && n.ClashName != bad.ClashName && nodeSchedulable(n) {
 			chosen = n
 			break
 		}
 	}
 	if chosen == nil {
-		// Fall back to any enabled non-quarantined Clash leaf.
-		// Unverified leaves are OK: the post-switch probe below will confirm
-		// (or chain-quarantine) them immediately instead of leaving production
-		// parked on a possibly already-degraded exit until the next 30s tick.
 		for _, n := range store.listNodes() {
-			if n.ID == bad.ID || n.Source != nodeSourceClash || n.ClashName == "" || !n.Enabled || n.DisabledByGuard {
+			if n.ID == bad.ID || n.Source != nodeSourceClash || n.ClashName == "" || !nodeSchedulable(n) {
 				continue
 			}
 			chosen = n
@@ -979,10 +892,6 @@ func switchClashAwayFromNode(store *stateStore, bad *nodeRecord) error {
 		NodeName: chosen.Name,
 		Reason:   fmt.Sprintf("隔离 %s 后切换到 %s", bad.Name, after),
 	})
-	// Chain: verify the newly selected production leaf right away.
-	if chosen.ID != "" && chosen.ID != bad.ID {
-		queuePostSwitchProbe(store, chosen, bad.Name)
-	}
 	return nil
 }
 

@@ -1,20 +1,16 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
-	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -123,7 +119,7 @@ func resolveNodeIDForAuth(store *stateStore, authKeys ...string) string {
 	// Shared mixed-port (Clash): multiple nodes share one proxy_url. Attribute
 	// passive usage to the currently selected PerfectAI leaf.
 	for _, n := range matches {
-		if n.Source == nodeSourceClash && n.ClashActive && !n.DisabledByGuard {
+		if n.Source == nodeSourceClash && n.ClashActive && nodeSchedulable(n) {
 			return n.ID
 		}
 	}
@@ -133,7 +129,7 @@ func resolveNodeIDForAuth(store *stateStore, authKeys ...string) string {
 		}
 	}
 	for _, n := range matches {
-		if n.Enabled && !n.DisabledByGuard {
+		if nodeSchedulable(n) {
 			return n.ID
 		}
 	}
@@ -145,7 +141,7 @@ func activeClashNodeID(store *stateStore) string {
 		return ""
 	}
 	for _, n := range store.listNodes() {
-		if n.Source == nodeSourceClash && n.ClashActive && n.Enabled && !n.DisabledByGuard {
+		if n.Source == nodeSourceClash && n.ClashActive && nodeSchedulable(n) {
 			return n.ID
 		}
 	}
@@ -155,19 +151,6 @@ func activeClashNodeID(store *stateStore) string {
 		}
 	}
 	return ""
-}
-
-func classifyTPS(tps float64, soft, hard float64) string {
-	if tps <= 0 {
-		return "unknown"
-	}
-	if tps >= hard {
-		return "hard"
-	}
-	if tps >= soft {
-		return "soft"
-	}
-	return "healthy"
 }
 
 // thinkingFieldNonEmpty reports whether a delta/message field carries real
@@ -235,10 +218,8 @@ func recordHasThinking(record map[string]any) bool {
 	return false
 }
 
-// classifyQuality classifies a successful generation sample.
-// When ThinkingGuard is on: missing thinking (with enough output) is hard 降智;
-// present thinking falls through to the original soft/hard Token/s thresholds.
-// When ThinkingGuard is off: behavior matches the original TPS-only path.
+// classifyQuality classifies a successful generation sample. Thinking is the
+// ONLY quality signal: missing thinking is hard 降智, present thinking healthy.
 func classifyQuality(tps float64, outputTokens int64, hasThinking bool, pol policyConfig) string {
 	if outputTokens <= 0 || tps <= 0 {
 		return "unknown"
@@ -246,10 +227,10 @@ func classifyQuality(tps float64, outputTokens int64, hasThinking bool, pol poli
 	if pol.MinOutputTokens > 0 && outputTokens < pol.MinOutputTokens {
 		return "ignored"
 	}
-	if pol.ThinkingGuard && !hasThinking {
+	if !hasThinking {
 		return "hard"
 	}
-	return classifyTPS(tps, pol.SoftTPS, pol.HardTPS)
+	return "healthy"
 }
 
 func classifyFailureKind(status int, body string) string {
@@ -303,45 +284,6 @@ func outputTokensFromUsage(usage map[string]any) int64 {
 	)
 }
 
-func httpClientThroughProxy(proxyURL string, timeout time.Duration) (*http.Client, error) {
-	transport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   15 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-		TLSHandshakeTimeout: 15 * time.Second,
-	}
-	if strings.TrimSpace(proxyURL) != "" {
-		u, err := url.Parse(proxyURL)
-		if err != nil {
-			return nil, fmt.Errorf("代理 URL 无效")
-		}
-		transport.Proxy = http.ProxyURL(u)
-	}
-	return &http.Client{Timeout: timeout, Transport: transport}, nil
-}
-
-func probeConnectivity(proxyURL string) (exitIP string, latencyMs int64, err error) {
-	client, err := httpClientThroughProxy(proxyURL, 20*time.Second)
-	if err != nil {
-		return "", 0, err
-	}
-	start := time.Now()
-	req, _ := http.NewRequest(http.MethodGet, "https://api.ipify.org", nil)
-	req.Header.Set("User-Agent", "CPA-egress-guard/1.0")
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", time.Since(start).Milliseconds(), err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 128))
-	ip := strings.TrimSpace(string(body))
-	if resp.StatusCode >= 400 || ip == "" {
-		return "", time.Since(start).Milliseconds(), fmt.Errorf("连通性失败 HTTP %d", resp.StatusCode)
-	}
-	return ip, time.Since(start).Milliseconds(), nil
-}
 
 type qualityResult struct {
 	Classification  string  `json:"classification"`
@@ -359,55 +301,26 @@ type qualityResult struct {
 	AuthLabel       string  `json:"auth_label,omitempty"`
 }
 
-// qualityProbePrompt is intentionally a short common-sense question that still
-// elicits a thinking/reasoning block on healthy Grok exits. Downgraded exits
-// typically answer without any thinking block.
-const qualityProbePrompt = "我要去洗车，但洗车店离我家只有5m,我应该走路去还是开车去？请思考后直接给出答案"
 
 const missingThinkingReason = "探测响应缺少 thinking（疑似降智）"
-const probeTimeoutReason = "探测超时（按降智处理）"
-const probeUnstableReason = "不一定降智，但节点断流不稳定，标记为降智，暂不使用"
 
-func isProbeTimeoutErr(err error) bool {
-	if err == nil {
+// quarantineSeconds is the fixed isolation duration for one 降智 (missing
+// thinking). It used to be a policy knob; thinking 是唯一判断标准，一次即隔离，
+// 到期由 guard worker 自动恢复，无需再配置。
+const quarantineSeconds = 120
+
+// isNodeTransportHard reports probe failures that mean the exit is flaky/unreachable,
+// not that the model/account lost thinking. These still isolate the node, but must
+// never be attributed to per-account 降智 stats (otherwise TLS/EOF inflates 降智率).
+func isNodeTransportHard(kind string) bool {
+	switch strings.TrimSpace(kind) {
+	case "probe_unstable", "probe_timeout", "transport_error":
+		return true
+	default:
 		return false
 	}
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-		return true
-	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "client.timeout") ||
-		strings.Contains(msg, "context deadline exceeded") ||
-		strings.Contains(msg, "context canceled") ||
-		strings.Contains(msg, "i/o timeout") ||
-		(strings.Contains(msg, "timeout") && strings.Contains(msg, "waiting for"))
 }
 
-// Transport flakiness that often means the exit is unusable even if not "dumb".
-func isProbeUnstableErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	if isProbeTimeoutErr(err) {
-		return true
-	}
-	msg := strings.ToLower(err.Error())
-	markers := []string{
-		"unexpected eof", "eof", "connection reset", "connection refused",
-		"broken pipe", "stream error", "http2: stream", "server closed idle connection",
-		"tls:", "tls handshake", "use of closed network connection",
-	}
-	for _, m := range markers {
-		if strings.Contains(msg, m) {
-			return true
-		}
-	}
-	return false
-}
-
-func probeAPIConfigured(pol policyConfig) bool {
-	return strings.TrimSpace(pol.ProbeAPIBase) != "" && strings.TrimSpace(pol.ProbeAPIKey) != ""
-}
 
 // deltaHasThinking reports whether a streamed delta/message carries any
 // thinking / reasoning signal. Downgraded nodes answer without these fields.
@@ -595,447 +508,7 @@ func rotateNodeIfConfigured(store *stateStore, node *nodeRecord) (bool, error) {
 	return true, nil
 }
 
-func applyGrokClientHeaders(req *http.Request, auth authFile) {
-	req.Header.Set("X-XAI-Token-Auth", "xai-grok-cli")
-	req.Header.Set("x-grok-client-version", "0.2.93")
-	req.Header.Set("x-grok-client-identifier", "grok-shell")
-	req.Header.Set("User-Agent", "CPA-egress-guard/1.0")
-	if headers, ok := auth.Raw["headers"].(map[string]any); ok {
-		for k, v := range headers {
-			if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
-				req.Header.Set(k, s)
-			}
-		}
-	}
-	if req.Header.Get("X-XAI-Token-Auth") == "" {
-		req.Header.Set("X-XAI-Token-Auth", "xai-grok-cli")
-	}
-	if req.Header.Get("x-grok-client-version") == "" {
-		req.Header.Set("x-grok-client-version", "0.2.93")
-	}
-	if req.Header.Get("x-grok-client-identifier") == "" {
-		req.Header.Set("x-grok-client-identifier", "grok-shell")
-	}
-}
 
-func isAuthExpired(auth authFile) bool {
-	exp, _ := auth.Raw["expired"].(string)
-	if exp == "" {
-		return false
-	}
-	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
-		if t, err := time.Parse(layout, exp); err == nil {
-			return time.Now().After(t.Add(-2 * time.Minute))
-		}
-	}
-	if t, err := time.Parse("2006-01-02T15:04:05Z07:00", exp); err == nil {
-		return time.Now().After(t.Add(-2 * time.Minute))
-	}
-	return false
-}
-
-func isAuthErrorRetryable(status int, body string) bool {
-	if status == http.StatusUnauthorized || status == http.StatusForbidden {
-		return true
-	}
-	lower := strings.ToLower(body)
-	return strings.Contains(lower, "invalid or expired") ||
-		strings.Contains(lower, "no auth context") ||
-		strings.Contains(lower, "permissiondenied") ||
-		strings.Contains(lower, "x_xai_token_auth=none")
-}
-
-// free-usage / quota exhaustion is an account problem, never a node degradation.
-// Always try another CPA xAI account before giving up the probe.
-func isAccountQuotaExhausted(status int, body string) bool {
-	lower := strings.ToLower(body)
-	if strings.Contains(lower, "free-usage-exhausted") ||
-		strings.Contains(lower, "free_usage_exhausted") ||
-		strings.Contains(lower, "subscription:free-usage") ||
-		strings.Contains(lower, "included free usage") {
-		return true
-	}
-	if status == http.StatusTooManyRequests && (strings.Contains(lower, "quota") || strings.Contains(lower, "usage") || strings.Contains(lower, "rate")) {
-		return true
-	}
-	return strings.Contains(lower, "quota") && strings.Contains(lower, "exhaust")
-}
-
-func shouldRetryProbeWithNextAuth(status int, body, kind string, hasMore bool) bool {
-	if !hasMore {
-		return false
-	}
-	if isAccountQuotaExhausted(status, body) {
-		return true
-	}
-	return kind == "account_error" || isAuthErrorRetryable(status, body)
-}
-
-const qualityProbeTimeout = 75 * time.Second
-
-func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
-	return probeQualityContext(context.Background(), store, node)
-}
-
-func probeQualityContext(ctx context.Context, store *stateStore, node *nodeRecord) qualityResult {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	pol := store.policy()
-	res := qualityResult{Model: pol.Model}
-	if node == nil || node.ProxyURL == "" {
-		res.Classification = "error"
-		res.ErrorKind = "request_error"
-		res.Error = "节点缺少代理"
-		return res
-	}
-
-	if ip, _, errIP := probeConnectivity(node.ProxyURL); errIP == nil {
-		res.ExitIP = ip
-	} else {
-		log.Printf("egress-guard: quality connectivity warn node=%s err=%v", node.ID, errIP)
-	}
-
-	usePublicAPI := probeAPIConfigured(pol)
-	var candidates []authFile
-	var err error
-	if usePublicAPI {
-		// Public gateway records free-usage cooling itself; one synthetic auth slot.
-		candidates = []authFile{{Name: "probe-api", Raw: map[string]any{"access_token": pol.ProbeAPIKey, "base_url": pol.ProbeAPIBase}}}
-	} else {
-		// Prefer several accounts so free-usage-exhausted can rotate. Timeout /
-		// missing-thinking / unstable EOF still return as node verdicts.
-		candidates, err = listAuthsForNode(node, 5)
-		if err != nil || len(candidates) == 0 {
-			res.Classification = "error"
-			res.ErrorKind = "no_account"
-			if err != nil {
-				res.Error = err.Error()
-			} else {
-				res.Error = "没有可用的 CPA xAI 账号"
-			}
-			return res
-		}
-	}
-
-	client, err := httpClientThroughProxy(node.ProxyURL, qualityProbeTimeout)
-	if err != nil {
-		res.Classification = "error"
-		res.ErrorKind = "transport_error"
-		res.Error = err.Error()
-		return res
-	}
-
-	maxTok := pol.MaxOutputTokensProbe
-	if maxTok <= 0 {
-		maxTok = 256
-	}
-	payload := map[string]any{
-		"model": pol.Model,
-		"messages": []map[string]string{
-			{"role": "user", "content": qualityProbePrompt},
-		},
-		"stream":      true,
-		"max_tokens":  maxTok,
-		"temperature": 0.7,
-	}
-	body, _ := json.Marshal(payload)
-	mode := "cli-chat-proxy"
-	if usePublicAPI {
-		mode = "public-api"
-	}
-	log.Printf("egress-guard: quality probe begin node=%s name=%q model=%s mode=%s base=%s candidates=%d max_tokens=%d",
-		node.ID, node.Name, pol.Model, mode, pol.ProbeAPIBase, len(candidates), maxTok)
-
-	var lastErr string
-	for i, auth := range candidates {
-		if err := ctx.Err(); err != nil {
-			res.Classification = "error"
-			res.ErrorKind = "transport_error"
-			res.Error = "探测已取消: " + err.Error()
-			return res
-		}
-		token, _ := auth.Raw["access_token"].(string)
-		if strings.TrimSpace(token) == "" {
-			lastErr = "账号缺少 access_token"
-			continue
-		}
-		if !usePublicAPI && isAuthExpired(auth) && i+1 < len(candidates) {
-			continue
-		}
-		baseURL, _ := auth.Raw["base_url"].(string)
-		if usePublicAPI {
-			baseURL = pol.ProbeAPIBase
-		} else if baseURL == "" {
-			baseURL = "https://cli-chat-proxy.grok.com/v1"
-		}
-		baseURL = strings.TrimRight(baseURL, "/")
-		authLabel := firstNonEmpty(auth.Email, auth.Name, auth.ID, auth.Index)
-		authKey := firstNonEmpty(auth.ID, auth.Index, auth.Name, auth.Email)
-		if usePublicAPI {
-			authLabel = "probe-api"
-			authKey = "probe-api"
-		}
-		res.AuthID = authKey
-		res.AuthLabel = authLabel
-
-		req, errReq := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/chat/completions", bytes.NewReader(body))
-		if errReq != nil {
-			res.Classification = "error"
-			res.ErrorKind = "request_error"
-			res.Error = "无法创建探测请求"
-			return res
-		}
-		req.Header.Set("Authorization", "Bearer "+token)
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Accept", "text/event-stream")
-		if !usePublicAPI {
-			applyGrokClientHeaders(req, auth)
-		} else {
-			req.Header.Set("User-Agent", "CPA-egress-guard/1.1")
-		}
-
-		start := time.Now()
-		log.Printf("egress-guard: quality request node=%s auth=%s mode=%s url=%s/chat/completions", node.ID, authLabel, mode, baseURL)
-		resp, errDo := client.Do(req)
-		if errDo != nil {
-			res.DurationMs = time.Since(start).Milliseconds()
-			log.Printf("egress-guard: quality request failed node=%s auth=%s dur=%dms err=%v", node.ID, authLabel, res.DurationMs, errDo)
-			if isProbeTimeoutErr(errDo) || isProbeTimeoutErr(ctx.Err()) {
-				res.Classification = "hard"
-				res.ErrorKind = "probe_timeout"
-				res.Error = probeTimeoutReason
-				res.HasThinking = false
-				log.Printf("egress-guard: quality TIMEOUT -> hard node=%s auth=%s dur=%dms", node.ID, authLabel, res.DurationMs)
-				return res
-			}
-			if isProbeUnstableErr(errDo) {
-				res.Classification = "hard"
-				res.ErrorKind = "probe_unstable"
-				res.Error = probeUnstableReason + " (" + truncate(errDo.Error(), 80) + ")"
-				res.HasThinking = false
-				log.Printf("egress-guard: quality UNSTABLE EOF/reset -> hard node=%s auth=%s err=%v", node.ID, authLabel, errDo)
-				return res
-			}
-			lastErr = "模型探测请求失败: " + truncate(errDo.Error(), 160)
-			res.ErrorKind = "transport_error"
-			continue
-		}
-
-		if resp.StatusCode >= 400 {
-			b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-			_ = resp.Body.Close()
-			msg := fmt.Sprintf("上游 HTTP %d: %s", resp.StatusCode, truncate(string(b), 160))
-			lastErr = msg
-			res.ErrorKind = classifyFailureKind(resp.StatusCode, string(b))
-			res.DurationMs = time.Since(start).Milliseconds()
-			bodyText := string(b)
-			log.Printf("egress-guard: quality upstream error node=%s auth=%s status=%d kind=%s body=%q", node.ID, authLabel, resp.StatusCode, res.ErrorKind, truncate(bodyText, 200))
-			hasMore := i+1 < len(candidates)
-			if shouldRetryProbeWithNextAuth(resp.StatusCode, bodyText, res.ErrorKind, hasMore) {
-				if isAccountQuotaExhausted(resp.StatusCode, bodyText) {
-					log.Printf("egress-guard: quality free-usage exhausted -> retry next auth node=%s auth=%s remain=%d", node.ID, authLabel, len(candidates)-i-1)
-				}
-				continue
-			}
-			// Quota exhausted on the last candidate is still an account problem: ignored, not node hard.
-			if isAccountQuotaExhausted(resp.StatusCode, bodyText) {
-				res.Classification = "ignored"
-				res.ErrorKind = "account_quota"
-				res.Error = "账号 free 额度耗尽，已无更多可切换账号: " + truncate(bodyText, 120)
-				log.Printf("egress-guard: quality free-usage exhausted, no more auths node=%s", node.ID)
-				return res
-			}
-			res.Classification = "error"
-			res.Error = msg
-			return res
-		}
-
-		var (
-			firstTokenAt   time.Time
-			contentLen     int
-			reasoningLen   int
-			usageOut       int64
-			usageReason    int64
-			hasThinking    bool
-			chunkCount     int
-			sampleLogged   int
-			lastChunkDebug string
-		)
-		scanner := bufio.NewScanner(resp.Body)
-		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-		for scanner.Scan() {
-			if err := ctx.Err(); err != nil {
-				_ = resp.Body.Close()
-				res.Classification = "error"
-				res.ErrorKind = "transport_error"
-				res.Error = "探测已取消: " + err.Error()
-				res.DurationMs = time.Since(start).Milliseconds()
-				return res
-			}
-			line := scanner.Text()
-			if !strings.HasPrefix(line, "data:") {
-				continue
-			}
-			data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-			if data == "" || data == "[DONE]" {
-				if data == "[DONE]" {
-					break
-				}
-				continue
-			}
-			var chunk map[string]any
-			if json.Unmarshal([]byte(data), &chunk) != nil {
-				continue
-			}
-			chunkCount++
-			if sampleLogged < 4 {
-				lastChunkDebug = chunkDebugSummary(chunk)
-				log.Printf("egress-guard: quality chunk sample node=%s auth=%s n=%d %s raw=%q",
-					node.ID, authLabel, chunkCount, lastChunkDebug, truncate(data, 240))
-				sampleLogged++
-			}
-			if u, ok := chunk["usage"].(map[string]any); ok {
-				usageOut = maxInt64(usageOut, outputTokensFromUsage(u))
-				usageReason = maxInt64(usageReason, usageReasoningTokens(u))
-				if usageReason > 0 {
-					hasThinking = true
-				}
-			}
-			choices, _ := chunk["choices"].([]any)
-			for _, c := range choices {
-				cm, _ := c.(map[string]any)
-				if cm == nil {
-					continue
-				}
-				if msg, ok := cm["message"].(map[string]any); ok {
-					if deltaHasThinking(msg) {
-						hasThinking = true
-					}
-				}
-				delta, _ := cm["delta"].(map[string]any)
-				if delta == nil {
-					continue
-				}
-				if deltaHasThinking(delta) {
-					hasThinking = true
-					if firstTokenAt.IsZero() {
-						firstTokenAt = time.Now()
-					}
-					for _, key := range []string{"reasoning_content", "reasoningContent", "thinking", "thinking_content", "reasoning"} {
-						if t, ok := delta[key].(string); ok && t != "" {
-							reasoningLen += len([]rune(t))
-							contentLen += len([]rune(t))
-						}
-					}
-				}
-				if t, ok := delta["content"].(string); ok && t != "" {
-					if firstTokenAt.IsZero() {
-						firstTokenAt = time.Now()
-					}
-					contentLen += len([]rune(t))
-				}
-			}
-		}
-		_ = resp.Body.Close()
-		if scanErr := scanner.Err(); scanErr != nil {
-			res.DurationMs = time.Since(start).Milliseconds()
-			log.Printf("egress-guard: quality stream read failed node=%s auth=%s err=%v", node.ID, authLabel, scanErr)
-			if isProbeTimeoutErr(scanErr) || isProbeTimeoutErr(ctx.Err()) {
-				res.Classification = "hard"
-				res.ErrorKind = "probe_timeout"
-				res.Error = probeTimeoutReason
-				res.HasThinking = false
-				log.Printf("egress-guard: quality stream TIMEOUT -> hard node=%s auth=%s dur=%dms", node.ID, authLabel, res.DurationMs)
-				return res
-			}
-			if isProbeUnstableErr(scanErr) {
-				res.Classification = "hard"
-				res.ErrorKind = "probe_unstable"
-				res.Error = probeUnstableReason + " (" + truncate(scanErr.Error(), 80) + ")"
-				res.HasThinking = false
-				log.Printf("egress-guard: quality stream UNSTABLE -> hard node=%s auth=%s err=%v", node.ID, authLabel, scanErr)
-				return res
-			}
-			lastErr = "模型探测流读取失败: " + truncate(scanErr.Error(), 160)
-			res.ErrorKind = "transport_error"
-			continue
-		}
-		if err := ctx.Err(); isProbeTimeoutErr(err) {
-			res.DurationMs = time.Since(start).Milliseconds()
-			res.Classification = "hard"
-			res.ErrorKind = "probe_timeout"
-			res.Error = probeTimeoutReason
-			res.HasThinking = false
-			log.Printf("egress-guard: quality ctx TIMEOUT -> hard node=%s auth=%s dur=%dms", node.ID, authLabel, res.DurationMs)
-			return res
-		}
-
-		duration := time.Since(start)
-		res.DurationMs = duration.Milliseconds()
-		if !firstTokenAt.IsZero() {
-			res.FirstTokenMs = firstTokenAt.Sub(start).Milliseconds()
-		}
-		outTokens := usageOut
-		if usageReason > outTokens {
-			outTokens = usageReason
-		}
-		if outTokens <= 0 {
-			outTokens = int64(contentLen / 4)
-			if outTokens == 0 && contentLen > 0 {
-				outTokens = 1
-			}
-		}
-		res.OutputTokens = outTokens
-		res.ReasoningTokens = usageReason
-		res.HasThinking = hasThinking || usageReason > 0 || reasoningLen > 0
-		res.TPS = computeTPS(outTokens, res.DurationMs, res.FirstTokenMs, pol.MinGenerationMs)
-		// Thinking probe verdict first. MinOutputTokens only applies to TPS soft/hard,
-		// not to "has thinking => healthy" for this short car-wash prompt.
-		if !res.HasThinking {
-			res.Classification = "hard"
-			res.Error = missingThinkingReason
-			res.ErrorKind = "missing_thinking"
-			log.Printf("egress-guard: quality MISSING thinking node=%s auth=%s class=hard chunks=%d out_tokens=%d sample=%s",
-				node.ID, authLabel, chunkCount, outTokens, lastChunkDebug)
-			return res
-		}
-		if outTokens == 0 {
-			lastErr = "探测无输出"
-			res.ErrorKind = "no_output"
-			res.Classification = "error"
-			log.Printf("egress-guard: quality no output node=%s auth=%s", node.ID, authLabel)
-			continue
-		}
-		// Has thinking: node is not degraded. Keep TPS class only for diagnostics;
-		// never ignore a successful thinking probe as "too few tokens".
-		tpsClass := classifyQuality(res.TPS, outTokens, res.HasThinking, pol)
-		if tpsClass == "ignored" || tpsClass == "unknown" || tpsClass == "" {
-			res.Classification = "healthy"
-		} else if tpsClass == "soft" || tpsClass == "hard" {
-			// Still has thinking, so do not isolate on TPS alone from active probe.
-			res.Classification = "healthy"
-			log.Printf("egress-guard: quality thinking present, TPS class=%s ignored for isolation node=%s tps=%.1f", tpsClass, node.ID, res.TPS)
-		} else {
-			res.Classification = tpsClass
-		}
-		log.Printf("egress-guard: quality stream done node=%s auth=%s chunks=%d thinking=true reason_tokens=%d reason_chars=%d content_chars=%d out_tokens=%d tps=%.1f class=%s dur=%dms sample=%s",
-			node.ID, authLabel, chunkCount, usageReason, reasoningLen, contentLen, outTokens, res.TPS, res.Classification, res.DurationMs, lastChunkDebug)
-		res.Error = ""
-		res.ErrorKind = ""
-		return res
-	}
-
-	res.Classification = "error"
-	if res.ErrorKind == "" {
-		res.ErrorKind = "transport_error"
-	}
-	if lastErr == "" {
-		lastErr = "所有候选账号探测失败"
-	}
-	res.Error = lastErr
-	return res
-}
 
 func anyInt(v any) int64 {
 	switch t := v.(type) {
@@ -1053,6 +526,104 @@ func anyInt(v any) int64 {
 	}
 }
 
+// maybeAutoDisableNode permanently stops a leaf after repeated quarantine cycles.
+// Unlike quarantine, this sets DisabledByOperator so recovery probes and scheduling
+// stay off across restarts until an operator re-enables the node.
+func maybeAutoDisableNode(store *stateStore, nodeID, reason string) {
+	if store == nil || strings.TrimSpace(nodeID) == "" {
+		return
+	}
+	pol := store.policy()
+	if !pol.NodeAutoDisable {
+		return
+	}
+	threshold := pol.NodeAutoDisableMinQuarantines
+	if threshold <= 0 {
+		threshold = 3
+	}
+	n, ok := store.getNode(nodeID)
+	if !ok || n == nil || n.DisabledByOperator {
+		return
+	}
+	if n.QuarantineCount < int64(threshold) {
+		return
+	}
+	why := fmt.Sprintf("持续降智自动停用：累计隔离 %d 次（阈值 %d）", n.QuarantineCount, threshold)
+	if rs := strings.TrimSpace(reason); rs != "" {
+		why = why + " · " + rs
+		if len(why) > 240 {
+			why = why[:240]
+		}
+	}
+	updated, err := store.updateNode(nodeID, func(node *nodeRecord) error {
+		if node.DisabledByOperator {
+			return nil
+		}
+		if node.QuarantineCount < int64(threshold) {
+			return nil
+		}
+		applyOperatorEnabledLocked(node, false, "auto", why)
+		// Keep guard mark so UI still shows last isolation context, but clear the
+		// recovery timer — 停用 nodes must not re-enter the quality queue.
+		node.DisabledByGuard = true
+		node.QuarantinedUntil = 0
+		return nil
+	})
+	if err != nil || updated == nil || !updated.DisabledByOperator {
+		return
+	}
+	store.appendEvent(guardEvent{
+		Event:          "node_auto_disabled",
+		NodeID:         updated.ID,
+		NodeName:       updated.Name,
+		Reason:         why,
+		Classification: "hard",
+	})
+	log.Printf("egress-guard: node auto-disable id=%s name=%q quarantine_count=%d threshold=%d",
+		updated.ID, updated.Name, updated.QuarantineCount, threshold)
+	// If this leaf is currently selected in Clash, switch production away.
+	if updated.Source == nodeSourceClash {
+		if err := switchClashAwayFromNode(store, updated); err != nil {
+			store.appendEvent(guardEvent{Event: "clash_switch_failed", NodeID: updated.ID, NodeName: updated.Name, Reason: err.Error()})
+		}
+	}
+}
+
+// maybeAutoDisableAuth disables a host auth when per-account degrade evidence
+// crosses the configured multi-node full-rate threshold.
+func maybeAutoDisableAuth(store *stateStore, authID, label string) {
+	authID = strings.TrimSpace(authID)
+	if store == nil || authID == "" || authID == "probe-api" {
+		return
+	}
+	pol := store.policy()
+	if !pol.AuthAutoDisable {
+		return
+	}
+	rec := store.getAuthDegradeRecord(authID)
+	if !shouldAutoDisableAuth(rec, pol) {
+		return
+	}
+	nodes := distinctDegradedNodes(rec)
+	reason := fmt.Sprintf("降智 %d/%d (100%%) · 跨 %d 节点", rec.DegradedCount, rec.SampleCount, nodes)
+	a, err := disableAuthByID(authID, "auto", reason)
+	if err != nil {
+		log.Printf("egress-guard: auth auto-disable failed id=%s err=%v", authID, err)
+		store.appendEvent(guardEvent{Event: "auth_auto_disable_failed", AuthID: authID, Reason: err.Error()})
+		return
+	}
+	fullReason := authDisableReason(a)
+	if fullReason == "" {
+		fullReason = "egress-guard account-auto: " + reason
+	}
+	store.markAuthDisabled(authID, "auto", fullReason)
+	if label == "" {
+		label = firstNonEmpty(a.Email, a.Name, authID)
+	}
+	log.Printf("egress-guard: auth auto-disable id=%s label=%s hits=%d/%d nodes=%d", authID, label, rec.DegradedCount, rec.SampleCount, nodes)
+	store.appendEvent(guardEvent{Event: "auth_auto_disabled", AuthID: authID, Reason: fullReason, Classification: "hard"})
+}
+
 func applyObservation(store *stateStore, nodeID, source string, res qualityResult) {
 	pol := store.policy()
 	if res.Classification == "error" && res.ErrorKind != "transport_error" {
@@ -1062,7 +633,6 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 	var (
 		doRestore     bool
 		doQuarantine  bool
-		queueThinking bool
 		quarantineWhy string
 		nodeCopy      nodeRecord
 	)
@@ -1074,9 +644,6 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 		n.LastOutputTokens = res.OutputTokens
 		n.LastSource = source
 		n.LastObservedAt = now
-		if source == "active" {
-			n.LastProbeAt = now
-		}
 		if res.ExitIP != "" {
 			n.ExitIP = res.ExitIP
 		}
@@ -1087,115 +654,49 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 		}
 		switch res.Classification {
 		case "healthy":
-			n.SoftStrikes = 0
 			n.ErrorStrikes = 0
 			n.ThinkingStrikes = 0
-			// Restore only when the probe actually saw thinking. A "healthy" TPS
-			// without thinking is rewritten to hard in probeQuality.
-			if n.DisabledByGuard && res.HasThinking && (source == "active" || pol.Mode == "passive") {
+			// Restore only when the observation actually carried thinking.
+			if n.DisabledByGuard && !n.DisabledByOperator && res.HasThinking {
 				markNodeRestored(n, now)
 				n.DisabledByGuard = false
 				n.QuarantinedUntil = 0
 				doRestore = true
+			} else if n.DisabledByOperator {
+				// Operator/auto permanent stop: never auto-restore into the schedule.
+				n.Enabled = false
+				n.QuarantinedUntil = 0
+				if n.DisabledReason != "" {
+					n.LastReason = n.DisabledReason
+				}
 			}
 			// Credit real healthy usage (not idle selected wall-clock).
 			if !n.DisabledByGuard {
 				recordHealthyObservation(n, res.DurationMs)
 			}
-		case "soft":
-			// Soft TPS is only a suspicion. Do NOT isolate on soft alone by default.
-			// When SoftCrossVerify is on (default), queue a thinking probe; only
-			// missing thinking becomes hard isolation.
-			n.SoftStrikes++
-			if n.DisabledByGuard {
-				n.LastReason = fmt.Sprintf("软阈值 Token/s=%.1f · 已隔离，等待 thinking 复测", res.TPS)
-				if pol.SoftCrossVerify {
-					queueThinking = true
-				}
-			} else if pol.SoftCrossVerify {
-				n.LastReason = fmt.Sprintf("软阈值 Token/s=%.1f · 排队 thinking 复测确认", res.TPS)
-				queueThinking = true
-				// Soft still means the exit produced a usable response; count as
-				// non-degraded observation until hard/thinking confirms otherwise.
-				recordHealthyObservation(n, res.DurationMs)
-			} else if n.SoftStrikes >= pol.ConsecutiveSoft && !n.DisabledByGuard {
-				// SoftCrossVerify off: fall back to consecutive-soft quarantine.
-				doQuarantine = true
-				quarantineWhy = fmt.Sprintf("连续软阈值 Token/s=%.1f", res.TPS)
-			} else {
-				n.LastReason = fmt.Sprintf("软阈值 Token/s=%.1f · 连续 %d/%d", res.TPS, n.SoftStrikes, pol.ConsecutiveSoft)
-				recordHealthyObservation(n, res.DurationMs)
-			}
 		case "hard":
-			missingThinking := res.ErrorKind == "missing_thinking" || (!res.HasThinking && res.ErrorKind != "probe_timeout" && res.ErrorKind != "probe_unstable" && res.ErrorKind != "transport_error")
+			// Thinking is the only hard signal: one missing-thinking 降智 immediately
+			// isolates the exit IP and bans the account (see account branch below).
+			n.ThinkingStrikes++
 			if strings.TrimSpace(res.Error) != "" {
 				quarantineWhy = res.Error
-			} else if res.ErrorKind == "probe_timeout" {
-				quarantineWhy = probeTimeoutReason
-			} else if res.ErrorKind == "probe_unstable" {
-				quarantineWhy = probeUnstableReason
-			} else if missingThinking {
+			} else {
 				quarantineWhy = missingThinkingReason
-			} else {
-				quarantineWhy = fmt.Sprintf("硬阈值 Token/s=%.1f", res.TPS)
 			}
-
-			// ThinkingGuard off: missing-thinking hard is downgraded to a soft-style
-			// sample (no isolation on thinking alone). Other hard reasons still isolate.
-			if missingThinking && !pol.ThinkingGuard {
-				n.SoftStrikes++
-				n.ThinkingStrikes = 0
-				n.LastReason = quarantineWhy + " · thinking 判定已关闭"
-				n.LastClassification = "soft"
-				recordHealthyObservation(n, res.DurationMs)
-				break
-			}
-
-			if missingThinking {
-				n.ThinkingStrikes++
-				threshold := pol.ConsecutiveMissingThinking
-				if threshold <= 0 {
-					threshold = 1
-				}
-				isActiveConfirm := source == "active" || source == "cross_verify" || source == "soft-recheck"
-				if n.ThinkingStrikes < threshold {
-					n.LastReason = fmt.Sprintf("连续缺少 thinking %d/%d", n.ThinkingStrikes, threshold)
-					n.LastClassification = "hard"
-					// Not yet at threshold: sample only, no quarantine.
-					recordDegradedObservation(n)
-					break
-				}
-				if pol.ThinkingCrossVerify && !isActiveConfirm && !n.DisabledByGuard {
-					// Defer isolation: queue active thinking recheck first.
-					n.LastReason = fmt.Sprintf("连续缺少 thinking %d 次，排队交叉验证探测", n.ThinkingStrikes)
-					n.LastClassification = "hard"
-					queueThinking = true
-					recordDegradedObservation(n)
-					break
-				}
-				quarantineWhy = fmt.Sprintf("连续缺少 thinking_content %d 次（降智）", n.ThinkingStrikes)
-			} else {
-				n.ThinkingStrikes = 0
-			}
-
 			recordDegradedObservation(n)
-			if !n.DisabledByGuard {
-				doQuarantine = true
-			} else {
-				// Already isolated: refresh countdown + reason so recovery retests
-				// keep the operator-visible thinking verdict.
-				n.QuarantinedUntil = float64(time.Now().Add(time.Duration(pol.QuarantineSec) * time.Second).Unix())
-				n.LastReason = quarantineWhy
-				n.LastClassification = "hard"
-			}
+			// Always re-enter quarantine path. quarantineNodeOpts handles both the
+			// first isolation and already-isolated failed recovery cycles (count +
+			// auto-disable). Do NOT only refresh the timer here — that made continuous
+			// 降智 nodes loop recovery forever with quarantine_count stuck at 1.
+			doQuarantine = true
 		case "error":
 			n.ThinkingStrikes = 0
 			n.ErrorStrikes++
 			// Transport/node-side errors count as degraded observations.
 			recordDegradedObservation(n)
-			if n.ErrorStrikes >= pol.ConsecutiveErrors && !n.DisabledByGuard {
+			if n.ErrorStrikes >= pol.ConsecutiveErrors {
 				doQuarantine = true
-				quarantineWhy = "连续探测错误: " + res.Error
+				quarantineWhy = "连续传输错误: " + res.Error
 			}
 		}
 		nodeCopy = *n
@@ -1205,48 +706,25 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 		store.bumpStat(source, res.Classification, res.OutputTokens)
 		return
 	}
-	// Per-account 降智 stats (independent of node isolation / cross-verify):
-	// - sample: real generation outcomes (healthy/soft/hard), not errors/ignored
+	// Per-account 降智 stats:
+	// - sample: real generation outcomes (healthy/hard quality), not errors/ignored
 	// - degraded: this observation itself is a quality-degrade hit for THIS auth
-	// Passive missing-thinking immediately counts as degrade for the audited account.
-	// Cross-verify probes use their own AuthID and are recorded separately — do NOT
-	// merge passive-trigger account with the recheck account, and do not wait for
-	// cross-verify confirmation before attributing the passive hit.
-	if res.AuthID != "" && res.Classification != "error" && res.Classification != "ignored" && res.Classification != "unknown" {
-		degraded := false
+	// Passive missing-thinking immediately counts as degrade for the audited account
+	// and immediately bans it (AuthAutoDisable on) — no cross-node threshold needed.
+	// Node transport flakiness (TLS/EOF/timeout) still isolates the node, but is
+	// NOT an account 降智 sample — otherwise 断流 inflates account degrade rate.
+	if res.AuthID != "" && res.Classification != "error" && res.Classification != "ignored" && res.Classification != "unknown" &&
+		!isNodeTransportHard(res.ErrorKind) {
+		degraded := res.Classification == "hard"
 		reason := res.Error
-		switch res.Classification {
-		case "hard":
-			// Account stats follow the observation itself. Queuing a cross-verify
-			// only defers node isolation; it must not suppress this auth's degrade.
-			degraded = true
-			if reason == "" {
-				if res.ErrorKind == "missing_thinking" || !res.HasThinking {
-					reason = missingThinkingReason
-				} else if res.ErrorKind == "probe_timeout" {
-					reason = probeTimeoutReason
-				} else if res.ErrorKind == "probe_unstable" {
-					reason = probeUnstableReason
-				} else if nodeCopy.LastReason != "" {
-					reason = nodeCopy.LastReason
-				} else {
-					reason = fmt.Sprintf("硬阈值 Token/s=%.1f", res.TPS)
-				}
-			}
-		case "soft":
-			// Soft is suspicion until thinking recheck; only count as degrade if
-			// the node is already isolated (or just quarantined this turn).
-			if doQuarantine || (nodeCopy.DisabledByGuard && !queueThinking) {
-				degraded = true
-				if reason == "" {
-					reason = fmt.Sprintf("连续软阈值 Token/s=%.1f", res.TPS)
-				}
-			}
-		case "healthy":
-			// Explicit healthy (e.g. cross-verify found thinking): sample only.
-			degraded = false
+		if degraded && reason == "" {
+			reason = missingThinkingReason
 		}
 		store.recordAuthObservation(res.AuthID, res.AuthLabel, source, nodeCopy.ID, nodeCopy.Name, res.Classification, reason, res.TPS, degraded)
+		if degraded {
+			// 缺 thinking 立即禁用账号（阈值即时触发，见 shouldAutoDisableAuth）。
+			maybeAutoDisableAuth(store, res.AuthID, res.AuthLabel)
+		}
 	}
 	if res.Classification == "ignored" {
 		store.bumpStat(source, "ignored", res.OutputTokens)
@@ -1259,32 +737,6 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 	}
 	if doQuarantine {
 		quarantineNode(store, nodeCopy.ID, quarantineWhy, res.TPS, res.Classification)
-	}
-	if queueThinking {
-		evName := "thinking_recheck_queued"
-		evClass := "soft"
-		evReason := fmt.Sprintf("软阈值 Token/s=%.1f，排队 thinking 复测；无 thinking 才隔离", res.TPS)
-		if res.Classification == "hard" || res.ErrorKind == "missing_thinking" || (!res.HasThinking && res.Classification == "hard") {
-			evName = "thinking_cross_verify_scheduled"
-			evClass = "hard"
-			evReason = nodeCopy.LastReason
-			if evReason == "" {
-				evReason = "缺少 thinking，排队交叉验证探测"
-			}
-		} else if pol.SoftCrossVerify {
-			evName = "soft_cross_verify_scheduled"
-		}
-		store.appendEvent(guardEvent{
-			Event:          evName,
-			NodeID:         nodeCopy.ID,
-			NodeName:       nodeCopy.Name,
-			Classification: evClass,
-			OutputTPS:      res.TPS,
-			Reason:         evReason,
-		})
-		log.Printf("egress-guard: queue thinking recheck node=%s name=%q class=%s tps=%.1f source=%s event=%s",
-			nodeCopy.ID, nodeCopy.Name, res.Classification, res.TPS, source, evName)
-		_, _ = queueNodeQuality(store, nodeCopy.ID, "soft-recheck", false)
 	}
 	store.bumpStat(source, res.Classification, res.OutputTokens)
 }
@@ -1316,21 +768,51 @@ func quarantineNodeOpts(store *stateStore, nodeID, reason string, tps float64, c
 		return nil, fmt.Errorf("节点不存在")
 	}
 	if target.DisabledByGuard {
-		// Already quarantined — refresh reason / countdown for manual re-mark.
-		// Keep original LastQuarantinedAt so continuous quarantine duration is accurate.
+		// Already quarantined — refresh reason/countdown, and count this as another
+		// continuous-degrade cycle. Recovery hard retests used to only refresh the
+		// timer, so quarantine_count stayed at 1 and NodeAutoDisable never fired.
+		// Keep original LastQuarantinedAt so continuous quarantine wall-clock stays accurate.
 		updated, err := store.updateNode(nodeID, func(n *nodeRecord) error {
-			n.QuarantinedUntil = float64(time.Now().Add(time.Duration(pol.QuarantineSec) * time.Second).Unix())
+			n.DisabledByGuard = true
+			n.QuarantinedUntil = float64(time.Now().Add(quarantineSeconds * time.Second).Unix())
 			n.LastReason = reason
 			if class != "" {
 				n.LastClassification = class
 			}
 			if n.LastQuarantinedAt <= 0 {
 				markNodeQuarantined(n, float64(time.Now().Unix()))
+			} else {
+				// Same isolation stint: do not reset LastQuarantinedAt, but bump the
+				// cycle counter so repeated failed recoveries reach auto-disable.
+				n.QuarantineCount++
 			}
 			return nil
 		})
-		if err != nil {
+		if err != nil || updated == nil {
+			if err == nil {
+				err = fmt.Errorf("隔离续期失败")
+			}
 			return nil, err
+		}
+		store.appendEvent(guardEvent{
+			Event:          "node_quarantine_extended",
+			NodeID:         updated.ID,
+			NodeName:       updated.Name,
+			Reason:         reason,
+			Classification: class,
+			OutputTPS:      tps,
+		})
+		// Continuous 降智 while still isolated: same auto-stop path as a fresh quarantine.
+		maybeAutoDisableNode(store, updated.ID, reason)
+		if latest, ok := store.getNode(updated.ID); ok && latest != nil {
+			updated = latest
+		}
+		// If auto-disable did not fire and this Clash leaf somehow became selected,
+		// push production off it again.
+		if updated.Source == nodeSourceClash && updated.Enabled && !updated.DisabledByOperator {
+			if err := switchClashAwayFromNode(store, updated); err != nil {
+				store.appendEvent(guardEvent{Event: "clash_switch_failed", NodeID: updated.ID, NodeName: updated.Name, Reason: err.Error()})
+			}
 		}
 		return updated, nil
 	}
@@ -1350,7 +832,7 @@ func quarantineNodeOpts(store *stateStore, nodeID, reason string, tps float64, c
 		nowUnix := float64(time.Now().Unix())
 		markNodeQuarantined(n, nowUnix)
 		n.DisabledByGuard = true
-		n.QuarantinedUntil = float64(time.Now().Add(time.Duration(pol.QuarantineSec) * time.Second).Unix())
+		n.QuarantinedUntil = float64(time.Now().Add(quarantineSeconds * time.Second).Unix())
 		n.LastReason = reason
 		if class != "" {
 			n.LastClassification = class
@@ -1365,27 +847,48 @@ func quarantineNodeOpts(store *stateStore, nodeID, reason string, tps float64, c
 	}
 	store.bumpAction("quarantined")
 	store.appendEvent(guardEvent{Event: "node_quarantined", NodeID: updated.ID, NodeName: updated.Name, Reason: reason, Classification: class, OutputTPS: tps})
+	// Continuous 降智: permanently stop the leaf after N quarantine cycles so recovery
+	// probes stop burning traffic. Operator must re-enable explicitly.
+	maybeAutoDisableNode(store, updated.ID, reason)
 	// Clash-sourced nodes share one mixed-port URL. The real recovery action is
 	// switching 🏜️ PerfectAI (or configured group) to another healthy leaf.
 	if updated.Source == nodeSourceClash {
 		if err := switchClashAwayFromNode(store, updated); err != nil {
 			store.appendEvent(guardEvent{Event: "clash_switch_failed", NodeID: updated.ID, NodeName: updated.Name, Reason: err.Error()})
-			if pol.DisableAuthOnHard {
-				_ = disableAuthsOnNode(store, updated, "egress-guard 降智隔离: "+reason)
-			}
 		}
 	} else if err := migrateAuthsOffNode(store, updated); err != nil {
 		store.appendEvent(guardEvent{Event: "accounts_migration_failed", NodeID: updated.ID, NodeName: updated.Name, Reason: err.Error()})
-		if pol.DisableAuthOnHard {
-			_ = disableAuthsOnNode(store, updated, "egress-guard 降智隔离: "+reason)
-		}
 	}
-	if rotated, err := rotateNodeIfConfigured(store, updated); err != nil {
+	if _, err := rotateNodeIfConfigured(store, updated); err != nil {
 		store.appendEvent(guardEvent{Event: "node_rotation_failed", NodeID: updated.ID, NodeName: updated.Name, Reason: err.Error()})
-	} else if rotated {
-		_, _ = queueNodeQuality(store, updated.ID, "rotate", false)
 	}
 	return updated, nil
+}
+
+// disableNodeForWindow ends the 24h account-window cool-off aftermath: push
+// production off the node and clear its bound accounts from scheduling so host
+// candidates never include a marked exit. Recovery is time-based, not probe-based.
+func disableNodeForWindow(store *stateStore, nodeID, reason string) {
+	if store == nil || nodeID == "" {
+		return
+	}
+	n, ok := store.getNode(nodeID)
+	if !ok || n == nil || !n.DisabledByNodeWindow {
+		return
+	}
+	store.appendEvent(guardEvent{
+		Event:    "node_window_disabled",
+		NodeID:   n.ID,
+		NodeName: n.Name,
+		Reason:   reason,
+	})
+	if n.Source == nodeSourceClash {
+		if err := switchClashAwayFromNode(store, n); err != nil {
+			store.appendEvent(guardEvent{Event: "clash_switch_failed", NodeID: n.ID, NodeName: n.Name, Reason: err.Error()})
+		}
+	} else if err := migrateAuthsOffNode(store, n); err != nil {
+		store.appendEvent(guardEvent{Event: "accounts_migration_failed", NodeID: n.ID, NodeName: n.Name, Reason: err.Error()})
+	}
 }
 
 // manualQuarantineNode is the panel "降智隔离" action: always force-isolate.
@@ -1409,15 +912,18 @@ func restoreQuarantinedNode(store *stateStore, nodeID string) (*nodeRecord, erro
 	if !ok {
 		return nil, fmt.Errorf("节点不存在")
 	}
-	if !n.DisabledByGuard {
+	if !n.DisabledByGuard && !n.DisabledByOperator {
 		return n, nil
 	}
 	updated, err := store.updateNode(nodeID, func(node *nodeRecord) error {
 		markNodeRestored(node, float64(time.Now().Unix()))
 		node.DisabledByGuard = false
 		node.QuarantinedUntil = 0
-		node.SoftStrikes = 0
 		node.ErrorStrikes = 0
+		node.ThinkingStrikes = 0
+		// Panel "恢复" also clears durable stop so a quarantined+auto-disabled leaf
+		// can re-enter the pool without a separate 启用 click.
+		applyOperatorEnabledLocked(node, true, "", "")
 		node.LastReason = "人工恢复"
 		node.LastClassification = "healthy"
 		return nil
@@ -1440,470 +946,8 @@ func restoreQuarantinedNode(store *stateStore, nodeID string) (*nodeRecord, erro
 	return updated, nil
 }
 
-func runNodeConnectivity(store *stateStore, id string) (map[string]any, error) {
-	n, ok := store.getNode(id)
-	if !ok {
-		return nil, fmt.Errorf("节点不存在")
-	}
-	ip, ms, err := probeConnectivity(n.ProxyURL)
-	status := "ok"
-	if err != nil {
-		status = "error"
-	}
-	_, _ = store.updateNode(id, func(node *nodeRecord) error {
-		node.ProbeStatus = status
-		node.ProbeLatencyMs = ms
-		node.LastProbeAt = float64(time.Now().Unix())
-		if ip != "" {
-			node.ExitIP = ip
-		}
-		if err != nil {
-			node.LastReason = err.Error()
-		}
-		return nil
-	})
-	out := map[string]any{"id": id, "status": status, "exitIp": ip, "latencyMs": ms}
-	if err != nil {
-		out["error"] = err.Error()
-	}
-	return out, nil
-}
-
-// executeNodeQuality runs one real-model quality probe. Callers that may race
-// Clash group selection must go through queueNodeQuality instead.
-func executeNodeQuality(store *stateStore, id, source string) (map[string]any, error) {
-	if strings.TrimSpace(source) == "" {
-		source = "manual"
-	}
-	// Observation source controls restore/strike bookkeeping. Recovery/rotate/
-	// manual/active probes all need the same "active" accounting so LastProbeAt
-	// advances and thinking-based hard hits apply.
-	obsSource := "active"
-
-	n, ok := store.getNode(id)
-	if !ok {
-		return nil, fmt.Errorf("节点不存在")
-	}
-	// Manual panel tests may intentionally hit a disabled leaf. Automatic sources
-	// (recovery/active/post-switch/…) must never spend queue slots on 停用 nodes.
-	if !n.Enabled && source != "manual" {
-		log.Printf("egress-guard: quality skip disabled node source=%s node=%s name=%q", source, id, n.Name)
-		return map[string]any{
-			"id":      id,
-			"skipped": true,
-			"reason":  "节点已停用",
-			"source":  source,
-		}, nil
-	}
-	log.Printf("egress-guard: quality start source=%s node=%s name=%q clash=%v leaf=%q quarantined=%v enabled=%v",
-		source, id, n.Name, n.Source == nodeSourceClash, n.ClashName, n.DisabledByGuard, n.Enabled)
-
-	// Quality probes always go internal cli-chat-proxy with CPA xAI tokens, via
-	// TestPort + :7953 so production PerfectAI/:7890 is undisturbed.
-	// (Optional public probe_api_* remains supported if operator sets it later.)
-	probeNode := *n
-	testGroup := ""
-	pol := store.policy()
-	usePublic := probeAPIConfigured(pol)
-	if usePublic {
-		// Explicit public API only: dial direct, no clash proxy.
-		probeNode.ProxyURL = ""
-		log.Printf("egress-guard: quality public-api direct dial base=%s node=%s", pol.ProbeAPIBase, id)
-	} else {
-		if n.Source == nodeSourceClash && n.ClashName != "" {
-			g, err := ensureClashSelectedForQuality(store, n)
-			testGroup = g
-			if err != nil {
-				log.Printf("egress-guard: quality test-group switch failed node=%s leaf=%q group=%q err=%v", id, n.ClashName, g, err)
-				return nil, fmt.Errorf("切换测试策略组失败: %w", err)
-			}
-			log.Printf("egress-guard: quality test-group switch ok node=%s leaf=%q group=%q", id, n.ClashName, g)
-		}
-		if proxy := qualityProbeProxyURL(n); proxy != "" {
-			probeNode.ProxyURL = proxy
-			log.Printf("egress-guard: quality dial proxy=%s (test path / cli-chat-proxy) node=%s", redactProxyURL(proxy), id)
-		}
-	}
-
-	// Hard deadline so one hung upstream stream cannot freeze the whole queue.
-	probeCtx, cancel := context.WithTimeout(context.Background(), qualityProbeTimeout+15*time.Second)
-	defer cancel()
-	res := probeQualityContext(probeCtx, store, &probeNode)
-	if res.Classification == "error" && res.ErrorKind != "transport_error" {
-		res.Classification = "ignored"
-	}
-
-	reason := strings.TrimSpace(res.Error)
-	if reason == "" {
-		if res.HasThinking {
-			reason = fmt.Sprintf("thinking=有 · class=%s · tps=%.1f · tokens=%d · reason_tokens=%d · dur=%dms · source=%s",
-				res.Classification, res.TPS, res.OutputTokens, res.ReasoningTokens, res.DurationMs, source)
-		} else {
-			reason = fmt.Sprintf("thinking=无 · class=%s · tps=%.1f · tokens=%d · dur=%dms · source=%s",
-				res.Classification, res.TPS, res.OutputTokens, res.DurationMs, source)
-		}
-	} else if !strings.Contains(strings.ToLower(reason), "thinking") {
-		think := "无"
-		if res.HasThinking {
-			think = "有"
-		}
-		reason = fmt.Sprintf("%s · thinking=%s · class=%s · source=%s", reason, think, res.Classification, source)
-	}
-
-	applyObservation(store, id, obsSource, res)
-	store.appendEvent(guardEvent{
-		Event:          "quality_probe_completed",
-		NodeID:         id,
-		NodeName:       n.Name,
-		Classification: res.Classification,
-		OutputTPS:      res.TPS,
-		Reason:         reason,
-	})
-	log.Printf("egress-guard: quality done source=%s node=%s name=%q class=%s thinking=%v reason_tokens=%d tps=%.1f tokens=%d dur=%dms kind=%s err=%q",
-		source, id, n.Name, res.Classification, res.HasThinking, res.ReasoningTokens, res.TPS, res.OutputTokens, res.DurationMs, res.ErrorKind, res.Error)
-
-	out := map[string]any{
-		"id":              id,
-		"classification":  res.Classification,
-		"tps":             res.TPS,
-		"outputTokens":    res.OutputTokens,
-		"durationMs":      res.DurationMs,
-		"firstTokenMs":    res.FirstTokenMs,
-		"exitIp":          res.ExitIP,
-		"error":           res.Error,
-		"errorKind":       res.ErrorKind,
-		"model":           res.Model,
-		"hasThinking":     res.HasThinking,
-		"reasoningTokens": res.ReasoningTokens,
-		"source":          source,
-		"reason":          reason,
-		"testGroup":       testGroup,
-		"testProxy":       redactProxyURL(probeNode.ProxyURL),
-	}
-	return out, nil
-}
-
-// runNodeQuality is the panel/API entry: enqueue and wait for the serial slot.
-func runNodeQuality(store *stateStore, id string) (map[string]any, error) {
-	return queueNodeQuality(store, id, "manual", true)
-}
-
-type qualityOutcome struct {
-	data map[string]any
-	err  error
-}
-
-type qualityJob struct {
-	id         int64
-	nodeID     string
-	nodeName   string
-	source     string
-	enqueuedAt time.Time
-	startedAt  time.Time
-	waiters    []chan qualityOutcome
-}
-
-// qualityScheduler serializes all real-model probes. Clash PerfectAI can only
-// point at one leaf at a time; concurrent quality tests would cross-wire exits.
-//
-// The worker loop is process-lifetime: CPA reconfigure fires many times at
-// startup and must NOT tear down / respawn the queue worker, or jobs freeze
-// mid-flight and multiple workers race Clash selection.
-type qualityScheduler struct {
-	mu      sync.Mutex
-	cond    *sync.Cond
-	nextID  int64
-	active  *qualityJob
-	pending []*qualityJob
-	started bool
-	stop    context.CancelFunc
-}
-
-var qualitySched = func() *qualityScheduler {
-	s := &qualityScheduler{}
-	s.cond = sync.NewCond(&s.mu)
-	return s
-}()
-
-func qualitySourceLabel(source string) string {
-	switch source {
-	case "manual":
-		return "手动"
-	case "active":
-		return "主动"
-	case "recovery":
-		return "隔离复测"
-	case "rotate":
-		return "换 IP 复测"
-	case "soft-recheck":
-		return "软阈值复测"
-	case "post-switch":
-		return "切后复测"
-	default:
-		if source == "" {
-			return "检测"
-		}
-		return source
-	}
-}
-
-func (s *qualityScheduler) snapshot() map[string]any {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	pending := make([]map[string]any, 0, len(s.pending))
-	for i, job := range s.pending {
-		if job == nil {
-			continue
-		}
-		pending = append(pending, map[string]any{
-			"position":     i + 1,
-			"node_id":      job.nodeID,
-			"node_name":    job.nodeName,
-			"source":       job.source,
-			"source_label": qualitySourceLabel(job.source),
-			"enqueued_at":  float64(job.enqueuedAt.Unix()),
-		})
-	}
-	out := map[string]any{
-		"pending":       pending,
-		"pending_count": len(pending),
-		"total":         len(pending),
-		"busy":          s.active != nil || len(pending) > 0,
-	}
-	if s.active != nil {
-		out["active"] = map[string]any{
-			"position":     0,
-			"node_id":      s.active.nodeID,
-			"node_name":    s.active.nodeName,
-			"source":       s.active.source,
-			"source_label": qualitySourceLabel(s.active.source),
-			"enqueued_at":  float64(s.active.enqueuedAt.Unix()),
-			"started_at":   float64(s.active.startedAt.Unix()),
-		}
-		out["total"] = len(pending) + 1
-	}
-	return out
-}
-
-func (s *qualityScheduler) findLocked(nodeID string) *qualityJob {
-	if s.active != nil && s.active.nodeID == nodeID {
-		return s.active
-	}
-	for _, job := range s.pending {
-		if job != nil && job.nodeID == nodeID {
-			return job
-		}
-	}
-	return nil
-}
-
-// queueNodeQuality enqueues a quality probe. When wait is true the caller blocks
-// until this node's job finishes (attaching to an in-flight/pending job if any).
-// When wait is false, duplicate node IDs are deduped and the call returns immediately.
-func queueNodeQuality(store *stateStore, nodeID, source string, wait bool) (map[string]any, error) {
-	if store == nil {
-		return nil, fmt.Errorf("store 未初始化")
-	}
-	nodeID = strings.TrimSpace(nodeID)
-	if nodeID == "" {
-		return nil, fmt.Errorf("节点 ID 为空")
-	}
-	n, ok := store.getNode(nodeID)
-	if !ok {
-		return nil, fmt.Errorf("节点不存在")
-	}
-	if strings.TrimSpace(source) == "" {
-		source = "manual"
-	}
-	// 停用节点：只允许面板手动检测；recovery/active/post-switch 等自动路径直接跳过，
-	// 避免隔离到期后继续烧测已停用叶子。
-	if !n.Enabled && source != "manual" {
-		return map[string]any{
-			"id":      nodeID,
-			"skipped": true,
-			"reason":  "节点已停用",
-			"source":  source,
-			"status":  "skipped_disabled",
-		}, nil
-	}
-
-	s := qualitySched
-	s.mu.Lock()
-	if existing := s.findLocked(nodeID); existing != nil {
-		if !wait {
-			s.mu.Unlock()
-			return map[string]any{
-				"id":      nodeID,
-				"queued":  true,
-				"deduped": true,
-				"status":  "already_queued",
-			}, nil
-		}
-		ch := make(chan qualityOutcome, 1)
-		existing.waiters = append(existing.waiters, ch)
-		s.mu.Unlock()
-		out := <-ch
-		return out.data, out.err
-	}
-
-	s.nextID++
-	job := &qualityJob{
-		id:         s.nextID,
-		nodeID:     nodeID,
-		nodeName:   n.Name,
-		source:     source,
-		enqueuedAt: time.Now(),
-	}
-	var ch chan qualityOutcome
-	if wait {
-		ch = make(chan qualityOutcome, 1)
-		job.waiters = []chan qualityOutcome{ch}
-	}
-	s.pending = append(s.pending, job)
-	s.cond.Signal()
-	s.mu.Unlock()
-
-	if !wait {
-		return map[string]any{
-			"id":     nodeID,
-			"queued": true,
-			"status": "queued",
-		}, nil
-	}
-	out := <-ch
-	return out.data, out.err
-}
-
-func startQualityWorker(_ context.Context, _ *stateStore) {
-	s := qualitySched
-	s.mu.Lock()
-	if s.started {
-		s.mu.Unlock()
-		return
-	}
-	lifeCtx, lifeCancel := context.WithCancel(context.Background())
-	s.stop = lifeCancel
-	s.started = true
-	s.mu.Unlock()
-
-	go func() {
-		defer func() {
-			if rec := recover(); rec != nil {
-				log.Printf("egress-guard: quality worker panic: %v\n%s", rec, debug.Stack())
-			}
-			s.mu.Lock()
-			s.started = false
-			active := s.active
-			s.active = nil
-			pendingLeft := len(s.pending)
-			s.stop = nil
-			s.mu.Unlock()
-			if active != nil {
-				for _, w := range active.waiters {
-					w <- qualityOutcome{err: fmt.Errorf("质量检测 worker 异常退出")}
-				}
-			}
-			// Only auto-restart on unexpected panic while the plugin is still up.
-			// Explicit stopQualityWorker cancels lifeCtx and must not respawn.
-			if lifeCtx.Err() == nil && pendingLeft > 0 {
-				log.Printf("egress-guard: quality worker restarting after panic pending=%d", pendingLeft)
-				startQualityWorker(context.Background(), nil)
-			}
-		}()
-
-		log.Printf("egress-guard: quality worker started (process lifetime)")
-		for {
-			s.mu.Lock()
-			for len(s.pending) == 0 && lifeCtx.Err() == nil {
-				s.cond.Wait()
-			}
-			if lifeCtx.Err() != nil {
-				// Plugin shutdown: fail waiters, keep pending list for diagnostics.
-				leftover := append([]*qualityJob{}, s.pending...)
-				if s.active != nil {
-					leftover = append(leftover, s.active)
-				}
-				s.pending = nil
-				s.active = nil
-				s.mu.Unlock()
-				for _, job := range leftover {
-					for _, w := range job.waiters {
-						w <- qualityOutcome{err: fmt.Errorf("质量检测队列已停止")}
-					}
-				}
-				log.Printf("egress-guard: quality worker stopped")
-				return
-			}
-			job := s.pending[0]
-			s.pending = s.pending[1:]
-			job.startedAt = time.Now()
-			s.active = job
-			pendingAfter := len(s.pending)
-			s.mu.Unlock()
-
-			// Always use the live global store — reconfigure swaps it under us.
-			live := store
-			log.Printf("egress-guard: quality dequeue source=%s node=%s name=%q pending_left=%d",
-				job.source, job.nodeID, job.nodeName, pendingAfter)
-
-			var (
-				data map[string]any
-				err  error
-			)
-			func() {
-				defer func() {
-					if rec := recover(); rec != nil {
-						err = fmt.Errorf("质量检测 panic: %v", rec)
-						log.Printf("egress-guard: quality job panic source=%s node=%s: %v\n%s",
-							job.source, job.nodeID, rec, debug.Stack())
-					}
-				}()
-				if live == nil {
-					err = fmt.Errorf("store 未初始化")
-					return
-				}
-				data, err = executeNodeQuality(live, job.nodeID, job.source)
-			}()
-
-			s.mu.Lock()
-			if s.active == job {
-				s.active = nil
-			}
-			waiters := job.waiters
-			job.waiters = nil
-			nextPending := len(s.pending)
-			s.mu.Unlock()
-			if err != nil {
-				log.Printf("egress-guard: quality finish ERR source=%s node=%s name=%q err=%v pending_left=%d",
-					job.source, job.nodeID, job.nodeName, err, nextPending)
-			} else {
-				class, _ := data["classification"].(string)
-				log.Printf("egress-guard: quality finish OK source=%s node=%s name=%q class=%s pending_left=%d",
-					job.source, job.nodeID, job.nodeName, class, nextPending)
-			}
-			for _, w := range waiters {
-				w <- qualityOutcome{data: data, err: err}
-			}
-		}
-	}()
-}
-
-func stopQualityWorker() {
-	s := qualitySched
-	s.mu.Lock()
-	stop := s.stop
-	s.mu.Unlock()
-	if stop != nil {
-		stop()
-	}
-	s.cond.Broadcast()
-}
-
 func handlePassiveUsage(store *stateStore, record map[string]any) {
 	pol := store.policy()
-	if pol.Mode == "active" {
-		return
-	}
 	provider := strings.ToLower(firstString(record, "Provider", "provider"))
 	if provider != "" && !strings.Contains(provider, "xai") && !strings.Contains(provider, "grok") {
 		return
@@ -1981,7 +1025,7 @@ func handlePassiveUsage(store *stateStore, record map[string]any) {
 		class = classifyQuality(tps, outTokens, hasThinking, pol)
 	}
 
-	if class == "hard" || class == "soft" {
+	if class == "hard" {
 		invalidateAuthProxyCache()
 	}
 	nodeID := resolveNodeIDForAuth(store, authID, authIndex,
@@ -1998,15 +1042,25 @@ func handlePassiveUsage(store *stateStore, record map[string]any) {
 		AuthID:         authKey,
 		AuthLabel:      authKey,
 	}
-	if class == "hard" && !failed && pol.ThinkingGuard && !hasThinking {
+	if class == "hard" && !failed && !hasThinking {
 		res.Error = missingThinkingReason
 		res.ErrorKind = "missing_thinking"
 	}
+	// Account-window cool-off: real requests (never probes or failures) count
+	// distinct auths per egress. At the threshold the node is isolated for 24h
+	// so a shared exit cannot mark more accounts.
+	if nodeID != "" && class != "error" && class != "ignored" && !failed && authKey != "" && authKey != "probe-api" {
+		if store.recordNodeAuthUsage(nodeID, authKey) {
+			if n, ok := store.getNode(nodeID); ok && n != nil {
+				disableNodeForWindow(store, nodeID, n.NodeWindowReason)
+			}
+		}
+	}
 	if nodeID == "" {
 		store.bumpStat("passive", class, outTokens)
-		if class == "hard" || class == "soft" {
+		if class == "hard" {
 			store.appendEvent(guardEvent{
-				Event:          "unmapped_" + class,
+				Event:          "unmapped_hard",
 				AuthID:         authKey,
 				Classification: class,
 				OutputTPS:      tps,
@@ -2017,15 +1071,10 @@ func handlePassiveUsage(store *stateStore, record map[string]any) {
 		if authKey != "" && class != "error" && class != "ignored" && class != "unknown" {
 			degraded := false
 			reason := res.Error
-			if pol.ThinkingGuard && class == "hard" && !hasThinking && !failed {
+			if class == "hard" && !failed {
 				degraded = true
 				if reason == "" {
 					reason = missingThinkingReason
-				}
-			} else if class == "hard" && !failed {
-				degraded = true
-				if reason == "" {
-					reason = fmt.Sprintf("硬阈值 Token/s=%.1f", tps)
 				}
 			}
 			store.recordAuthObservation(authKey, authKey, "passive", "", "", class, reason, tps, degraded)
@@ -2044,23 +1093,7 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
-func busiestEnabledNode(store *stateStore) string {
-	bestID := ""
-	bestN := -1
-	for _, n := range store.listNodes() {
-		if !n.Enabled || n.DisabledByGuard || n.ProxyURL == "" {
-			continue
-		}
-		if n.AssignedAccountCount > bestN {
-			bestN = n.AssignedAccountCount
-			bestID = n.ID
-		}
-	}
-	return bestID
-}
-
 func startGuardWorker(ctx context.Context, store *stateStore) {
-	startQualityWorker(ctx, store)
 	go func() {
 		t := time.NewTicker(30 * time.Second)
 		defer t.Stop()
@@ -2069,25 +1102,44 @@ func startGuardWorker(ctx context.Context, store *stateStore) {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				pol := store.policy()
 				now := float64(time.Now().Unix())
-				// Enqueue only — never run probes inline. Clash leaf selection is
-				// global; the quality scheduler keeps PerfectAI switches serial.
 				for _, n := range store.listNodes() {
-					// Recovery only for still-enabled leaves. Disabled nodes keep quarantine marks for UI but must never re-enter the probe queue.
-					if n.DisabledByGuard && n.Enabled && n.QuarantinedUntil > 0 && now >= n.QuarantinedUntil {
-						_, _ = queueNodeQuality(store, n.ID, "recovery", false)
+					// Account-window cool-off expiry: time-based restore, never
+					// probe-based, so a marked exit needs no traffic to come back.
+					if n.DisabledByNodeWindow && n.NodeWindowUntil > 0 && now >= n.NodeWindowUntil {
+						if store.clearNodeWindow(n.ID) {
+							store.appendEvent(guardEvent{
+								Event:    "node_window_restored",
+								NodeID:   n.ID,
+								NodeName: n.Name,
+								Reason:   "账号窗口冷却到期，自动恢复",
+							})
+						}
 						continue
 					}
-					if pol.Mode == "active" || pol.Mode == "hybrid" {
-						if n.Enabled && !n.DisabledByGuard && (n.LastProbeAt == 0 || now-n.LastProbeAt >= float64(pol.ActiveIntervalSec)) {
-							_, _ = queueNodeQuality(store, n.ID, "active", false)
-							break
-						}
+					// Guard quarantine expiry: time-based restore. Isolated leaves
+					// re-enter the pool without any recovery probe traffic.
+					if n.DisabledByGuard && n.QuarantinedUntil > 0 && now >= n.QuarantinedUntil {
+						store.updateNode(n.ID, func(node *nodeRecord) error {
+							markNodeRestored(node, now)
+							node.DisabledByGuard = false
+							node.QuarantinedUntil = 0
+							node.ErrorStrikes = 0
+							node.ThinkingStrikes = 0
+							node.LastReason = "隔离到期自动恢复"
+							node.LastClassification = "healthy"
+							return nil
+						})
+						store.appendEvent(guardEvent{
+							Event:          "node_restored",
+							NodeID:         n.ID,
+							NodeName:       n.Name,
+							Reason:         "隔离到期自动恢复",
+							Classification: "healthy",
+						})
+						continue
 					}
 				}
-				// Counts are refreshed lazily from UI/status and after migrations.
-				// Doing a full auth fan-out every 30s is a major CPU/host-call cost.
 			}
 		}
 	}()

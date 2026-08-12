@@ -4,3 +4,35 @@
 .panel-switch .button.active { background: var(--card); color: var(--foreground); }
 .panel[hidden] { display: none !important; }
 #panel-accounts-host .section-note { margin: var(--space-3xs) 0 0; color: var(--muted-foreground); font-size: var(--text-2xs); line-height: 1.5; }
+#panel-accounts-host .section + .section { margin-top: var(--space-md); }
+
+/* 账号降智统计：全绿 / 已禁用 行强调 */
+#auth-degrade-body tr.row-quarantined td,
+#auth-degrade-cards .node-card.row-quarantined { background: color-mix(in oklch, var(--destructive) 6%, transparent); }
+#auth-degrade-body tr.row-disabled td,
+#auth-degrade-cards .node-card.row-disabled { opacity: 0.6; }
+#auth-degrade-body tr.row-disabled .node-name,
+#auth-degrade-cards .node-card.row-disabled .node-name { text-decoration: line-through; text-decoration-color: var(--muted-foreground); }
+
+/* 自动禁用进度文本 */
+#auth-degrade-body .progress-line { font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--muted-foreground); }
+#auth-degrade-body .progress-line.tone-bad { color: var(--destructive); font-weight: 650; }
+#auth-degrade-body .progress-line.tone-muted { color: var(--muted-foreground); }
+
+/* 行内禁用/恢复按钮 */
+#auth-degrade-body .auth-action,
+#auth-degrade-cards .auth-action,
+.disabled-row .auth-action { min-height: 1.6rem; padding: 0 var(--space-sm); font-size: var(--text-2xs); }
+#auth-degrade-cards .node-card-actions { display: flex; justify-content: flex-end; margin-top: var(--space-2xs); }
+
+/* 插件禁用账号列表 */
+#disabled-auths-list.account-list { max-height: 18rem; }
+.disabled-row .disabled-actions { align-items: flex-end; text-align: right; max-width: 55%; }
+.disabled-row .disabled-actions .subtext { overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+
+/* 账号探测：勾选列 + 行内操作组 */
+#auth-degrade-body .check-cell,
+#auth-degrade-body th.check-cell { width: 2.2rem; text-align: center; }
+#auth-degrade-body .auth-actions,
+#auth-degrade-cards .auth-actions { display: inline-flex; flex-wrap: wrap; gap: var(--space-3xs); justify-content: flex-end; }
+#auth-probe-selected:disabled { opacity: 0.55; }

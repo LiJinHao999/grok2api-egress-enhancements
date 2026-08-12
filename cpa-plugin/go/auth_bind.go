@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -240,7 +242,87 @@ func setAuthProxyAndFlags(a authFile, proxyURL string, disabled bool, reason str
 	if _, ok := a.Raw["type"]; !ok {
 		a.Raw["type"] = "xai"
 	}
-	return saveAuthFile(a.Name, a.Raw)
+	// host.auth.save keeps the CPA runtime in sync for proxy_url and token
+	// fields, but on current CPA versions it silently ignores the disabled flag
+	// (only the management panel's PATCH /auth-files/status sets it). Apply the
+	// disabled flag directly to the physical auth file so the account actually
+	// goes offline / comes back online; the CPA file watcher picks it up.
+	if err := saveAuthFile(a.Name, a.Raw); err != nil {
+		return err
+	}
+	if err := writeAuthDisabled(a.Name, disabled, reason); err != nil {
+		log.Printf("egress-guard: direct auth disabled write failed name=%s disabled=%v err=%v", a.Name, disabled, err)
+	}
+	return nil
+}
+
+// authFileDirCandidatesList lists container paths where CPA auth files may
+// live. It is a package var so tests can point it at a temp dir.
+var authFileDirCandidatesList = []string{
+	"/root/.cli-proxy-api",
+	"/CLIProxyAPI/auths",
+}
+
+func authFileDirCandidates() []string {
+	out := append([]string{}, authFileDirCandidatesList...)
+	if home := strings.TrimSpace(os.Getenv("HOME")); home != "" {
+		out = append(out, filepath.Join(home, ".cli-proxy-api"))
+	}
+	return out
+}
+
+// findAuthFilePath resolves the physical container path of an auth file by
+// name across the candidate auth directories.
+func findAuthFilePath(name string) (string, bool) {
+	if name == "" {
+		return "", false
+	}
+	for _, dir := range authFileDirCandidates() {
+		p := filepath.Join(dir, name)
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			return p, true
+		}
+	}
+	return "", false
+}
+
+// writeAuthDisabled edits the disabled / disabled_reason / disabled_at fields
+// of the physical auth file (keeping all other fields intact), because
+// host.auth.save ignores the disabled flag.
+func writeAuthDisabled(name string, disabled bool, reason string) error {
+	path, ok := findAuthFilePath(name)
+	if !ok {
+		return fmt.Errorf("auth file path not found: %s", name)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	obj := map[string]any{}
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return err
+	}
+	obj["disabled"] = disabled
+	if disabled && reason != "" {
+		obj["disabled_reason"] = reason
+		obj["disabled_at"] = nowRFC3339()
+	} else {
+		delete(obj, "disabled_reason")
+		delete(obj, "disabled_at")
+	}
+	out, err := json.MarshalIndent(obj, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, out, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	invalidateAuthListCache()
+	return nil
 }
 
 func isGuardDisabledAuth(a authFile) bool {
@@ -249,6 +331,222 @@ func isGuardDisabledAuth(a authFile) bool {
 	}
 	reason, _ := a.Raw["disabled_reason"].(string)
 	return strings.Contains(reason, "egress-guard") || strings.Contains(reason, "降智")
+}
+
+func authDisableReason(a authFile) string {
+	if a.Raw == nil {
+		return ""
+	}
+	reason, _ := a.Raw["disabled_reason"].(string)
+	return strings.TrimSpace(reason)
+}
+
+// isAuthExpired reports whether the auth file carries an explicit expiry in the
+// past or an expired flag. Files without expiry metadata are not expired.
+func isAuthExpired(a authFile) bool {
+	if a.Raw == nil {
+		return false
+	}
+	for _, key := range []string{"expired", "Expired", "is_expired"} {
+		switch v := a.Raw[key].(type) {
+		case bool:
+			if v {
+				return true
+			}
+		case string:
+			if s := strings.TrimSpace(v); strings.EqualFold(s, "true") || s == "1" {
+				return true
+			}
+		}
+	}
+	now := time.Now().Unix()
+	for _, key := range []string{"ExpiresAt", "expires_at", "expiresAt", "expire_at", "ExpireAt"} {
+		switch v := a.Raw[key].(type) {
+		case float64:
+			if v > 0 && v < float64(now) {
+				return true
+			}
+		case int64:
+			if v > 0 && v < now {
+				return true
+			}
+		case string:
+			if t, err := time.Parse(time.RFC3339, v); err == nil && t.Before(time.Now()) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isPluginAccountDisabledReason matches panel/manual or auto account bans.
+func isPluginAccountDisabledReason(reason string) bool {
+	r := strings.ToLower(strings.TrimSpace(reason))
+	return strings.Contains(r, "account-manual") || strings.Contains(r, "account-auto")
+}
+
+func isPluginAccountDisabled(a authFile) bool {
+	if !a.Disabled {
+		return false
+	}
+	return isPluginAccountDisabledReason(authDisableReason(a))
+}
+
+// isNodeIsolationDisabledReason is the old "disable auths on quarantined node" path.
+func isNodeIsolationDisabledReason(reason string) bool {
+	r := strings.TrimSpace(reason)
+	if r == "" {
+		return false
+	}
+	if isPluginAccountDisabledReason(r) {
+		return false
+	}
+	return strings.Contains(r, "egress-guard 降智隔离") || (strings.Contains(r, "egress-guard") && strings.Contains(r, "降智"))
+}
+
+func isPluginManagedDisabled(a authFile) bool {
+	if !a.Disabled {
+		return false
+	}
+	r := authDisableReason(a)
+	return isPluginAccountDisabledReason(r) || isNodeIsolationDisabledReason(r)
+}
+
+// normalizeAuthFileKey normalizes an auth identifier for fuzzy matching: strips
+// whitespace, a trailing .json and an optional xai- / grok- prefix, then
+// lowercases. Panel/stat keys arrive as filenames (xai-{email}.json), bare
+// emails or raw runtime ids, so the file lookup must not require an exact
+// field match against whatever host.auth.get happened to return as Name/ID.
+func normalizeAuthFileKey(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	s = strings.TrimSuffix(s, ".json")
+	s = strings.TrimPrefix(s, "xai-")
+	s = strings.TrimPrefix(s, "grok-")
+	return s
+}
+
+func findAuthFileByID(authID string) (authFile, bool) {
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return authFile{}, false
+	}
+	norm := normalizeAuthFileKey(authID)
+	auths := listAuthFilesBestEffort()
+	for _, a := range auths {
+		for _, key := range []string{a.ID, a.Index, a.Name, a.Email} {
+			k := strings.TrimSpace(key)
+			if k != "" && (k == authID || normalizeAuthFileKey(k) == norm) {
+				return a, true
+			}
+		}
+	}
+	// Last resort: the key may embed an email (xai-a@b.c.json or a@b.c) that is
+	// not a normalized field of any listed authFile (e.g. host returned an
+	// opaque Name/ID). Match the email portion against the auth file email.
+	if strings.Contains(norm, "@") {
+		for _, a := range auths {
+			if a.Email != "" && normalizeAuthFileKey(a.Email) == norm {
+				return a, true
+			}
+		}
+	}
+	return authFile{}, false
+}
+
+func disableAuthByID(authID, source, reason string) (authFile, error) {
+	a, ok := findAuthFileByID(authID)
+	if !ok {
+		return authFile{}, fmt.Errorf("账号不存在: %s", authID)
+	}
+	if a.Disabled && isPluginAccountDisabled(a) {
+		return a, nil
+	}
+	source = strings.TrimSpace(source)
+	if source == "" {
+		source = "manual"
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		if source == "auto" {
+			reason = "egress-guard account-auto: 账号降智自动禁用"
+		} else {
+			reason = "egress-guard account-manual: 面板手动禁用"
+		}
+	} else if !strings.Contains(reason, "egress-guard") {
+		if source == "auto" {
+			reason = "egress-guard account-auto: " + reason
+		} else {
+			reason = "egress-guard account-manual: " + reason
+		}
+	}
+	if err := setAuthProxyAndFlags(a, a.ProxyURL, true, reason); err != nil {
+		return a, err
+	}
+	invalidateAuthListCache()
+	updated, ok := findAuthFileByID(authID)
+	if ok {
+		return updated, nil
+	}
+	a.Disabled = true
+	if a.Raw == nil {
+		a.Raw = map[string]any{}
+	}
+	a.Raw["disabled"] = true
+	a.Raw["disabled_reason"] = reason
+	return a, nil
+}
+
+func enableAuthByID(authID string) (authFile, error) {
+	a, ok := findAuthFileByID(authID)
+	if !ok {
+		return authFile{}, fmt.Errorf("账号不存在: %s", authID)
+	}
+	if !a.Disabled {
+		return a, nil
+	}
+	if !isPluginManagedDisabled(a) {
+		return a, fmt.Errorf("非插件托管禁用，拒绝恢复: %s", authDisableReason(a))
+	}
+	if err := setAuthProxyAndFlags(a, a.ProxyURL, false, ""); err != nil {
+		return a, err
+	}
+	invalidateAuthListCache()
+	updated, ok := findAuthFileByID(authID)
+	if ok {
+		return updated, nil
+	}
+	a.Disabled = false
+	return a, nil
+}
+
+func listPluginDisabledAuthSummaries() []map[string]any {
+	out := make([]map[string]any, 0)
+	for _, a := range listAuthFilesBestEffort() {
+		if !isPluginManagedDisabled(a) {
+			continue
+		}
+		reason := authDisableReason(a)
+		source := "other"
+		if strings.Contains(reason, "account-auto") {
+			source = "auto"
+		} else if strings.Contains(reason, "account-manual") {
+			source = "manual"
+		} else if isNodeIsolationDisabledReason(reason) {
+			source = "node"
+		}
+		disabledAt, _ := a.Raw["disabled_at"].(string)
+		out = append(out, map[string]any{
+			"auth_id":         firstNonEmpty(a.ID, a.Index, a.Name, a.Email),
+			"label":           firstNonEmpty(a.Email, a.Name, a.ID, a.Index),
+			"name":            a.Name,
+			"disabled":        true,
+			"disabled_source": source,
+			"disabled_reason": reason,
+			"disabled_at":     disabledAt,
+			"proxy_url":       a.ProxyURL,
+		})
+	}
+	return out
 }
 
 func verifyAuthBinding(a authFile, expectedProxy string, expectedDisabled bool) error {
@@ -298,7 +596,7 @@ func rebalanceAuthsToNodes(store *stateStore) (map[string]int, error) {
 	clashProxy := ""
 	var activeClash *nodeRecord
 	for _, n := range nodes {
-		if n.Source != nodeSourceClash || !n.Enabled || n.DisabledByGuard || n.ProxyURL == "" {
+		if n.Source != nodeSourceClash || !nodeSchedulable(n) || n.ProxyURL == "" {
 			continue
 		}
 		if clashProxy == "" {
@@ -311,7 +609,7 @@ func rebalanceAuthsToNodes(store *stateStore) (map[string]int, error) {
 	if clashProxy != "" {
 		if activeClash == nil {
 			for _, n := range nodes {
-				if n.Source == nodeSourceClash && n.Enabled && !n.DisabledByGuard && n.ClashName != "" {
+				if n.Source == nodeSourceClash && nodeSchedulable(n) && n.ClashName != "" {
 					activeClash = n
 					break
 				}
@@ -344,10 +642,11 @@ func rebalanceAuthsToNodes(store *stateStore) (map[string]int, error) {
 		store.setAssignedCounts(counts)
 		return counts, nil
 	}
-	// eligible nodes: enabled, not guard-quarantined, has proxy
+	// eligible nodes: schedulable (enabled, not guard-quarantined, not
+	// operator-disabled, not in node-window cool-off), has proxy
 	eligible := make([]*nodeRecord, 0)
 	for _, n := range nodes {
-		if n.Enabled && !n.DisabledByGuard && n.ProxyURL != "" {
+		if nodeSchedulable(n) && n.ProxyURL != "" {
 			eligible = append(eligible, n)
 		}
 	}
@@ -513,7 +812,9 @@ func enableAuthsOnNode(node *nodeRecord) error {
 	for _, a := range auths {
 		if a.ProxyURL == node.ProxyURL && a.Disabled {
 			reason, _ := a.Raw["disabled_reason"].(string)
-			if strings.Contains(reason, "egress-guard") || strings.Contains(reason, "降智") {
+			// Only re-enable node-isolation collateral disables.
+			// Never revive account-manual / account-auto bans from node restore.
+			if isNodeIsolationDisabledReason(reason) {
 				_ = setAuthProxyAndFlags(a, a.ProxyURL, false, "")
 			}
 		}
@@ -551,9 +852,7 @@ func listAuthsForNode(node *nodeRecord, limit int) ([]authFile, error) {
 		if strings.TrimSpace(tok) == "" {
 			continue
 		}
-		// Clash quality probes dial TestPort (e.g. :7953) while account sticky proxy
-		// remains production mixed-port (:7890). Match either the probe dial URL or
-		// the configured production Clash proxy so auths still resolve.
+		// Clash-sourced nodes share the production mixed-port; match it directly.
 		onNode := false
 		if node != nil && a.ProxyURL != "" {
 			if node.ProxyURL != "" && a.ProxyURL == node.ProxyURL {
@@ -595,7 +894,6 @@ func listAuthsForNode(node *nodeRecord, limit int) ([]authFile, error) {
 	}
 	return out, nil
 }
-
 
 // deleteManagedNodes removes nodes immediately, then asynchronously clears proxy_url
 // only for proxies exclusively owned by the deleted set. Shared Clash mixed-port
@@ -711,18 +1009,15 @@ func verifiedMigrationTargets(store *stateStore, bad *nodeRecord) []*nodeRecord 
 	if store == nil || bad == nil {
 		return nil
 	}
-	pol := store.policy()
-	freshness := time.Duration(pol.ActiveIntervalSec*2) * time.Second
-	if freshness < time.Hour {
-		freshness = time.Hour
-	}
-	cutoff := float64(time.Now().Add(-freshness).Unix())
+	// No active probes anymore: "recently verified" means a passive healthy
+	// observation on this egress within the last two hours with a known exit IP.
+	cutoff := float64(time.Now().Add(-2 * time.Hour).Unix())
 	targets := make([]*nodeRecord, 0)
 	for _, n := range store.listNodes() {
-		if n.ID == bad.ID || !n.Enabled || n.DisabledByGuard || n.ProxyURL == "" {
+		if n.ID == bad.ID || !nodeSchedulable(n) || n.ProxyURL == "" {
 			continue
 		}
-		if n.LastClassification != "healthy" || n.LastProbeAt <= cutoff || n.ExitIP == "" {
+		if n.LastClassification != "healthy" || n.LastObservedAt <= cutoff || n.ExitIP == "" {
 			continue
 		}
 		if bad.ExitIP != "" && n.ExitIP == bad.ExitIP {
@@ -745,9 +1040,15 @@ func migrateAuthsOffNode(store *stateStore, bad *nodeRecord) error {
 	}
 	affected := make([]authFile, 0)
 	for _, a := range auths {
-		if a.ProxyURL == bad.ProxyURL && (!a.Disabled || isGuardDisabledAuth(a)) {
-			affected = append(affected, a)
+		if a.ProxyURL != bad.ProxyURL {
+			continue
 		}
+		// Migrate enabled accounts and node-isolation collateral disables only.
+		// Never revive account-manual / account-auto bans (or operator disables).
+		if a.Disabled && !isNodeIsolationDisabledReason(authDisableReason(a)) {
+			continue
+		}
+		affected = append(affected, a)
 	}
 	if len(affected) == 0 {
 		return nil

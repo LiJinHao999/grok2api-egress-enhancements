@@ -197,7 +197,7 @@ func TestSyncClashNodesCreatesSharedProxyNodes(t *testing.T) {
 		if n.ClashName == "node-b" {
 			_, _ = store.updateNode(n.ID, func(node *nodeRecord) error {
 				node.LastClassification = "healthy"
-				node.LastProbeAt = 1e12
+				node.LastObservedAt = 1e12
 				node.ExitIP = "198.51.100.2"
 				return nil
 			})
@@ -207,12 +207,6 @@ func TestSyncClashNodesCreatesSharedProxyNodes(t *testing.T) {
 		node.ExitIP = "198.51.100.1"
 		return nil
 	})
-	// Drain any leftover queue before asserting post-switch enqueue.
-	qualitySched.mu.Lock()
-	qualitySched.pending = nil
-	qualitySched.active = nil
-	qualitySched.started = false
-	qualitySched.mu.Unlock()
 
 	if err := switchClashAwayFromNode(store, bad); err != nil {
 		t.Fatal(err)
@@ -220,36 +214,6 @@ func TestSyncClashNodesCreatesSharedProxyNodes(t *testing.T) {
 	if current != "node-b" {
 		t.Fatalf("clash current=%s want node-b", current)
 	}
-
-	// Quarantine switch must immediately queue a post-switch quality probe on the
-	// newly selected leaf so degraded B is not left untested until the 30s tick.
-	var targetB string
-	for _, n := range store.listNodes() {
-		if n.ClashName == "node-b" {
-			targetB = n.ID
-		}
-	}
-	if targetB == "" {
-		t.Fatal("missing node-b id")
-	}
-	qualitySched.mu.Lock()
-	pending := append([]*qualityJob{}, qualitySched.pending...)
-	qualitySched.mu.Unlock()
-	found := false
-	for _, job := range pending {
-		if job != nil && job.nodeID == targetB && job.source == "post-switch" {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatalf("expected post-switch probe for node-b=%s, pending=%#v", targetB, pending)
-	}
-	qualitySched.mu.Lock()
-	qualitySched.pending = nil
-	qualitySched.active = nil
-	qualitySched.started = false
-	qualitySched.mu.Unlock()
 }
 
 func TestClashUIConfigOverridesRuntime(t *testing.T) {
@@ -352,7 +316,7 @@ func TestEnsureHealthyClashExitSwitchesOffQuarantined(t *testing.T) {
 		if n.ClashName == "node-b" {
 			_, _ = store.updateNode(n.ID, func(node *nodeRecord) error {
 				node.LastClassification = "healthy"
-				node.LastProbeAt = 1e12
+				node.LastObservedAt = 1e12
 				node.ExitIP = "198.51.100.2"
 				node.ClashActive = false
 				return nil
@@ -412,7 +376,7 @@ func TestManualQuarantineAndRestore(t *testing.T) {
 	}
 }
 
-func TestSchedulerAutoSwitchesClashWhenActiveQuarantined(t *testing.T) {
+func TestSchedulerHandsBackSelectionWhenActiveQuarantined(t *testing.T) {
 	current := "node-a"
 	mux := http.NewServeMux()
 	mux.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {
@@ -465,7 +429,7 @@ func TestSchedulerAutoSwitchesClashWhenActiveQuarantined(t *testing.T) {
 		if n.ClashName == "node-b" {
 			_, _ = store.updateNode(n.ID, func(node *nodeRecord) error {
 				node.LastClassification = "healthy"
-				node.LastProbeAt = 1e12
+				node.LastObservedAt = 1e12
 				node.ExitIP = "198.51.100.9"
 				node.ClashActive = false
 				return nil
@@ -493,10 +457,10 @@ func TestSchedulerAutoSwitchesClashWhenActiveQuarantined(t *testing.T) {
 	if err := json.Unmarshal(env.Result, &response); err != nil {
 		t.Fatal(err)
 	}
-	if !response.Handled || response.AuthID != "auth-1" {
-		t.Fatalf("expected auth-1 after auto switch, got %+v current=%s", response, current)
+	if response.Handled || response.AuthID != "" {
+		t.Fatalf("expected selection handed back to host (Handled=false), got %+v", response)
 	}
-	if current != "node-b" {
-		t.Fatalf("expected clash switch to node-b, current=%s", current)
+	if current != "node-a" {
+		t.Fatalf("scheduler pick must not force-switch production, current=%s", current)
 	}
 }
