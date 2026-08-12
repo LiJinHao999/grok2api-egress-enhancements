@@ -358,7 +358,7 @@
         <table>
           <thead><tr>
             <th class="check-cell"><input id="select-all" type="checkbox" aria-label="选择所有节点"></th>
-            <th>节点</th><th>状态</th><th>可用性</th><th>出口 IP</th><th class="numeric">输出 Token/s</th><th class="numeric">首字</th><th class="numeric">窗口账号</th><th class="actions-col">操作</th>
+            <th>节点</th><th>状态</th><th>出口 IP</th><th class="numeric">输出 Token/s</th><th class="numeric">首字</th><th class="numeric">窗口账号</th><th>可用性</th><th class="actions-col">操作</th>
           </tr></thead>
           <tbody id="nodes-body"><tr><td colspan="9" class="loading">正在加载节点</td></tr></tbody>
         </table>
@@ -978,12 +978,12 @@
         return '<tr class="' + rowClass + '" data-id="' + esc(node.id) + '">' +
           '<td class="check-cell"><input type="checkbox" data-action="select" ' + (state.selected.has(node.id) ? 'checked' : '') + ' aria-label="选择 ' + esc(node.name) + '"></td>' +
           '<td><div class="node-name" title="' + esc(node.name) + '">' + esc(node.name) + '</div><div class="subtext">ID ' + esc(node.id) + ' · ' + (node.proxyPool ? '代理池' : '固定代理') + (!node.enabled ? ' · 停用' : '') + '</div></td>' +
-          '<td style="width:11rem">' + nodeBadge(node, guard) + '<div class="subtext" title="' + esc(reason) + '">' + esc(reason) + (cd ? ' · ' + cd : '') + '</div></td>' +
-          '<td><div title="真实健康响应累计使用时长（不含空闲选中）">' + (avail.serviceMs ? formatDurationMs(avail.serviceMs) : '-') + '<div class="subtext">正常 ' + number(avail.healthyObs) + ' · 降智观测 ' + number(avail.degradedObs) + '</div></div><div class="subtext" title="降智墙钟时长">' + (avail.quarantineMs ? ('降智 ' + formatDurationMs(avail.quarantineMs)) : '无降智记录') + (avail.totalActive ? (' · 累计使用 ' + formatDurationMs(avail.totalActive)) : '') + '</div></td>' +
+          '<td style="width:9rem">' + nodeBadge(node, guard) + '<div class="subtext" title="' + esc(reason) + '">' + esc(reason) + (cd ? ' · ' + cd : '') + '</div></td>' +
           '<td><div>' + esc(node.exitIp || '-') + '</div><div class="subtext">出口 IP</div></td>' +
           '<td class="numeric ' + tpsClass + '">' + (observed ? Number(guard.last_output_tps || 0).toFixed(1) : '-') + '</td>' +
           '<td class="numeric">' + (guard.last_first_token_ms ? number(guard.last_first_token_ms) + ' ms' : '-') + '</td>' +
           '<td><div>' + winfo.count + ' / ' + winfo.max + '</div><div class="subtext">' + (guard.disabled_by_node_window ? (windowCountdown(guard) || '冷却中') : '窗口账号') + '</div>' + (guard.disabled_by_node_window && guard.node_window_until ? '<div class="subtext">' + time(Number(guard.node_window_until), true) + ' 到期</div>' : '') + '</td>' +
+          '<td><div title="真实健康响应累计使用时长（不含空闲选中）">' + (avail.serviceMs ? formatDurationMs(avail.serviceMs) : '-') + '<div class="subtext">正常 ' + number(avail.healthyObs) + ' · 降智观测 ' + number(avail.degradedObs) + '</div></div><div class="subtext" title="降智墙钟时长">' + (avail.quarantineMs ? ('降智 ' + formatDurationMs(avail.quarantineMs)) : '无降智记录') + (avail.totalActive ? (' · 累计使用 ' + formatDurationMs(avail.totalActive)) : '') + '</div></td>' +
           '<td class="actions-col">' + actionButtons(node) + '</td></tr>';
       }).join('');
       $('node-cards').innerHTML = nodes.map((node) => {
