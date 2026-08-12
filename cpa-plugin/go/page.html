@@ -313,7 +313,7 @@
     <section id="degradation-banner" class="queue-banner" aria-label="降智事件记录">
       <div>
         <strong id="degradation-title">降智事件记录</strong>
-        <p id="degradation-summary">被动观测捕获的降智样本（缺 thinking 与传输故障），保留时间、账号、出口 IP 与指标用于画像分析；最多保留最近 200 条。</p>
+        <p id="degradation-summary">被动观测捕获的降智样本（响应缺少 thinking），保留时间、账号、出口 IP 与指标用于画像分析；最多保留最近 200 条。</p>
         <div class="table-wrap">
           <table class="rotation-table">
             <thead><tr><th>时间</th><th>节点</th><th>账号</th><th>出口 IP</th><th>分类</th><th>原因</th><th class="numeric">Token</th><th class="numeric">首字</th></tr></thead>
@@ -749,14 +749,11 @@
       const rows = Array.isArray(state.status?.degradations) ? state.status.degradations.slice().reverse() : [];
       if (!rows.length) { list.innerHTML = '<tr><td colspan="8" class="empty">暂无降智事件</td></tr>'; return; }
       list.innerHTML = rows.map((d) => {
-        const badge = d.class === 'hard'
-          ? '<span class="badge bad">降智</span>'
-          : '<span class="badge warn">传输故障</span>';
         return '<tr><td>' + time(d.ts, true) + '</td>' +
           '<td>' + esc(d.node_name || d.node_id || '-') + '</td>' +
           '<td>' + esc(d.auth_id || '-') + '</td>' +
           '<td>' + esc(d.exit_ip || '-') + '</td>' +
-          '<td>' + badge + '</td>' +
+          '<td><span class="badge bad">降智</span></td>' +
           '<td>' + esc(d.reason || '-') + '</td>' +
           '<td class="numeric">' + (d.output_tokens ? number(d.output_tokens) : '-') + '</td>' +
           '<td class="numeric">' + (d.first_token_ms ? number(d.first_token_ms) + ' ms' : '-') + '</td></tr>';

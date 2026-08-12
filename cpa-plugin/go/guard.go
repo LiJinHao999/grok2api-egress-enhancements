@@ -706,16 +706,12 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 		store.bumpStat(source, res.Classification, res.OutputTokens)
 		return
 	}
-	// Persist degrade samples for profiling: missing-thinking hard hits and
-	// transport errors both degrade the exit. Account/request errors are not
-	// egress quality samples.
-	if updated.LastClassification == "hard" || (updated.LastClassification == "error" && res.ErrorKind == "transport_error") {
+	// Persist degrade samples for profiling: missing-thinking hard hits only.
+	// Transport errors still isolate the exit but are not account-降智 samples.
+	if updated.LastClassification == "hard" {
 		reason := res.Error
-		switch {
-		case updated.LastClassification == "hard" && reason == "":
+		if reason == "" {
 			reason = missingThinkingReason
-		case updated.LastClassification == "error" && reason == "":
-			reason = "传输故障 " + res.ErrorKind
 		}
 		store.recordDegradation(degradationRecord{
 			TS:           now,
@@ -723,7 +719,7 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 			NodeName:     updated.Name,
 			AuthID:       res.AuthID,
 			ExitIP:       updated.ExitIP,
-			Class:        updated.LastClassification,
+			Class:        "hard",
 			Reason:       reason,
 			ErrorKind:    res.ErrorKind,
 			OutputTokens: res.OutputTokens,
