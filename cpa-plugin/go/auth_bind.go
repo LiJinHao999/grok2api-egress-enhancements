@@ -326,10 +326,10 @@ func rebalanceAuthsToNodes(store *stateStore) (map[string]int, error) {
 		return nil, err
 	}
 	nodes := store.listNodes()
-	// eligible nodes: enabled, not guard-quarantined, has proxy
+	// eligible nodes: enabled, not guard-quarantined or window-cooled, has proxy
 	eligible := make([]*nodeRecord, 0)
 	for _, n := range nodes {
-		if n.Enabled && !n.DisabledByGuard && n.ProxyURL != "" {
+		if nodeSchedulable(n) && n.ProxyURL != "" {
 			eligible = append(eligible, n)
 		}
 	}

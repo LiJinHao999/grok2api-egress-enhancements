@@ -4,26 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
-
-func schedulerCandidateAvailable(candidate pluginapi.SchedulerAuthCandidate) bool {
-	status := strings.ToLower(strings.TrimSpace(candidate.Status))
-	// Empty status is retained for older CPA hosts. Any explicit lifecycle or
-	// cooldown state other than active/ready must stay with CPA's retry logic.
-	switch status {
-	case "", "active", "ready":
-		return true
-	case "disabled", "unavailable", "error", "cooling", "cooldown", "pending", "refreshing", "retrying":
-		return false
-	default:
-		// Unknown explicit states are fail-closed; selecting them can bypass CPA's
-		// own cooldown scheduler.
-		return false
-	}
-}
 
 // handleSchedulerPick hands auth selection entirely back to the host.
 //

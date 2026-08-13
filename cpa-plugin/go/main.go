@@ -460,7 +460,7 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 			}
 			p.ConsecutiveMissingThinking = intPick(raw, p.ConsecutiveMissingThinking, "consecutive_missing_thinking", "consecutiveMissingThinking")
 			p.NodeWindowMaxAuths = intPick(raw, p.NodeWindowMaxAuths, "node_window_max_auths", "nodeWindowMaxAuths")
-			p.NodeWindowHours = floatPick(raw, p.NodeWindowHours, "node_window_hours", "nodeWindowHours")
+			p.NodeWindowHours = pickNodeWindowHours(raw, p.NodeWindowHours)
 			if v, ok := raw["thinking_cross_verify"].(bool); ok {
 				p.ThinkingCrossVerify = v
 			}
@@ -750,20 +750,23 @@ func buildStatus() map[string]any {
 	nodeMap := map[string]any{}
 	for _, n := range nodes {
 		nodeMap[n.ID] = map[string]any{
-			"disabled_by_guard":   n.DisabledByGuard,
-			"quarantined_until":   n.QuarantinedUntil,
-			"error_strikes":       n.ErrorStrikes,
-			"soft_strikes":        n.SoftStrikes,
-			"thinking_strikes":    n.ThinkingStrikes,
-			"last_classification": n.LastClassification,
-			"last_output_tps":     n.LastOutputTPS,
-			"last_first_token_ms": n.LastFirstTokenMs,
-			"last_duration_ms":    n.LastDurationMs,
-			"last_output_tokens":  n.LastOutputTokens,
-			"last_reason":         n.LastReason,
-			"last_source":         n.LastSource,
-			"last_observed_at":    n.LastObservedAt,
-			"last_probe_at":       n.LastProbeAt,
+			"disabled_by_guard":       n.DisabledByGuard,
+			"quarantined_until":       n.QuarantinedUntil,
+			"disabled_by_node_window": n.DisabledByNodeWindow,
+			"node_window_until":       n.NodeWindowUntil,
+			"node_window_reason":      n.NodeWindowReason,
+			"error_strikes":           n.ErrorStrikes,
+			"soft_strikes":            n.SoftStrikes,
+			"thinking_strikes":        n.ThinkingStrikes,
+			"last_classification":     n.LastClassification,
+			"last_output_tps":         n.LastOutputTPS,
+			"last_first_token_ms":     n.LastFirstTokenMs,
+			"last_duration_ms":        n.LastDurationMs,
+			"last_output_tokens":      n.LastOutputTokens,
+			"last_reason":             n.LastReason,
+			"last_source":             n.LastSource,
+			"last_observed_at":        n.LastObservedAt,
+			"last_probe_at":           n.LastProbeAt,
 		}
 	}
 	pol := store.policy()
@@ -876,6 +879,19 @@ func floatPick(raw map[string]any, def float64, keys ...string) float64 {
 		}
 	}
 	return def
+}
+
+// pickNodeWindowHours accepts the canonical hour field or the panel's minute
+// alias. Minutes win when both are present so a PATCH of 120 as minutes is
+// not stored as 120 hours.
+func pickNodeWindowHours(raw map[string]any, current float64) float64 {
+	if _, ok := raw["node_window_minutes"]; ok {
+		return floatPick(raw, current*60, "node_window_minutes") / 60
+	}
+	if _, ok := raw["nodeWindowMinutes"]; ok {
+		return floatPick(raw, current*60, "nodeWindowMinutes") / 60
+	}
+	return floatPick(raw, current, "node_window_hours", "nodeWindowHours")
 }
 
 func firstString(payload map[string]any, keys ...string) string {

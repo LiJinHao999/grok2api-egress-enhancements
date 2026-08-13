@@ -188,7 +188,7 @@ func defaultPolicy() policyConfig {
 		MaxOutputTokensProbe:       384,
 		NodeWindowMaxAuths:         4,
 		NodeWindowHours:            2.0,
-		PolicySchema:               5,
+		PolicySchema:               6,
 	}
 }
 
@@ -277,6 +277,7 @@ func normalizePolicy(p *policyConfig, rawPolicy map[string]any) {
 	// schema < 3: soft cross-verify product default (now off)
 	// schema < 4: node-window guard introduced
 	// schema < 5: quarantine retest default 120s -> 1h (minimize active probes)
+	// schema < 6: thinking cross-verify product default off (1.0.8 leftovers)
 	if p.PolicySchema < 2 {
 		if !has("consecutive_missing_thinking", "consecutiveMissingThinking") {
 			p.ConsecutiveMissingThinking = def.ConsecutiveMissingThinking
@@ -292,18 +293,26 @@ func normalizePolicy(p *policyConfig, rawPolicy map[string]any) {
 	} else if p.PolicySchema < 4 {
 		// 2 -> 3: soft cross-verify product default flipped to off.
 		// 3 -> 4: node-window fields are filled above; just advance schema.
+		// Live 1.0.8 files are schema 3 with thinking_cross_verify still true.
+		p.ThinkingCrossVerify = def.ThinkingCrossVerify
 		p.SoftCrossVerify = def.SoftCrossVerify
 		if p.QuarantineSec == 120 {
 			p.QuarantineSec = def.QuarantineSec
 		}
 		p.PolicySchema = def.PolicySchema
-	} else if p.PolicySchema < def.PolicySchema {
+	} else if p.PolicySchema < 5 {
 		// 4 -> 5: isolation retest interval product default 120s -> 3600s.
 		// Only rewrite the previous product default so an operator-chosen
 		// quarantine_seconds (e.g. 300 / 7200) is left alone.
 		if p.QuarantineSec == 120 {
 			p.QuarantineSec = def.QuarantineSec
 		}
+		p.ThinkingCrossVerify = def.ThinkingCrossVerify
+		p.PolicySchema = def.PolicySchema
+	} else if p.PolicySchema < def.PolicySchema {
+		// 5 -> 6: force thinking cross-verify off for files that already
+		// absorbed the quarantine migration but kept the 1.0.8 leftover.
+		p.ThinkingCrossVerify = def.ThinkingCrossVerify
 		p.PolicySchema = def.PolicySchema
 	} else {
 		if !has("thinking_cross_verify", "thinkingCrossVerify") {
@@ -932,7 +941,7 @@ func (s *stateStore) recordNodeAuthUsage(nodeID, authID string) bool {
 		// Already cooling off: keep the window fresh for the restore-time reset,
 		// but never extend the expiry from stragglers.
 		n.NodeWindowAuths[authID] = now
-		_ = s.persistLocked()
+		s.scheduleFlushLocked()
 		return false
 	}
 	for k, last := range n.NodeWindowAuths {
@@ -942,13 +951,13 @@ func (s *stateStore) recordNodeAuthUsage(nodeID, authID string) bool {
 	}
 	n.NodeWindowAuths[authID] = now
 	if len(n.NodeWindowAuths) < limit {
-		_ = s.persistLocked()
+		s.scheduleFlushLocked()
 		return false
 	}
 	n.DisabledByNodeWindow = true
 	n.NodeWindowUntil = now + hours*3600
 	n.NodeWindowReason = fmt.Sprintf("窗口累计 %d 个不同账号使用该出口（阈值 %d）", len(n.NodeWindowAuths), limit)
-	_ = s.persistLocked()
+	_ = s.flushNowLocked()
 	return true
 }
 

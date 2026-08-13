@@ -197,8 +197,8 @@ func TestDefaultPolicyDefaults(t *testing.T) {
 	if pol.QuarantineSec != 3600 {
 		t.Fatalf("default quarantine seconds=%d, want 3600", pol.QuarantineSec)
 	}
-	if pol.PolicySchema != 5 {
-		t.Fatalf("default policy schema=%d, want 5", pol.PolicySchema)
+	if pol.PolicySchema != 6 {
+		t.Fatalf("default policy schema=%d, want 6", pol.PolicySchema)
 	}
 	if got := classifyQuality(100, 64, false, pol); got != "hard" {
 		t.Fatalf("missing thinking with guard=%q, want hard", got)
@@ -230,8 +230,8 @@ func TestNormalizePolicyFillsAbsentBoolDefaults(t *testing.T) {
 	if p.ConsecutiveMissingThinking != 1 {
 		t.Fatalf("consecutive_missing_thinking=%d, want 1", p.ConsecutiveMissingThinking)
 	}
-	if p.PolicySchema != 5 {
-		t.Fatalf("policy_schema=%d, want 5", p.PolicySchema)
+	if p.PolicySchema != 6 {
+		t.Fatalf("policy_schema=%d, want 6", p.PolicySchema)
 	}
 	if p.QuarantineSec != 3600 {
 		t.Fatalf("migrated quarantine_seconds=%d, want 3600", p.QuarantineSec)
@@ -252,8 +252,8 @@ func TestNormalizePolicyFillsAbsentBoolDefaults(t *testing.T) {
 	if pMid.SoftCrossVerify {
 		t.Fatal("schema migration must turn soft_cross_verify off")
 	}
-	if pMid.PolicySchema != 5 {
-		t.Fatalf("migrated policy_schema=%d, want 5", pMid.PolicySchema)
+	if pMid.PolicySchema != 6 {
+		t.Fatalf("migrated policy_schema=%d, want 6", pMid.PolicySchema)
 	}
 
 	// After redesign (schema 2), explicit false must stick.
@@ -269,6 +269,41 @@ func TestNormalizePolicyFillsAbsentBoolDefaults(t *testing.T) {
 	})
 	if p2.ThinkingCrossVerify {
 		t.Fatal("explicit false after schema 2 must stay false")
+	}
+
+	// Live 1.0.8 leftover: schema 3 with thinking_cross_verify still true.
+	pLive := policyConfig{HardTPS: 1000, SoftTPS: 500, ThinkingGuard: true, ThinkingCrossVerify: true, SoftCrossVerify: false, ConsecutiveMissingThinking: 1, PolicySchema: 3}
+	normalizePolicy(&pLive, map[string]any{
+		"hard_tps":              1000,
+		"soft_tps":              500,
+		"thinking_guard":        true,
+		"thinking_cross_verify": true,
+		"soft_cross_verify":     false,
+		"policy_schema":         3,
+	})
+	if pLive.ThinkingCrossVerify {
+		t.Fatal("schema 3 leftover thinking_cross_verify=true must migrate off")
+	}
+	if pLive.PolicySchema != 6 {
+		t.Fatalf("live leftover policy_schema=%d, want 6", pLive.PolicySchema)
+	}
+
+	// Schema 5 leftover that already absorbed quarantine migration.
+	p5 := policyConfig{HardTPS: 1000, SoftTPS: 500, ThinkingGuard: true, ThinkingCrossVerify: true, SoftCrossVerify: false, QuarantineSec: 3600, PolicySchema: 5}
+	normalizePolicy(&p5, map[string]any{
+		"hard_tps":              1000,
+		"soft_tps":              500,
+		"thinking_guard":        true,
+		"thinking_cross_verify": true,
+		"soft_cross_verify":     false,
+		"quarantine_seconds":    3600,
+		"policy_schema":         5,
+	})
+	if p5.ThinkingCrossVerify {
+		t.Fatal("schema 5 leftover thinking_cross_verify=true must migrate off")
+	}
+	if p5.PolicySchema != 6 {
+		t.Fatalf("schema5 leftover policy_schema=%d, want 6", p5.PolicySchema)
 	}
 
 	// Explicit thinking_guard=false stays false and forces cross-verify off.
@@ -487,19 +522,6 @@ func TestRecordAuthDegradeStats(t *testing.T) {
 func TestManualDisabledAuthIsNotRestored(t *testing.T) {
 	if isGuardDisabledAuth(authFile{Disabled: true, Raw: map[string]any{"disabled_reason": "operator: maintenance"}}) {
 		t.Fatal("operator-disabled auth must not be treated as guard-managed")
-	}
-}
-
-func TestSchedulerSkipsCoolingStatuses(t *testing.T) {
-	for _, status := range []string{"disabled", "unavailable", "error", "cooling", "pending", "refreshing", "future-state"} {
-		if schedulerCandidateAvailable(pluginapi.SchedulerAuthCandidate{Status: status}) {
-			t.Fatalf("status %q should not be selected", status)
-		}
-	}
-	for _, status := range []string{"", "active", "ready"} {
-		if !schedulerCandidateAvailable(pluginapi.SchedulerAuthCandidate{Status: status}) {
-			t.Fatalf("status %q should be selectable", status)
-		}
 	}
 }
 
@@ -1075,6 +1097,54 @@ func TestRecordNodeAuthUsageTriggersWindowDisable(t *testing.T) {
 	}
 }
 
+func TestRecordNodeAuthUsageDebouncesUntilTrigger(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	s := newStateStore(path)
+	s.flushDelay = time.Hour
+	n, err := s.createNode("n1", "socks5h://127.0.0.1:1080", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pol := s.policy()
+	pol.NodeWindowMaxAuths = 3
+	if err := s.updatePolicy(pol); err != nil {
+		t.Fatal(err)
+	}
+	if s.recordNodeAuthUsage(n.ID, "auth-1") || s.recordNodeAuthUsage(n.ID, "auth-2") {
+		t.Fatal("must not trigger below the window limit")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st guardState
+	if err := json.Unmarshal(raw, &st); err != nil {
+		t.Fatal(err)
+	}
+	got := st.Nodes[n.ID]
+	if got == nil {
+		t.Fatal("node missing from persisted state")
+	}
+	if len(got.NodeWindowAuths) != 0 || got.DisabledByNodeWindow {
+		t.Fatalf("sub-threshold usage must debounce persist: %+v", got)
+	}
+	if !s.recordNodeAuthUsage(n.ID, "auth-3") {
+		t.Fatal("expected window disable trigger")
+	}
+	raw, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw, &st); err != nil {
+		t.Fatal(err)
+	}
+	got = st.Nodes[n.ID]
+	if got == nil || !got.DisabledByNodeWindow {
+		t.Fatalf("window flip must flush immediately: %+v", got)
+	}
+}
+
 func TestRecordNodeAuthUsageRollingExpiry(t *testing.T) {
 	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
 	n, err := s.createNode("n1", "socks5h://127.0.0.1:1080", true, false, 0)
@@ -1181,8 +1251,8 @@ func TestNormalizePolicyMigratesQuarantineDefault(t *testing.T) {
 	if p.QuarantineSec != 3600 {
 		t.Fatalf("schema4 default 120s must migrate to 3600, got %d", p.QuarantineSec)
 	}
-	if p.PolicySchema != 5 {
-		t.Fatalf("policy_schema=%d, want 5", p.PolicySchema)
+	if p.PolicySchema != 6 {
+		t.Fatalf("policy_schema=%d, want 6", p.PolicySchema)
 	}
 
 	// Operator-chosen interval must survive the schema bump.
@@ -1196,8 +1266,8 @@ func TestNormalizePolicyMigratesQuarantineDefault(t *testing.T) {
 	if p2.QuarantineSec != 300 {
 		t.Fatalf("custom quarantine_seconds must stay 300, got %d", p2.QuarantineSec)
 	}
-	if p2.PolicySchema != 5 {
-		t.Fatalf("policy_schema=%d, want 5", p2.PolicySchema)
+	if p2.PolicySchema != 6 {
+		t.Fatalf("policy_schema=%d, want 6", p2.PolicySchema)
 	}
 }
 
@@ -1275,5 +1345,239 @@ func TestWindowIsolationDoesNotAffectDegradeQuarantine(t *testing.T) {
 	}
 	if got.DisabledByNodeWindow {
 		t.Fatal("healthy probe must not re-enable window cool-off")
+	}
+}
+
+func withMockAuths(t *testing.T, auths map[string]map[string]any) {
+	t.Helper()
+	originalHostCall := hostCall
+	hostCall = func(method string, payload []byte) (json.RawMessage, error) {
+		switch method {
+		case pluginabi.MethodHostAuthList:
+			entries := make([]pluginapi.HostAuthFileEntry, 0, len(auths))
+			for name, raw := range auths {
+				disabled, _ := raw["disabled"].(bool)
+				entries = append(entries, pluginapi.HostAuthFileEntry{ID: name, AuthIndex: name, Name: name, Provider: "xai", Type: "xai", Disabled: disabled})
+			}
+			return json.Marshal(hostAuthListResponse{Files: entries})
+		case pluginabi.MethodHostAuthGet:
+			var request map[string]string
+			_ = json.Unmarshal(payload, &request)
+			name := request["auth_index"]
+			if name == "" {
+				name = request["name"]
+			}
+			raw, ok := auths[name]
+			if !ok {
+				return nil, fmt.Errorf("auth not found: %s", name)
+			}
+			body, _ := json.Marshal(raw)
+			return json.Marshal(hostAuthGetResponse{AuthIndex: name, Name: name, Path: "/auths/" + name, JSON: body})
+		case pluginabi.MethodHostAuthSave:
+			var request struct {
+				Name string          `json:"name"`
+				JSON json.RawMessage `json:"json"`
+			}
+			if err := json.Unmarshal(payload, &request); err != nil {
+				return nil, err
+			}
+			updated := map[string]any{}
+			if err := json.Unmarshal(request.JSON, &updated); err != nil {
+				return nil, err
+			}
+			auths[request.Name] = updated
+			return json.Marshal(pluginapi.HostAuthSaveResponse{Name: request.Name, Path: "/auths/" + request.Name})
+		default:
+			return nil, fmt.Errorf("unexpected host callback %s", method)
+		}
+	}
+	t.Cleanup(func() {
+		hostCall = originalHostCall
+		authProxyMu.Lock()
+		authProxyCache = nil
+		authProxyAt = time.Time{}
+		authProxyMu.Unlock()
+		invalidateAuthListCache()
+	})
+}
+
+func TestBuildStatusIncludesNodeWindowFields(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	n, err := store.createNode("n1", "http://127.0.0.1:7951", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	until := float64(time.Now().Add(2 * time.Hour).Unix())
+	if _, err := store.updateNode(n.ID, func(node *nodeRecord) error {
+		node.DisabledByNodeWindow = true
+		node.NodeWindowUntil = until
+		node.NodeWindowReason = "窗口累计 4 个不同账号使用该出口（阈值 4）"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	status := buildStatus()
+	nodes, _ := status["nodes"].(map[string]any)
+	got, _ := nodes[n.ID].(map[string]any)
+	if got == nil {
+		t.Fatalf("status.nodes[%s] missing: %#v", n.ID, status["nodes"])
+	}
+	if disabled, _ := got["disabled_by_node_window"].(bool); !disabled {
+		t.Fatalf("disabled_by_node_window=%v, want true", got["disabled_by_node_window"])
+	}
+	if got["node_window_until"] != until {
+		t.Fatalf("node_window_until=%v, want %v", got["node_window_until"], until)
+	}
+	if got["node_window_reason"] == "" {
+		t.Fatal("node_window_reason missing")
+	}
+}
+
+func TestWindowMigrationFailureReenablesAuths(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	n, err := store.createNode("only", "http://127.0.0.1:7951", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.updateNode(n.ID, func(node *nodeRecord) error {
+		node.DisabledByNodeWindow = true
+		node.NodeWindowUntil = float64(time.Now().Add(2 * time.Hour).Unix())
+		node.NodeWindowReason = "窗口累计 4 个不同账号"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	auths := map[string]map[string]any{
+		"stuck.json": {
+			"type": "xai", "email": "stuck@example.test", "access_token": "tok", "proxy_url": n.ProxyURL, "disabled": false,
+		},
+	}
+	withMockAuths(t, auths)
+	fresh, _ := store.getNode(n.ID)
+	disableNodeForWindow(store, fresh.ID, fresh.NodeWindowReason)
+	if disabled, _ := auths["stuck.json"]["disabled"].(bool); disabled {
+		t.Fatal("migrate-fail must roll back the fail-closed disable")
+	}
+	if got := auths["stuck.json"]["proxy_url"]; got != n.ProxyURL {
+		t.Fatalf("auth proxy=%q, want original %q", got, n.ProxyURL)
+	}
+}
+
+func TestWindowRestoreReenablesStrandedAuths(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	n, err := store.createNode("cooled", "http://127.0.0.1:7951", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.updateNode(n.ID, func(node *nodeRecord) error {
+		node.DisabledByNodeWindow = true
+		node.NodeWindowUntil = float64(time.Now().Add(-time.Minute).Unix())
+		node.NodeWindowReason = "窗口累计 4 个不同账号"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	auths := map[string]map[string]any{
+		"stranded.json": {
+			"type": "xai", "email": "stranded@example.test", "access_token": "tok",
+			"proxy_url": n.ProxyURL, "disabled": true, "disabled_reason": "egress-guard 隔离中",
+		},
+		"manual.json": {
+			"type": "xai", "email": "manual@example.test", "access_token": "tok2",
+			"proxy_url": n.ProxyURL, "disabled": true, "disabled_reason": "operator maintenance",
+		},
+	}
+	withMockAuths(t, auths)
+	fresh, _ := store.getNode(n.ID)
+	restoreNodeWindow(store, fresh)
+	got, _ := store.getNode(n.ID)
+	if got.DisabledByNodeWindow || got.NodeWindowUntil != 0 {
+		t.Fatalf("window not cleared: %+v", got)
+	}
+	if disabled, _ := auths["stranded.json"]["disabled"].(bool); disabled {
+		t.Fatal("guard-disabled leftover must be re-enabled on window restore")
+	}
+	if disabled, _ := auths["manual.json"]["disabled"].(bool); !disabled {
+		t.Fatal("operator-disabled auth must stay disabled")
+	}
+}
+
+func TestRebalanceSkipsWindowCooledNodes(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	cooled, err := store.createNode("cooled", "http://127.0.0.1:7951", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	good, err := store.createNode("good", "http://127.0.0.1:7952", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.updateNode(cooled.ID, func(node *nodeRecord) error {
+		node.DisabledByNodeWindow = true
+		node.NodeWindowUntil = float64(time.Now().Add(2 * time.Hour).Unix())
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	auths := map[string]map[string]any{
+		"a.json": {"type": "xai", "email": "a@example.test", "access_token": "a", "proxy_url": cooled.ProxyURL, "disabled": false},
+		"b.json": {"type": "xai", "email": "b@example.test", "access_token": "b", "proxy_url": good.ProxyURL, "disabled": false},
+	}
+	withMockAuths(t, auths)
+	counts, err := rebalanceAuthsToNodes(store)
+	if err != nil {
+		t.Fatalf("rebalanceAuthsToNodes() error = %v", err)
+	}
+	if counts[cooled.ID] != 0 {
+		t.Fatalf("cooled node received %d auths, want 0", counts[cooled.ID])
+	}
+	if counts[good.ID] != 2 {
+		t.Fatalf("good node received %d auths, want 2", counts[good.ID])
+	}
+	if got := auths["a.json"]["proxy_url"]; got != good.ProxyURL {
+		t.Fatalf("auth a proxy=%q, want good node", got)
+	}
+}
+
+func TestBusiestEnabledNodeSkipsWindowCooled(t *testing.T) {
+	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	cooled, err := s.createNode("cooled", "http://127.0.0.1:7951", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	good, err := s.createNode("good", "http://127.0.0.1:7952", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.updateNode(cooled.ID, func(node *nodeRecord) error {
+		node.DisabledByNodeWindow = true
+		node.AssignedAccountCount = 10
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.updateNode(good.ID, func(node *nodeRecord) error {
+		node.AssignedAccountCount = 1
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := busiestEnabledNode(s); got != good.ID {
+		t.Fatalf("busiestEnabledNode=%q, want %q", got, good.ID)
+	}
+}
+
+func TestPickNodeWindowHoursAcceptsMinutes(t *testing.T) {
+	if got := pickNodeWindowHours(map[string]any{"node_window_minutes": 120.0}, 2); got != 2 {
+		t.Fatalf("minutes 120 -> hours %v, want 2", got)
+	}
+	if got := pickNodeWindowHours(map[string]any{"nodeWindowMinutes": 90.0}, 2); got != 1.5 {
+		t.Fatalf("camel minutes 90 -> hours %v, want 1.5", got)
+	}
+	if got := pickNodeWindowHours(map[string]any{"node_window_hours": 5.0}, 2); got != 5 {
+		t.Fatalf("canonical hours 5 -> %v, want 5", got)
+	}
+	if got := pickNodeWindowHours(map[string]any{"node_window_minutes": 120.0, "node_window_hours": 5.0}, 2); got != 2 {
+		t.Fatalf("minutes must win when both present, got %v", got)
 	}
 }

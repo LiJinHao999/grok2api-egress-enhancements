@@ -1103,6 +1103,32 @@ func disableNodeForWindow(store *stateStore, nodeID, reason string) {
 	})
 	if err := migrateAuthsOffNode(store, n); err != nil {
 		store.appendEvent(guardEvent{Event: "accounts_migration_failed", NodeID: n.ID, NodeName: n.Name, Reason: err.Error()})
+		// No healthy target: undo the fail-closed disable so these accounts
+		// are not stranded on the cooled node until a human re-enables them.
+		if err2 := enableAuthsOnNode(n); err2 != nil {
+			store.appendEvent(guardEvent{Event: "accounts_restore_failed", NodeID: n.ID, NodeName: n.Name, Reason: err2.Error()})
+		}
+	}
+}
+
+// restoreNodeWindow clears the account-window cool-off and re-enables any
+// accounts still bound here that the guard itself disabled (migrate-fail
+// leftovers from 1.0.9, or a race that left them parked).
+func restoreNodeWindow(store *stateStore, n *nodeRecord) {
+	if store == nil || n == nil {
+		return
+	}
+	if !store.clearNodeWindow(n.ID) {
+		return
+	}
+	store.appendEvent(guardEvent{
+		Event:    "node_window_restored",
+		NodeID:   n.ID,
+		NodeName: n.Name,
+		Reason:   "账号窗口冷却到期，自动恢复",
+	})
+	if err := enableAuthsOnNode(n); err != nil {
+		store.appendEvent(guardEvent{Event: "accounts_restore_failed", NodeID: n.ID, NodeName: n.Name, Reason: err.Error()})
 	}
 }
 
@@ -1388,7 +1414,7 @@ func busiestEnabledNode(store *stateStore) string {
 	bestID := ""
 	bestN := -1
 	for _, n := range store.listNodes() {
-		if !n.Enabled || n.DisabledByGuard || n.ProxyURL == "" {
+		if !nodeSchedulable(n) || n.ProxyURL == "" {
 			continue
 		}
 		if n.AssignedAccountCount > bestN {
@@ -1429,14 +1455,7 @@ func startGuardWorker(ctx context.Context, store *stateStore) {
 					// Account-window cool-off expiry: time-based restore, never
 					// probe-based, so a marked exit needs no traffic to come back.
 					if n.DisabledByNodeWindow && n.NodeWindowUntil > 0 && now >= n.NodeWindowUntil {
-						if store.clearNodeWindow(n.ID) {
-							store.appendEvent(guardEvent{
-								Event:    "node_window_restored",
-								NodeID:   n.ID,
-								NodeName: n.Name,
-								Reason:   "账号窗口冷却到期，自动恢复",
-							})
-						}
+						restoreNodeWindow(store, n)
 						continue
 					}
 					if n.DisabledByGuard && n.QuarantinedUntil > 0 && now >= n.QuarantinedUntil {
