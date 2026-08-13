@@ -77,7 +77,7 @@ import (
 
 const (
 	pluginName          = "grok2api-egress"
-	pluginVersion       = "1.0.8"
+	pluginVersion       = "1.0.9"
 	resourcePath        = "/status"
 	managementAPIPath   = "/v0/management/grok2api-egress/api"
 	resourceContentType = "text/html; charset=utf-8"
@@ -459,6 +459,8 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 				p.ThinkingGuard = v
 			}
 			p.ConsecutiveMissingThinking = intPick(raw, p.ConsecutiveMissingThinking, "consecutive_missing_thinking", "consecutiveMissingThinking")
+			p.NodeWindowMaxAuths = intPick(raw, p.NodeWindowMaxAuths, "node_window_max_auths", "nodeWindowMaxAuths")
+			p.NodeWindowHours = floatPick(raw, p.NodeWindowHours, "node_window_hours", "nodeWindowHours")
 			if v, ok := raw["thinking_cross_verify"].(bool); ok {
 				p.ThinkingCrossVerify = v
 			}
@@ -733,7 +735,6 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 	return managementJSON(http.StatusNotFound, errMsg("notFound", "not found"))
 }
 
-
 func renderPageHTML() string {
 	out := pageTemplate
 	out = strings.Replace(out, "/*__HALLMARK_TOKENS__*/", tokenCSS, 1)
@@ -753,7 +754,7 @@ func buildStatus() map[string]any {
 			"quarantined_until":   n.QuarantinedUntil,
 			"error_strikes":       n.ErrorStrikes,
 			"soft_strikes":        n.SoftStrikes,
-				"thinking_strikes":    n.ThinkingStrikes,
+			"thinking_strikes":    n.ThinkingStrikes,
 			"last_classification": n.LastClassification,
 			"last_output_tps":     n.LastOutputTPS,
 			"last_first_token_ms": n.LastFirstTokenMs,

@@ -1,6 +1,6 @@
 # CPA 出口守护 AI 部署与运维指南
 
-本文用于让 AI 工具或运维人员从零部署、配置和维护 `grok2api-egress` v1.0.8。插件是纯 CPA 原生实现，只读写 CLIProxyAPI（下称 CPA）的 xAI auth 文件和 Usage 事件，不依赖 Grok2API 运行时。
+本文用于让 AI 工具或运维人员从零部署、配置和维护 `grok2api-egress` v1.0.9。插件是纯 CPA 原生实现，只读写 CLIProxyAPI（下称 CPA）的 xAI auth 文件和 Usage 事件，不依赖 Grok2API 运行时。
 
 如果部署包含 Mihomo、家宽 sticky 会话或 Resin 动态池，请先阅读[推荐出口部署方式](../docs/RECOMMENDED_DEPLOYMENT.md)，再回到本文执行 CPA 节点添加、账号重平衡和 Guard 策略配置。本文的“方案 A/B”是单节点接入细节，不替代上游分片与故障域规划。
 
@@ -340,7 +340,7 @@ python3 cpa-plugin/import_from_g2a.py \
 mode: hybrid
 active_interval_seconds: 1800
 passive_poll_seconds: 5
-quarantine_seconds: 120
+quarantine_seconds: 3600
 soft_tps: 500
 hard_tps: 1000
 consecutive_soft: 2
@@ -360,7 +360,7 @@ max_output_tokens: 384
 | `mode` | `passive`、`active`、`hybrid` | 生产推荐 `hybrid` |
 | `active_interval_seconds` | 健康节点主动质量探测间隔 | 默认 1800 秒，流量敏感可加长 |
 | `passive_poll_seconds` | 策略保留字段 | 当前 Usage 由 CPA 事件直接推送，不要把它理解成请求日志扫描间隔 |
-| `quarantine_seconds` | 隔离后等待自动复测的时间 | 已能强制换 IP 时 120 秒可作为起点 |
+| `quarantine_seconds` | 隔离后等待自动复测的时间 | 默认 3600 秒（1 小时），尽量减少主动复测；已能强制换 IP 时可再缩短 |
 | `soft_tps` | 可疑速度阈值 | 连续命中才隔离，先按实测分布调 |
 | `hard_tps` | 硬阈值 | 命中立即隔离；误报代价高时适当上调 |
 | `consecutive_soft` | soft 连续次数 | 默认 2，降低误杀 |
@@ -378,7 +378,7 @@ max_output_tokens: 384
 - `active`：只跑定时检测，不处理被动 Usage；
 - `hybrid`：普通请求实时发现异常，30 分钟主动兜底，推荐使用。
 
-默认后台 worker 每 30 秒扫描一次，所以“隔离 120 秒”表示到期后的下一个扫描周期触发复测，不保证精确到秒。
+默认后台 worker 每 30 秒扫描一次，所以“隔离 3600 秒”表示到期后的下一个扫描周期触发复测，不保证精确到秒。
 
 ## 7. 隔离、迁号和恢复状态机
 
@@ -620,7 +620,7 @@ auth 到代理的映射仍有短缓存，后台隔离复测最多受 worker 扫�
 ## 12. 给 AI 工具的推荐任务提示词
 
 ```text
-你正在部署 grok2api-egress-enhancements/cpa-plugin v1.0.8。
+你正在部署 grok2api-egress-enhancements/cpa-plugin v1.0.9。
 
 先阅读：
 1. cpa-plugin/README.md

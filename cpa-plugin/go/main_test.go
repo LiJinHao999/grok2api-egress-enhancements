@@ -174,20 +174,31 @@ func TestProbeUnstableErrDetection(t *testing.T) {
 	}
 }
 
-
-func TestDefaultPolicyThinkingFeaturesOn(t *testing.T) {
+func TestDefaultPolicyDefaults(t *testing.T) {
 	pol := defaultPolicy()
 	if !pol.ThinkingGuard {
 		t.Fatal("default ThinkingGuard should be on")
 	}
-	if !pol.ThinkingCrossVerify {
-		t.Fatal("default ThinkingCrossVerify should be on")
+	if pol.ThinkingCrossVerify {
+		t.Fatal("default ThinkingCrossVerify should be off to minimize active probes")
 	}
-	if !pol.SoftCrossVerify {
-		t.Fatal("default SoftCrossVerify should be on")
+	if pol.SoftCrossVerify {
+		t.Fatal("default SoftCrossVerify should be off to minimize active probes")
+	}
+	if pol.NodeWindowMaxAuths != 4 {
+		t.Fatalf("default node window max auths=%d, want 4", pol.NodeWindowMaxAuths)
+	}
+	if pol.NodeWindowHours != 2.0 {
+		t.Fatalf("default node window hours=%v, want 2.0", pol.NodeWindowHours)
 	}
 	if pol.ConsecutiveMissingThinking != 1 {
 		t.Fatalf("default consecutive missing thinking=%d, want 1", pol.ConsecutiveMissingThinking)
+	}
+	if pol.QuarantineSec != 3600 {
+		t.Fatalf("default quarantine seconds=%d, want 3600", pol.QuarantineSec)
+	}
+	if pol.PolicySchema != 5 {
+		t.Fatalf("default policy schema=%d, want 5", pol.PolicySchema)
 	}
 	if got := classifyQuality(100, 64, false, pol); got != "hard" {
 		t.Fatalf("missing thinking with guard=%q, want hard", got)
@@ -204,17 +215,26 @@ func TestNormalizePolicyFillsAbsentBoolDefaults(t *testing.T) {
 	if !p.ThinkingGuard {
 		t.Fatal("absent thinking_guard must default on")
 	}
-	if !p.ThinkingCrossVerify {
-		t.Fatal("schema migration must turn thinking_cross_verify on")
+	if p.ThinkingCrossVerify {
+		t.Fatal("schema migration must default thinking_cross_verify off")
 	}
-	if !p.SoftCrossVerify {
-		t.Fatal("absent soft_cross_verify must default on")
+	if p.SoftCrossVerify {
+		t.Fatal("absent soft_cross_verify must default off")
+	}
+	if p.NodeWindowMaxAuths != 4 {
+		t.Fatalf("absent node_window_max_auths must default 4, got %d", p.NodeWindowMaxAuths)
+	}
+	if p.NodeWindowHours != 2.0 {
+		t.Fatalf("absent node_window_hours must default 2.0, got %v", p.NodeWindowHours)
 	}
 	if p.ConsecutiveMissingThinking != 1 {
 		t.Fatalf("consecutive_missing_thinking=%d, want 1", p.ConsecutiveMissingThinking)
 	}
-	if p.PolicySchema != 3 {
-		t.Fatalf("policy_schema=%d, want 3", p.PolicySchema)
+	if p.PolicySchema != 5 {
+		t.Fatalf("policy_schema=%d, want 5", p.PolicySchema)
+	}
+	if p.QuarantineSec != 3600 {
+		t.Fatalf("migrated quarantine_seconds=%d, want 3600", p.QuarantineSec)
 	}
 
 	// Intermediate build: explicit thinking_cross_verify=false but schema still 0.
@@ -226,14 +246,14 @@ func TestNormalizePolicyFillsAbsentBoolDefaults(t *testing.T) {
 		"thinking_cross_verify":        false,
 		"consecutive_missing_thinking": 1,
 	})
-	if !pMid.ThinkingCrossVerify {
-		t.Fatal("schema<2 must migrate thinking_cross_verify to default on even if false was persisted")
+	if pMid.ThinkingCrossVerify {
+		t.Fatal("schema<2 must migrate thinking_cross_verify to default off even if true was persisted")
 	}
-	if !pMid.SoftCrossVerify {
-		t.Fatal("schema migration must turn soft_cross_verify on")
+	if pMid.SoftCrossVerify {
+		t.Fatal("schema migration must turn soft_cross_verify off")
 	}
-	if pMid.PolicySchema != 3 {
-		t.Fatalf("migrated policy_schema=%d, want 3", pMid.PolicySchema)
+	if pMid.PolicySchema != 5 {
+		t.Fatalf("migrated policy_schema=%d, want 5", pMid.PolicySchema)
 	}
 
 	// After redesign (schema 2), explicit false must stick.
@@ -362,8 +382,6 @@ func TestSoftCrossVerifySchedulesInsteadOfQuarantine(t *testing.T) {
 	}
 	endCrossVerify(node.ID)
 }
-
-
 
 func TestAuthDegradeCountsPassiveEvenWhenCrossVerifyScheduled(t *testing.T) {
 	store := newStateStore(filepath.Join(t.TempDir(), "state.json"))
@@ -588,7 +606,7 @@ func TestMigrationFailsClosedAndVerifiesHostAuthSave(t *testing.T) {
 	}
 }
 
-func TestSchedulerSkipsQuarantinedNode(t *testing.T) {
+func TestSchedulerHandsSelectionBackToHost(t *testing.T) {
 	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
 	bad, err := store.createNode("bad", "http://127.0.0.1:7951", true, false, 0)
 	if err != nil {
@@ -624,8 +642,8 @@ func TestSchedulerSkipsQuarantinedNode(t *testing.T) {
 	if err := json.Unmarshal(env.Result, &response); err != nil {
 		t.Fatal(err)
 	}
-	if !response.Handled || response.AuthID != "auth-good" {
-		t.Fatalf("scheduler response=%+v", response)
+	if response.Handled || response.AuthID != "" {
+		t.Fatalf("scheduler must hand selection back to host affinity selector, response=%+v", response)
 	}
 }
 
@@ -730,8 +748,8 @@ state_file: %s
 store:
   schema-version: 1
   id: grok2api-egress
-  version: 1.0.8
-  release-tag: v1.0.8
+  version: 1.0.9
+  release-tag: v1.0.9
   repository: https://github.com/lij768423-svg/grok2api-egress-enhancements
   install:
     type: github-release
@@ -1016,5 +1034,246 @@ func TestDebouncedPersistCoalescesStats(t *testing.T) {
 	}
 	if st.Stats.Passive.Total != 20 {
 		t.Fatalf("passive total=%d want 20", st.Stats.Passive.Total)
+	}
+}
+
+func TestRecordNodeAuthUsageTriggersWindowDisable(t *testing.T) {
+	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	n, err := s.createNode("n1", "socks5h://127.0.0.1:1080", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pol := s.policy()
+	pol.NodeWindowMaxAuths = 3
+	pol.NodeWindowHours = 2.0
+	if err := s.updatePolicy(pol); err != nil {
+		t.Fatal(err)
+	}
+	for _, auth := range []string{"auth-1", "auth-2"} {
+		if s.recordNodeAuthUsage(n.ID, auth) {
+			t.Fatalf("premature trigger on %s", auth)
+		}
+	}
+	if !s.recordNodeAuthUsage(n.ID, "auth-3") {
+		t.Fatal("expected window disable trigger at 3 accounts")
+	}
+	got, _ := s.getNode(n.ID)
+	if !got.DisabledByNodeWindow || got.NodeWindowUntil == 0 || got.NodeWindowReason == "" {
+		t.Fatalf("window disable not recorded: %+v", got)
+	}
+	if got.NodeWindowAuths["auth-1"] == 0 || got.NodeWindowAuths["auth-2"] == 0 || got.NodeWindowAuths["auth-3"] == 0 {
+		t.Fatalf("window auths missing: %+v", got.NodeWindowAuths)
+	}
+	// Already cooling off: stragglers must not re-trigger or extend expiry.
+	before := got.NodeWindowUntil
+	if s.recordNodeAuthUsage(n.ID, "auth-4") {
+		t.Fatal("no re-trigger while disabled")
+	}
+	got, _ = s.getNode(n.ID)
+	if got.NodeWindowUntil != before {
+		t.Fatalf("expiry must not extend: before=%v after=%v", before, got.NodeWindowUntil)
+	}
+}
+
+func TestRecordNodeAuthUsageRollingExpiry(t *testing.T) {
+	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	n, err := s.createNode("n1", "socks5h://127.0.0.1:1080", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pol := s.policy()
+	pol.NodeWindowMaxAuths = 3
+	pol.NodeWindowHours = 2.0
+	if err := s.updatePolicy(pol); err != nil {
+		t.Fatal(err)
+	}
+	// Seed stale entries older than the window; they must be evicted on the next
+	// record instead of counting toward the limit.
+	s.mu.Lock()
+	n.NodeWindowAuths = map[string]float64{
+		"auth-old-1": float64(time.Now().Unix()) - 3*3600,
+		"auth-old-2": float64(time.Now().Unix()) - 4*3600,
+	}
+	s.mu.Unlock()
+	if s.recordNodeAuthUsage(n.ID, "auth-new-1") {
+		t.Fatal("stale entries must be evicted before counting")
+	}
+	if s.recordNodeAuthUsage(n.ID, "auth-new-2") {
+		t.Fatal("stale entries must be evicted before counting")
+	}
+	got, _ := s.getNode(n.ID)
+	if len(got.NodeWindowAuths) != 2 {
+		t.Fatalf("stale entries not evicted: %+v", got.NodeWindowAuths)
+	}
+	if got.NodeWindowAuths["auth-old-1"] != 0 || got.NodeWindowAuths["auth-old-2"] != 0 {
+		t.Fatalf("stale entries survived: %+v", got.NodeWindowAuths)
+	}
+	if !s.recordNodeAuthUsage(n.ID, "auth-new-3") {
+		t.Fatal("expected trigger with 3 fresh accounts")
+	}
+	got, _ = s.getNode(n.ID)
+	if !got.DisabledByNodeWindow || len(got.NodeWindowAuths) != 3 {
+		t.Fatalf("window state wrong: %+v", got)
+	}
+}
+
+func TestNodeSchedulableFlags(t *testing.T) {
+	base := &nodeRecord{Enabled: true}
+	if !nodeSchedulable(base) {
+		t.Fatal("base node must be schedulable")
+	}
+	cases := []struct {
+		name   string
+		mut    func(*nodeRecord)
+		expect bool
+	}{
+		{"disabled", func(n *nodeRecord) { n.Enabled = false }, false},
+		{"guard", func(n *nodeRecord) { n.DisabledByGuard = true }, false},
+		{"window", func(n *nodeRecord) { n.DisabledByNodeWindow = true }, false},
+	}
+	for _, tc := range cases {
+		n := &nodeRecord{Enabled: true}
+		tc.mut(n)
+		if got := nodeSchedulable(n); got != tc.expect {
+			t.Fatalf("%s: nodeSchedulable=%v want %v", tc.name, got, tc.expect)
+		}
+	}
+	if nodeSchedulable(nil) {
+		t.Fatal("nil node must not be schedulable")
+	}
+}
+
+func TestNodeWindowClearResetsCounters(t *testing.T) {
+	s := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	n, err := s.createNode("n1", "socks5h://127.0.0.1:1080", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pol := s.policy()
+	pol.NodeWindowMaxAuths = 1
+	if err := s.updatePolicy(pol); err != nil {
+		t.Fatal(err)
+	}
+	if !s.recordNodeAuthUsage(n.ID, "auth-1") {
+		t.Fatal("expected trigger at 1 account")
+	}
+	if !s.clearNodeWindow(n.ID) {
+		t.Fatal("clearNodeWindow must clear cooling state")
+	}
+	got, _ := s.getNode(n.ID)
+	if got.DisabledByNodeWindow || got.NodeWindowUntil != 0 || got.NodeWindowReason != "" || len(got.NodeWindowAuths) != 0 {
+		t.Fatalf("window state not reset: %+v", got)
+	}
+	if s.clearNodeWindow(n.ID) {
+		t.Fatal("second clear must be a no-op")
+	}
+}
+
+func TestNormalizePolicyMigratesQuarantineDefault(t *testing.T) {
+	// schema 4 still on the old product default (120s) must move to 1h.
+	p := policyConfig{HardTPS: 1000, SoftTPS: 500, QuarantineSec: 120, PolicySchema: 4}
+	normalizePolicy(&p, map[string]any{
+		"hard_tps":           1000,
+		"soft_tps":           500,
+		"quarantine_seconds": 120,
+		"policy_schema":      4,
+	})
+	if p.QuarantineSec != 3600 {
+		t.Fatalf("schema4 default 120s must migrate to 3600, got %d", p.QuarantineSec)
+	}
+	if p.PolicySchema != 5 {
+		t.Fatalf("policy_schema=%d, want 5", p.PolicySchema)
+	}
+
+	// Operator-chosen interval must survive the schema bump.
+	p2 := policyConfig{HardTPS: 1000, SoftTPS: 500, QuarantineSec: 300, PolicySchema: 4}
+	normalizePolicy(&p2, map[string]any{
+		"hard_tps":           1000,
+		"soft_tps":           500,
+		"quarantine_seconds": 300,
+		"policy_schema":      4,
+	})
+	if p2.QuarantineSec != 300 {
+		t.Fatalf("custom quarantine_seconds must stay 300, got %d", p2.QuarantineSec)
+	}
+	if p2.PolicySchema != 5 {
+		t.Fatalf("policy_schema=%d, want 5", p2.PolicySchema)
+	}
+}
+
+func TestWindowIsolationDoesNotAffectDegradeQuarantine(t *testing.T) {
+	store := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	node, err := store.createNode("n1", "http://127.0.0.1:7951", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.createNode("n2", "http://127.0.0.1:7952", true, false, 10); err != nil {
+		t.Fatal(err)
+	}
+	pol := store.policy()
+	pol.ThinkingGuard = true
+	pol.ThinkingCrossVerify = false
+	pol.ConsecutiveMissingThinking = 1
+	pol.MinHealthyNodes = 1
+	pol.NodeWindowMaxAuths = 1
+	if err := store.updatePolicy(pol); err != nil {
+		t.Fatal(err)
+	}
+
+	// Window cool-off first: this path must not touch DisabledByGuard.
+	if !store.recordNodeAuthUsage(node.ID, "auth-1") {
+		t.Fatal("expected window disable")
+	}
+	got, _ := store.getNode(node.ID)
+	if !got.DisabledByNodeWindow {
+		t.Fatal("window flag missing")
+	}
+	if got.DisabledByGuard || got.QuarantinedUntil != 0 {
+		t.Fatalf("window cool-off must not set degrade quarantine: %+v", got)
+	}
+
+	// Degrade isolation still fires on the same node while it is window-cooled.
+	applyObservation(store, node.ID, "passive", qualityResult{
+		Classification: "hard",
+		HasThinking:    false,
+		OutputTokens:   64,
+		TPS:            10,
+	})
+	got, _ = store.getNode(node.ID)
+	if !got.DisabledByGuard {
+		t.Fatal("missing-thinking must still quarantine while window-cooled")
+	}
+	if !got.DisabledByNodeWindow {
+		t.Fatal("degrade quarantine must not clear the window cool-off")
+	}
+	if got.QuarantinedUntil == 0 {
+		t.Fatal("degrade quarantine must set quarantined_until")
+	}
+
+	// Clearing the window must leave degrade isolation in place.
+	if !store.clearNodeWindow(node.ID) {
+		t.Fatal("clearNodeWindow failed")
+	}
+	got, _ = store.getNode(node.ID)
+	if got.DisabledByNodeWindow {
+		t.Fatal("window flag should be cleared")
+	}
+	if !got.DisabledByGuard || got.QuarantinedUntil == 0 {
+		t.Fatalf("degrade quarantine must survive window restore: %+v", got)
+	}
+
+	// A healthy active probe restores degrade isolation only, not a fresh window.
+	applyObservation(store, node.ID, "active", qualityResult{
+		Classification: "healthy",
+		HasThinking:    true,
+		OutputTokens:   64,
+		TPS:            10,
+	})
+	got, _ = store.getNode(node.ID)
+	if got.DisabledByGuard || got.QuarantinedUntil != 0 {
+		t.Fatalf("healthy probe must restore degrade isolation: %+v", got)
+	}
+	if got.DisabledByNodeWindow {
+		t.Fatal("healthy probe must not re-enable window cool-off")
 	}
 }

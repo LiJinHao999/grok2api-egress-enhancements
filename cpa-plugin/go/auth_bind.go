@@ -545,7 +545,7 @@ func verifiedMigrationTargets(store *stateStore, bad *nodeRecord) []*nodeRecord 
 	cutoff := float64(time.Now().Add(-freshness).Unix())
 	targets := make([]*nodeRecord, 0)
 	for _, n := range store.listNodes() {
-		if n.ID == bad.ID || !n.Enabled || n.DisabledByGuard || n.ProxyURL == "" {
+		if n.ID == bad.ID || !nodeSchedulable(n) || n.ProxyURL == "" {
 			continue
 		}
 		if n.LastClassification != "healthy" || n.LastProbeAt <= cutoff || n.ExitIP == "" {

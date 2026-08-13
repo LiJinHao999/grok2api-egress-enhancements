@@ -246,9 +246,9 @@
         <table>
           <thead><tr>
             <th class="check-cell"><input id="select-all" type="checkbox" aria-label="选择所有节点"></th>
-            <th>节点</th><th>状态</th><th>出口 IP</th><th class="numeric">输出 Token/s</th><th class="numeric">首字</th><th>账号</th><th>最近观测</th><th class="actions-col">操作</th>
+            <th>节点</th><th>状态</th><th>出口 IP</th><th class="numeric">输出 Token/s</th><th class="numeric">首字</th><th>账号</th><th>窗口账号</th><th>最近观测</th><th class="actions-col">操作</th>
           </tr></thead>
-          <tbody id="nodes-body"><tr><td colspan="9" class="loading">正在加载节点</td></tr></tbody>
+          <tbody id="nodes-body"><tr><td colspan="10" class="loading">正在加载节点</td></tr></tbody>
         </table>
       </div>
       <div id="node-cards" class="node-cards" aria-label="节点卡片"></div>
@@ -310,7 +310,7 @@
           <div class="field"><label for="policy-mode">模式</label><select id="policy-mode"><option value="hybrid">混合</option><option value="passive">被动</option><option value="active">主动</option></select></div>
           <div class="field"><label for="policy-active">主动检测间隔（秒）</label><input id="policy-active" type="number" min="60" max="86400"></div>
           <div class="field"><label for="policy-passive">审计轮询间隔（秒）</label><input id="policy-passive" type="number" min="1" max="300"></div>
-          <div class="field"><label for="policy-quarantine">隔离复测间隔（秒）</label><input id="policy-quarantine" type="number" min="30" max="86400"></div>
+          <div class="field"><label for="policy-quarantine">隔离复测间隔（秒）</label><input id="policy-quarantine" type="number" min="30" max="86400"><p class="help">降智隔离后等待自动复测的时间；默认 3600（1 小时），用于减少主动探测</p></div>
           <div class="field"><label for="policy-min-healthy">最低健康节点数</label><input id="policy-min-healthy" type="number" min="1" max="1000"></div>
           <div class="field"><label for="policy-error-count">连续错误次数</label><input id="policy-error-count" type="number" min="1" max="20"></div>
           <div class="field"><label for="policy-model">主动探测模型</label><input id="policy-model" maxlength="120" autocomplete="off"></div>
@@ -335,7 +335,16 @@
             <div class="form-grid">
               <div class="field full check-row"><div><label for="policy-thinking-guard">启用 thinking 降智判定</label><p class="help">开启后：同一出口连续缺少 thinking_content 达到设定次数则隔离；有 thinking 时回落 Token/s 阈值</p></div><input id="policy-thinking-guard" type="checkbox"></div>
               <div class="field" id="policy-missing-count-wrap"><label for="policy-missing-thinking-count">连续缺 thinking 次数</label><input id="policy-missing-thinking-count" type="number" min="1" max="50"><p class="help">同一出口连续多少次无 thinking 才动作；默认 1</p></div>
-              <div class="field full check-row" id="policy-thinking-cv-wrap"><div><label for="policy-thinking-cross-verify">thinking 交叉验证探测</label><p class="help">与主动的质量探测进行交叉验证，达到连续缺 thinking 次数后不立即隔离，先做一次主动质量探测；复测仍无 thinking 才判定降智。</p></div><input id="policy-thinking-cross-verify" type="checkbox"></div>
+              <div class="field full check-row" id="policy-thinking-cv-wrap"><div><label for="policy-thinking-cross-verify">thinking 交叉验证探测</label><p class="help">与主动的质量探测进行交叉验证，达到连续缺 thinking 次数后不立即隔离，先做一次主动质量探测；复测仍无 thinking 才判定降智。默认关闭以最小化主动探测。</p></div><input id="policy-thinking-cross-verify" type="checkbox"></div>
+            </div>
+          </section>
+
+          <section class="policy-section" id="policy-section-node-window" aria-labelledby="policy-section-node-window-title">
+            <h4 id="policy-section-node-window-title">节点账号窗口</h4>
+            <p class="section-note">节点在窗口时长内累计使用的账号数达到上限后，自动停用该节点冷却（不参与调度与探测），冷却结束后自动恢复，用于规避同一出口 IP 短时间内使用多个账号的批量标记。</p>
+            <div class="form-grid">
+              <div class="field"><label for="policy-node-window-auths">窗口账号数上限</label><input id="policy-node-window-auths" type="number" min="0" max="50"><p class="help">窗口内累计账号数达到该值即冷却；0 表示关闭该功能；默认 4</p></div>
+              <div class="field"><label for="policy-node-window-hours">窗口时长（分钟）</label><input id="policy-node-window-hours" type="number" min="30" max="10080"><p class="help">冷却时长与滚动窗口跨度（分钟）；默认 120</p></div>
             </div>
           </section>
 
@@ -472,7 +481,7 @@
         setService(true, status?.engine === 'cpa-native' ? 'CPA 原生守护' : '已连接');
       } catch (error) {
         setService(false, '连接失败');
-        $('nodes-body').innerHTML = '<tr><td colspan="9" class="error-state">' + esc(error.message) + '</td></tr>';
+        $('nodes-body').innerHTML = '<tr><td colspan="10" class="error-state">' + esc(error.message) + '</td></tr>';
         if (!silent) toast(error.message, 'error');
       } finally {
         state.loading = false;
@@ -545,10 +554,12 @@
     }
     function nodeRowClass(node, guard) {
       if (!node.enabled) return 'row-disabled';
+      if (guard.disabled_by_node_window) return 'row-quarantined';
       if (guard.disabled_by_guard) return 'row-quarantined';
       return '';
     }
     function nodeBadge(node, guard) {
+      if (guard.disabled_by_node_window) return '<span class="badge warn">窗口冷却</span>';
       if (guard.disabled_by_guard) return '<span class="badge bad">已隔离</span>';
       if (!node.enabled) return '<span class="badge muted">已停用</span>';
       if (guard.error_strikes) return '<span class="badge warn">检测失败</span>';
@@ -563,6 +574,25 @@
       if (left <= 0) return '复测到期';
       if (left < 60) return left + ' 秒后复测';
       return Math.ceil(left / 60) + ' 分钟后复测';
+    }
+    function windowCountdown(guard) {
+      const until = Number(guard.node_window_until || 0);
+      if (!until || !guard.disabled_by_node_window) return '';
+      const left = Math.max(0, Math.round(until - Date.now() / 1000));
+      if (left <= 0) return '冷却到期';
+      if (left < 60) return left + ' 秒后恢复';
+      if (left < 3600) return Math.ceil(left / 60) + ' 分钟后恢复';
+      return Math.floor(left / 3600) + ' 小时 ' + Math.ceil((left % 3600) / 60) + ' 分钟后恢复';
+    }
+    function nodeWindowCell(node, guard) {
+      const max = Number(state.status?.config?.node_window_max_auths || 0);
+      const count = Number(node.node_window_auth_count || 0);
+      if (!max) return {html: '-', sub: '窗口未启用'};
+      const cd = windowCountdown(guard);
+      return {
+        html: '<span class="' + (guard.disabled_by_node_window ? 'tone-bad' : '') + '">' + number(count) + ' / ' + number(max) + '</span>' + (cd ? ' · ' + cd : ''),
+        sub: guard.disabled_by_node_window ? '窗口冷却中' : '窗口账号 / 上限'
+      };
     }
     function nextObservation(node, guard) {
       const cfg = state.status?.config || {};
@@ -593,7 +623,7 @@
       $('select-all').checked = nodes.length > 0 && nodes.every((node) => state.selected.has(node.id));
       $('select-all').indeterminate = !($('select-all').checked) && nodes.some((node) => state.selected.has(node.id));
       if (!nodes.length) {
-        $('nodes-body').innerHTML = '<tr><td colspan="9" class="empty">' + (state.search ? '没有匹配的节点' : '暂无出口节点') + '</td></tr>';
+        $('nodes-body').innerHTML = '<tr><td colspan="10" class="empty">' + (state.search ? '没有匹配的节点' : '暂无出口节点') + '</td></tr>';
         $('node-cards').innerHTML = '<div class="empty">' + (state.search ? '没有匹配的节点' : '暂无出口节点') + '</div>';
         return;
       }
@@ -604,6 +634,7 @@
         const observed = guard.last_observed_at || guard.last_probe_at;
         const reason = guard.last_reason || node.probeStatus || '-';
         const cd = quarantineCountdown(guard);
+        const winCell = nodeWindowCell(node, guard);
         const rowClass = nodeRowClass(node, guard);
         return '<tr class="' + rowClass + '" data-id="' + esc(node.id) + '">' +
           '<td class="check-cell"><input type="checkbox" data-action="select" ' + (state.selected.has(node.id) ? 'checked' : '') + ' aria-label="选择 ' + esc(node.name) + '"></td>' +
@@ -613,6 +644,7 @@
           '<td class="numeric ' + tpsClass + '">' + (observed ? Number(guard.last_output_tps || 0).toFixed(1) : '-') + '</td>' +
           '<td class="numeric">' + (guard.last_first_token_ms ? number(guard.last_first_token_ms) + ' ms' : '-') + '</td>' +
           '<td><div>' + number(node.assignedAccountCount) + ' / ' + (node.accountCapacity || '∞') + '</div><div class="subtext">已绑定 / 容量</div></td>' +
+          '<td><div>' + winCell.html + '</div><div class="subtext">' + winCell.sub + '</div></td>' +
           '<td title="' + esc(time(observed, true)) + '">' + relative(observed) + '<div class="subtext" title="' + esc(nextObservation(node, guard)) + '">' + esc(nextObservation(node, guard)) + '</div></td>' +
           '<td class="actions-col">' + actionButtons(node) + '</td></tr>';
       }).join('');
@@ -631,6 +663,7 @@
             '<div><span>Token/s</span><strong>' + (observed ? Number(guard.last_output_tps || 0).toFixed(1) : '-') + '</strong></div>' +
             '<div><span>首字</span><strong>' + (guard.last_first_token_ms ? number(guard.last_first_token_ms) + ' ms' : '-') + '</strong></div>' +
             '<div><span>账号</span><strong>' + number(node.assignedAccountCount) + ' / ' + (node.accountCapacity || '∞') + '</strong></div>' +
+            '<div><span>窗口账号</span><strong>' + nodeWindowCell(node, guard).html + '</strong></div>' +
           '</div>' + actionButtons(node) + '</article>';
       }).join('');
     }
@@ -651,7 +684,7 @@
     function renderEvents() {
       const events = state.status?.recentEvents || [];
       if (!events.length) { $('events-list').innerHTML = '<div class="empty">暂无守护事件</div>'; return; }
-      const names = {node_quarantined:'节点已隔离',node_restored:'节点已恢复',quality_probe_completed:'质量检测完成',thinking_cross_verify_scheduled:'thinking 交叉验证已调度',soft_cross_verify_scheduled:'软阈值交叉验证已调度',node_rotated:'出口 IP 已轮换',node_rotation_failed:'换 IP 失败',quarantine_suppressed:'隔离已抑制',accounts_migrated:'账号已迁移',accounts_migration_failed:'账号迁移失败'};
+      const names = {node_quarantined:'节点已隔离',node_restored:'节点已恢复',quality_probe_completed:'质量检测完成',thinking_cross_verify_scheduled:'thinking 交叉验证已调度',soft_cross_verify_scheduled:'软阈值交叉验证已调度',node_rotated:'出口 IP 已轮换',node_rotation_failed:'换 IP 失败',quarantine_suppressed:'隔离已抑制',accounts_migrated:'账号已迁移',accounts_migration_failed:'账号迁移失败',node_window_disabled:'节点窗口冷却',node_window_restored:'节点窗口已恢复'};
       $('events-list').innerHTML = events.slice().reverse().map((event) => '<div class="event"><div><strong>' + esc(names[event.event] || event.event || '守护事件') + ' · ' + esc(event.node_name || ('节点 ' + event.node_id)) + '</strong><small>' + esc(event.reason || event.classification || '-') + (event.output_tps ? ' · ' + Number(event.output_tps).toFixed(1) + ' Token/s' : '') + '</small></div><time>' + relative(event.ts) + '</time></div>').join('');
     }
     function renderPolicy() {
@@ -670,6 +703,7 @@
         ['thinking 降智', thinkingOn ? '开' : '关'],
         ['连续缺 thinking', thinkingOn ? String(cfg.consecutive_missing_thinking || 1) : '-'],
         ['thinking 交叉验证', thinkingOn && cfg.thinking_cross_verify !== false ? '开' : '关'],
+        ['节点账号窗口', (cfg.node_window_max_auths ? cfg.node_window_max_auths + ' 账号 / ' + Math.round((cfg.node_window_hours || 2) * 60) + ' 分钟' : '关闭')],
         ['最短生成窗口', (cfg.min_generation_ms || 1000) + ' ms'],
         ['最小判定 Token', cfg.min_output_tokens || 32],
         ['探测输出', (cfg.max_output_tokens || 384) + ' Token'],
@@ -710,9 +744,10 @@
       $('policy-min-healthy').value = cfg.min_healthy_nodes;
       $('policy-thinking-guard').checked = cfg.thinking_guard !== false;
       $('policy-missing-thinking-count').value = cfg.consecutive_missing_thinking || 1;
-      // defaults-on flags: absent/undefined => on
-      $('policy-thinking-cross-verify').checked = cfg.thinking_guard !== false && cfg.thinking_cross_verify !== false;
-      $('policy-soft-cross-verify').checked = cfg.soft_cross_verify !== false;
+      $('policy-thinking-cross-verify').checked = cfg.thinking_guard !== false && cfg.thinking_cross_verify === true;
+      $('policy-soft-cross-verify').checked = cfg.soft_cross_verify === true;
+      $('policy-node-window-auths').value = cfg.node_window_max_auths ?? 4;
+      $('policy-node-window-hours').value = Math.round((cfg.node_window_hours || 2) * 60);
       $('policy-disable-auth').checked = cfg.disable_auth_on_hard !== false;
       syncPolicyFormDependencies();
       openModal('policy-modal');
@@ -899,10 +934,6 @@
       }
     }
     $('policy-thinking-guard').addEventListener('change', () => {
-      if ($('policy-thinking-guard').checked) {
-        // Re-enable with defaults-on cross-verify when user turns guard back on.
-        $('policy-thinking-cross-verify').checked = true;
-      }
       syncPolicyFormDependencies();
     });
     $('policy-form').addEventListener('submit', async (event) => {
@@ -925,6 +956,8 @@
         consecutiveMissingThinking: Number($('policy-missing-thinking-count').value) || 1,
         thinkingCrossVerify: thinkingOn && $('policy-thinking-cross-verify').checked,
         softCrossVerify: $('policy-soft-cross-verify').checked,
+        nodeWindowMaxAuths: Number($('policy-node-window-auths').value) || 0,
+        nodeWindowHours: Math.max(0.5, (Number($('policy-node-window-hours').value) || 120) / 60),
         disableAuthOnHard: $('policy-disable-auth').checked,
         quarantineSeconds: Number($('policy-quarantine').value),
         minHealthyNodes: Number($('policy-min-healthy').value)

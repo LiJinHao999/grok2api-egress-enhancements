@@ -5,29 +5,9 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"sync/atomic"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
-
-var schedulerCursor atomic.Uint64
-
-func isXAIProvider(provider string) bool {
-	provider = strings.ToLower(strings.TrimSpace(provider))
-	return strings.Contains(provider, "xai") || strings.Contains(provider, "grok")
-}
-
-func requestIncludesXAI(provider string, providers []string) bool {
-	if isXAIProvider(provider) {
-		return true
-	}
-	for _, candidate := range providers {
-		if isXAIProvider(candidate) {
-			return true
-		}
-	}
-	return false
-}
 
 func schedulerCandidateAvailable(candidate pluginapi.SchedulerAuthCandidate) bool {
 	status := strings.ToLower(strings.TrimSpace(candidate.Status))
@@ -45,63 +25,22 @@ func schedulerCandidateAvailable(candidate pluginapi.SchedulerAuthCandidate) boo
 	}
 }
 
-// handleSchedulerPick keeps the host scheduler from selecting an auth whose
-// proxy node is quarantined. Unmanaged providers and unbound accounts are
-// delegated to CPA's native scheduler.
+// handleSchedulerPick hands auth selection entirely back to the host.
+//
+// CPA only consults SessionAffinitySelector on the legacy path when the plugin
+// responds Handled:false (conductor.pickNextLegacy: "if !handled { selector.Pick }").
+// Any Handled:true answer — pinning AuthID or DelegateBuiltin — routes into
+// pickViaBuiltinScheduler, a bare round-robin cursor that bypasses session
+// affinity entirely and rotates auths on every request.
+//
+// Quarantined nodes are still defended without taking over selection:
+// migrateAuthsOffNode first disables affected auths (CPA drops candidate.Disabled),
+// then rebinds them to a healthy exit; disableAuthsOnNode is the fallback when
+// migration cannot complete. handleRequestIntercept closes the race between
+// host selection and that disable/migrate window.
 func handleSchedulerPick(request []byte) ([]byte, error) {
-	ensureStore()
-	var req pluginapi.SchedulerPickRequest
-	if err := json.Unmarshal(request, &req); err != nil {
-		return nil, fmt.Errorf("decode scheduler request: %w", err)
-	}
-	if !requestIncludesXAI(req.Provider, req.Providers) {
-		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
-	}
-
-	nodes := store.listNodes()
-	byProxy := make(map[string]*nodeRecord, len(nodes))
-	for _, node := range nodes {
-		if node.ProxyURL != "" {
-			byProxy[node.ProxyURL] = node
-		}
-	}
-	cache := refreshAuthProxyCache()
-	eligible := make([]string, 0, len(req.Candidates))
-	managed := false
-	nonXAIAvailable := false
-	for _, candidate := range req.Candidates {
-		if !isXAIProvider(candidate.Provider) {
-			nonXAIAvailable = true
-			continue
-		}
-		proxy := cache[candidate.ID]
-		if proxy == "" {
-			continue
-		}
-		node := byProxy[proxy]
-		if node == nil {
-			continue
-		}
-		managed = true
-		if !schedulerCandidateAvailable(candidate) {
-			continue
-		}
-		if node.Enabled && !node.DisabledByGuard {
-			eligible = append(eligible, candidate.ID)
-		}
-	}
-	if !managed {
-		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
-	}
-	if len(eligible) == 0 {
-		if strings.TrimSpace(req.Provider) == "" && nonXAIAvailable {
-			return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
-		}
-		return errorEnvelope("egress_no_healthy_auth", "没有可用的健康 CPA 出口账号"), nil
-	}
-	index := schedulerCursor.Add(1) - 1
-	selected := eligible[index%uint64(len(eligible))]
-	return okEnvelope(pluginapi.SchedulerPickResponse{Handled: true, AuthID: selected})
+	_ = request
+	return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
 }
 
 // handleRequestInterceptAfterAuth closes the small race between auth selection
@@ -125,7 +64,9 @@ func handleRequestIntercept(request []byte, afterAuth bool) ([]byte, error) {
 		return okEnvelope(pluginapi.RequestInterceptResponse{})
 	}
 	node, ok := store.getNode(nodeID)
-	if !ok || !node.DisabledByGuard {
+	// Fallback only for non-schedulable exits: guard quarantine and the
+	// account-window cool-off. Healthy nodes pass through.
+	if !ok || nodeSchedulable(node) {
 		return okEnvelope(pluginapi.RequestInterceptResponse{})
 	}
 	body, _ := json.Marshal(map[string]any{

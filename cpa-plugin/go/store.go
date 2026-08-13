@@ -13,19 +13,19 @@ import (
 )
 
 type policyConfig struct {
-	Mode                 string  `json:"mode"`
-	ActiveIntervalSec    int     `json:"active_interval_seconds"`
-	PassivePollSec       int     `json:"passive_poll_seconds"`
-	QuarantineSec        int     `json:"quarantine_seconds"`
-	SoftTPS              float64 `json:"soft_tps"`
-	HardTPS              float64 `json:"hard_tps"`
-	ConsecutiveSoft      int     `json:"consecutive_soft"`
-	ConsecutiveErrors    int     `json:"consecutive_errors"`
-	MinHealthyNodes      int     `json:"min_healthy_nodes"`
-	MinGenerationMs      int64   `json:"min_generation_ms"`
-	MinOutputTokens      int64   `json:"min_output_tokens"`
-	Model                string  `json:"model"`
-	DisableAuthOnHard    bool    `json:"disable_auth_on_hard"`
+	Mode              string  `json:"mode"`
+	ActiveIntervalSec int     `json:"active_interval_seconds"`
+	PassivePollSec    int     `json:"passive_poll_seconds"`
+	QuarantineSec     int     `json:"quarantine_seconds"`
+	SoftTPS           float64 `json:"soft_tps"`
+	HardTPS           float64 `json:"hard_tps"`
+	ConsecutiveSoft   int     `json:"consecutive_soft"`
+	ConsecutiveErrors int     `json:"consecutive_errors"`
+	MinHealthyNodes   int     `json:"min_healthy_nodes"`
+	MinGenerationMs   int64   `json:"min_generation_ms"`
+	MinOutputTokens   int64   `json:"min_output_tokens"`
+	Model             string  `json:"model"`
+	DisableAuthOnHard bool    `json:"disable_auth_on_hard"`
 	// ThinkingGuard enables missing-thinking 降智 detection. When false, quality
 	// classification falls back to the original soft/hard Token/s thresholds only.
 	// Absent in old state.json → default true (see normalizePolicy).
@@ -34,45 +34,58 @@ type policyConfig struct {
 	// on the same egress are required before isolation / cross-verify. Default 1.
 	ConsecutiveMissingThinking int `json:"consecutive_missing_thinking"`
 	// ThinkingCrossVerify defers missing-thinking isolation until an active probe
-	// also lacks thinking. Default true. May delay isolation and spend probe tokens.
+	// also lacks thinking. Default false to minimize active probes; operators can
+	// re-enable confirmation in the panel.
 	ThinkingCrossVerify bool `json:"thinking_cross_verify"`
 	// SoftCrossVerify defers soft-TPS isolation until an active probe confirms the
-	// anomaly. Default true.
+	// anomaly. Default false: passive observations quarantine directly to minimize
+	// active probes; operators can re-enable confirmation in the panel.
 	SoftCrossVerify      bool `json:"soft_cross_verify"`
 	MaxOutputTokensProbe int  `json:"max_output_tokens"`
+	// NodeWindowMaxAuths cools a node for NodeWindowHours when that many distinct
+	// accounts used it within the rolling window. 0 disables the guard.
+	NodeWindowMaxAuths int     `json:"node_window_max_auths"`
+	NodeWindowHours    float64 `json:"node_window_hours"`
 	// PolicySchema tracks policy feature revisions. Bump when new defaults must be
 	// force-migrated once for existing state.json files.
 	PolicySchema int `json:"policy_schema,omitempty"`
 }
 
 type nodeRecord struct {
-	ID                   string    `json:"id"`
-	Name                 string    `json:"name"`
-	ProxyURL             string    `json:"-"` // never serialize to API clients in clear form via dedicated DTO
-	ProxyURLStored       string    `json:"proxy_url"`
-	Enabled              bool      `json:"enabled"`
-	ProxyPool            bool      `json:"proxy_pool"`
-	AccountCapacity      int       `json:"account_capacity"`
-	ExitIP               string    `json:"exit_ip,omitempty"`
-	ProbeStatus          string    `json:"probe_status,omitempty"`
-	ProbeLatencyMs       int64     `json:"probe_latency_ms,omitempty"`
-	AssignedAccountCount int       `json:"assigned_account_count"`
-	DisabledByGuard      bool      `json:"disabled_by_guard"`
-	QuarantinedUntil     float64   `json:"quarantined_until,omitempty"`
-	ErrorStrikes         int       `json:"error_strikes"`
-	SoftStrikes          int       `json:"soft_strikes"`
-	ThinkingStrikes      int       `json:"thinking_strikes"`
-	LastClassification   string    `json:"last_classification,omitempty"`
-	LastOutputTPS        float64   `json:"last_output_tps,omitempty"`
-	LastFirstTokenMs     int64     `json:"last_first_token_ms,omitempty"`
-	LastDurationMs       int64     `json:"last_duration_ms,omitempty"`
-	LastOutputTokens     int64     `json:"last_output_tokens,omitempty"`
-	LastReason           string    `json:"last_reason,omitempty"`
-	LastSource           string    `json:"last_source,omitempty"`
-	LastObservedAt       float64   `json:"last_observed_at,omitempty"`
-	LastProbeAt          float64   `json:"last_probe_at,omitempty"`
-	CreatedAt            time.Time `json:"created_at"`
-	UpdatedAt            time.Time `json:"updated_at"`
+	ID                   string  `json:"id"`
+	Name                 string  `json:"name"`
+	ProxyURL             string  `json:"-"` // never serialize to API clients in clear form via dedicated DTO
+	ProxyURLStored       string  `json:"proxy_url"`
+	Enabled              bool    `json:"enabled"`
+	ProxyPool            bool    `json:"proxy_pool"`
+	AccountCapacity      int     `json:"account_capacity"`
+	ExitIP               string  `json:"exit_ip,omitempty"`
+	ProbeStatus          string  `json:"probe_status,omitempty"`
+	ProbeLatencyMs       int64   `json:"probe_latency_ms,omitempty"`
+	AssignedAccountCount int     `json:"assigned_account_count"`
+	DisabledByGuard      bool    `json:"disabled_by_guard"`
+	QuarantinedUntil     float64 `json:"quarantined_until,omitempty"`
+	// DisabledByNodeWindow is a temporary cool-off when too many distinct
+	// accounts used this egress within the rolling window (shared-exit marking).
+	// Auto-cleared by the guard worker when NodeWindowUntil passes.
+	DisabledByNodeWindow bool               `json:"disabled_by_node_window,omitempty"`
+	NodeWindowUntil      float64            `json:"node_window_until,omitempty"`
+	NodeWindowReason     string             `json:"node_window_reason,omitempty"`
+	NodeWindowAuths      map[string]float64 `json:"node_window_auths,omitempty"` // authID -> last used unix sec
+	ErrorStrikes         int                `json:"error_strikes"`
+	SoftStrikes          int                `json:"soft_strikes"`
+	ThinkingStrikes      int                `json:"thinking_strikes"`
+	LastClassification   string             `json:"last_classification,omitempty"`
+	LastOutputTPS        float64            `json:"last_output_tps,omitempty"`
+	LastFirstTokenMs     int64              `json:"last_first_token_ms,omitempty"`
+	LastDurationMs       int64              `json:"last_duration_ms,omitempty"`
+	LastOutputTokens     int64              `json:"last_output_tokens,omitempty"`
+	LastReason           string             `json:"last_reason,omitempty"`
+	LastSource           string             `json:"last_source,omitempty"`
+	LastObservedAt       float64            `json:"last_observed_at,omitempty"`
+	LastProbeAt          float64            `json:"last_probe_at,omitempty"`
+	CreatedAt            time.Time          `json:"created_at"`
+	UpdatedAt            time.Time          `json:"updated_at"`
 }
 
 type nodeCreateInput struct {
@@ -119,27 +132,27 @@ type statistics struct {
 
 // authDegradeRecord tracks per-account 降智 (missing-thinking) hits.
 type authDegradeRecord struct {
-	AuthID         string  `json:"auth_id"`
-	Label          string  `json:"label,omitempty"`
-	DegradedCount  int64   `json:"degraded_count"`
-	SampleCount    int64   `json:"sample_count"`
-	LastAt         float64 `json:"last_at,omitempty"`
-	LastReason     string  `json:"last_reason,omitempty"`
-	LastNodeID     string  `json:"last_node_id,omitempty"`
-	LastNodeName   string  `json:"last_node_name,omitempty"`
-	LastOutputTPS  float64 `json:"last_output_tps,omitempty"`
-	LastSource     string  `json:"last_source,omitempty"`
+	AuthID        string  `json:"auth_id"`
+	Label         string  `json:"label,omitempty"`
+	DegradedCount int64   `json:"degraded_count"`
+	SampleCount   int64   `json:"sample_count"`
+	LastAt        float64 `json:"last_at,omitempty"`
+	LastReason    string  `json:"last_reason,omitempty"`
+	LastNodeID    string  `json:"last_node_id,omitempty"`
+	LastNodeName  string  `json:"last_node_name,omitempty"`
+	LastOutputTPS float64 `json:"last_output_tps,omitempty"`
+	LastSource    string  `json:"last_source,omitempty"`
 }
 
 type guardState struct {
-	Version    int                           `json:"version"`
-	Policy     policyConfig                  `json:"policy"`
-	Nodes      map[string]*nodeRecord        `json:"nodes"`
-	Events     []guardEvent                  `json:"events"`
-	Stats      statistics                    `json:"statistics"`
-	AuthStats  map[string]*authDegradeRecord `json:"auth_stats"`
-	NextID     int                           `json:"next_id"`
-	UpdatedAt  float64                       `json:"updated_at"`
+	Version   int                           `json:"version"`
+	Policy    policyConfig                  `json:"policy"`
+	Nodes     map[string]*nodeRecord        `json:"nodes"`
+	Events    []guardEvent                  `json:"events"`
+	Stats     statistics                    `json:"statistics"`
+	AuthStats map[string]*authDegradeRecord `json:"auth_stats"`
+	NextID    int                           `json:"next_id"`
+	UpdatedAt float64                       `json:"updated_at"`
 }
 
 type stateStore struct {
@@ -158,7 +171,7 @@ func defaultPolicy() policyConfig {
 		Mode:                       "hybrid",
 		ActiveIntervalSec:          1800,
 		PassivePollSec:             5,
-		QuarantineSec:              120,
+		QuarantineSec:              3600,
 		SoftTPS:                    500,
 		HardTPS:                    1000,
 		ConsecutiveSoft:            2,
@@ -170,10 +183,12 @@ func defaultPolicy() policyConfig {
 		DisableAuthOnHard:          true,
 		ThinkingGuard:              true,
 		ConsecutiveMissingThinking: 1,
-		ThinkingCrossVerify:        true,
-		SoftCrossVerify:            true,
+		ThinkingCrossVerify:        false,
+		SoftCrossVerify:            false,
 		MaxOutputTokensProbe:       384,
-		PolicySchema:               3,
+		NodeWindowMaxAuths:         4,
+		NodeWindowHours:            2.0,
+		PolicySchema:               5,
 	}
 }
 
@@ -248,20 +263,47 @@ func normalizePolicy(p *policyConfig, rawPolicy map[string]any) {
 		p.DisableAuthOnHard = def.DisableAuthOnHard
 	}
 
+	// Node-window guard defaults: 0 means explicitly disabled, so only absent
+	// (old state.json) or negative values fall back to the default.
+	if !has("node_window_max_auths", "nodeWindowMaxAuths") || p.NodeWindowMaxAuths < 0 {
+		p.NodeWindowMaxAuths = def.NodeWindowMaxAuths
+	}
+	if p.NodeWindowHours <= 0 {
+		p.NodeWindowHours = def.NodeWindowHours
+	}
+
 	// policy_schema migrations are one-shot product default upgrades.
 	// schema < 2: thinking redesign defaults
-	// schema < 3: soft cross-verify defaults to on
+	// schema < 3: soft cross-verify product default (now off)
+	// schema < 4: node-window guard introduced
+	// schema < 5: quarantine retest default 120s -> 1h (minimize active probes)
 	if p.PolicySchema < 2 {
 		if !has("consecutive_missing_thinking", "consecutiveMissingThinking") {
 			p.ConsecutiveMissingThinking = def.ConsecutiveMissingThinking
 		}
-		// Force ON once, even if an intermediate build persisted false.
+		// Force once, even if an intermediate build persisted true.
 		p.ThinkingCrossVerify = def.ThinkingCrossVerify
 		p.SoftCrossVerify = def.SoftCrossVerify
+		// Also pick up later one-shot defaults so old files jump to current schema.
+		if p.QuarantineSec == 120 {
+			p.QuarantineSec = def.QuarantineSec
+		}
+		p.PolicySchema = def.PolicySchema
+	} else if p.PolicySchema < 4 {
+		// 2 -> 3: soft cross-verify product default flipped to off.
+		// 3 -> 4: node-window fields are filled above; just advance schema.
+		p.SoftCrossVerify = def.SoftCrossVerify
+		if p.QuarantineSec == 120 {
+			p.QuarantineSec = def.QuarantineSec
+		}
 		p.PolicySchema = def.PolicySchema
 	} else if p.PolicySchema < def.PolicySchema {
-		// 2 -> 3: soft cross-verify product default flipped to on.
-		p.SoftCrossVerify = def.SoftCrossVerify
+		// 4 -> 5: isolation retest interval product default 120s -> 3600s.
+		// Only rewrite the previous product default so an operator-chosen
+		// quarantine_seconds (e.g. 300 / 7200) is left alone.
+		if p.QuarantineSec == 120 {
+			p.QuarantineSec = def.QuarantineSec
+		}
 		p.PolicySchema = def.PolicySchema
 	} else {
 		if !has("thinking_cross_verify", "thinkingCrossVerify") {
@@ -464,7 +506,7 @@ func (s *stateStore) updatePolicy(p policyConfig) error {
 		return fmt.Errorf("连续缺 thinking 次数需在 1 到 50 之间")
 	}
 	if p.QuarantineSec <= 0 {
-		p.QuarantineSec = 120
+		p.QuarantineSec = 3600
 	}
 	if p.ActiveIntervalSec < 60 || p.ActiveIntervalSec > 86400 {
 		return fmt.Errorf("主动检测间隔需在 60 到 86400 秒之间")
@@ -486,6 +528,12 @@ func (s *stateStore) updatePolicy(p policyConfig) error {
 	}
 	if p.MaxOutputTokensProbe < 16 || p.MaxOutputTokensProbe > 4096 {
 		return fmt.Errorf("主动探测最大输出需在 16 到 4096 Token 之间")
+	}
+	if p.NodeWindowMaxAuths < 0 || p.NodeWindowMaxAuths > 50 {
+		return fmt.Errorf("节点账号窗口阈值需在 0 到 50 之间（0=禁用）")
+	}
+	if p.NodeWindowHours < 0.5 || p.NodeWindowHours > 168 {
+		return fmt.Errorf("节点账号窗口时长需在 30 到 10080 分钟之间")
 	}
 	if !p.ThinkingGuard {
 		p.ThinkingCrossVerify = false
@@ -686,7 +734,6 @@ func (s *stateStore) events() []guardEvent {
 	return out
 }
 
-
 func (s *stateStore) recordAuthObservation(authID, label, source, nodeID, nodeName, class, reason string, tps float64, degraded bool) {
 	authID = strings.TrimSpace(authID)
 	if authID == "" || s == nil {
@@ -775,7 +822,6 @@ func (s *stateStore) clearAuthDegradeStats() {
 	_ = s.flushNowLocked()
 }
 
-
 func (s *stateStore) stats() statistics {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -846,36 +892,121 @@ func (s *stateStore) nodeIDByProxy(proxyURL string) string {
 	return ""
 }
 
+// nodeSchedulable is the single source of truth for "may this egress carry
+// traffic": guard quarantine and the account-window cool-off both disqualify a
+// node from scheduling and probing.
+func nodeSchedulable(n *nodeRecord) bool {
+	return n != nil && n.Enabled && !n.DisabledByGuard && !n.DisabledByNodeWindow
+}
+
+// recordNodeAuthUsage credits a real (non-probe) request auth to the node's
+// rolling account window. When the window fills up to the policy threshold the
+// node is isolated for NodeWindowHours; the return value reports that trigger.
+func (s *stateStore) recordNodeAuthUsage(nodeID, authID string) bool {
+	authID = strings.TrimSpace(authID)
+	if s == nil || nodeID == "" || authID == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := s.data.Nodes[nodeID]
+	if n == nil {
+		return false
+	}
+	pol := s.data.Policy
+	limit := pol.NodeWindowMaxAuths
+	if limit <= 0 {
+		return false
+	}
+	hours := pol.NodeWindowHours
+	if hours <= 0 {
+		hours = 24
+	}
+	now := float64(time.Now().Unix())
+	cutoff := now - hours*3600
+
+	if n.NodeWindowAuths == nil {
+		n.NodeWindowAuths = map[string]float64{}
+	}
+	if n.DisabledByNodeWindow {
+		// Already cooling off: keep the window fresh for the restore-time reset,
+		// but never extend the expiry from stragglers.
+		n.NodeWindowAuths[authID] = now
+		_ = s.persistLocked()
+		return false
+	}
+	for k, last := range n.NodeWindowAuths {
+		if last < cutoff {
+			delete(n.NodeWindowAuths, k)
+		}
+	}
+	n.NodeWindowAuths[authID] = now
+	if len(n.NodeWindowAuths) < limit {
+		_ = s.persistLocked()
+		return false
+	}
+	n.DisabledByNodeWindow = true
+	n.NodeWindowUntil = now + hours*3600
+	n.NodeWindowReason = fmt.Sprintf("窗口累计 %d 个不同账号使用该出口（阈值 %d）", len(n.NodeWindowAuths), limit)
+	_ = s.persistLocked()
+	return true
+}
+
+// clearNodeWindow ends the account-window cool-off early and resets the window,
+// so a restored node starts a fresh counting period instead of instantly
+// re-isolating from stale entries.
+func (s *stateStore) clearNodeWindow(nodeID string) bool {
+	if s == nil || nodeID == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := s.data.Nodes[nodeID]
+	if n == nil || !n.DisabledByNodeWindow {
+		return false
+	}
+	n.DisabledByNodeWindow = false
+	n.NodeWindowUntil = 0
+	n.NodeWindowReason = ""
+	n.NodeWindowAuths = nil
+	_ = s.persistLocked()
+	return true
+}
+
 func publicNode(n *nodeRecord) map[string]any {
 	if n == nil {
 		return nil
 	}
 	return map[string]any{
-		"id":                   n.ID,
-		"name":                 n.Name,
-		"enabled":              n.Enabled,
-		"proxyPool":            n.ProxyPool,
-		"accountCapacity":      n.AccountCapacity,
-		"exitIp":               n.ExitIP,
-		"probeStatus":          n.ProbeStatus,
-		"probeLatencyMs":       n.ProbeLatencyMs,
-		"assignedAccountCount": n.AssignedAccountCount,
-		"disabled_by_guard":    n.DisabledByGuard,
-		"quarantined_until":    n.QuarantinedUntil,
-		"error_strikes":        n.ErrorStrikes,
-		"soft_strikes":         n.SoftStrikes,
-		"thinking_strikes":     n.ThinkingStrikes,
-		"last_classification":  n.LastClassification,
-		"last_output_tps":      n.LastOutputTPS,
-		"last_first_token_ms":  n.LastFirstTokenMs,
-		"last_duration_ms":     n.LastDurationMs,
-		"last_output_tokens":   n.LastOutputTokens,
-		"last_reason":          n.LastReason,
-		"last_source":          n.LastSource,
-		"last_observed_at":     n.LastObservedAt,
-		"last_probe_at":        n.LastProbeAt,
-		"hasProxy":             n.ProxyURL != "",
-		"createdAt":            n.CreatedAt,
-		"updatedAt":            n.UpdatedAt,
+		"id":                      n.ID,
+		"name":                    n.Name,
+		"enabled":                 n.Enabled,
+		"proxyPool":               n.ProxyPool,
+		"accountCapacity":         n.AccountCapacity,
+		"exitIp":                  n.ExitIP,
+		"probeStatus":             n.ProbeStatus,
+		"probeLatencyMs":          n.ProbeLatencyMs,
+		"assignedAccountCount":    n.AssignedAccountCount,
+		"disabled_by_guard":       n.DisabledByGuard,
+		"quarantined_until":       n.QuarantinedUntil,
+		"disabled_by_node_window": n.DisabledByNodeWindow,
+		"node_window_until":       n.NodeWindowUntil,
+		"node_window_reason":      n.NodeWindowReason,
+		"node_window_auth_count":  len(n.NodeWindowAuths),
+		"error_strikes":           n.ErrorStrikes,
+		"soft_strikes":            n.SoftStrikes,
+		"thinking_strikes":        n.ThinkingStrikes,
+		"last_classification":     n.LastClassification,
+		"last_output_tps":         n.LastOutputTPS,
+		"last_first_token_ms":     n.LastFirstTokenMs,
+		"last_duration_ms":        n.LastDurationMs,
+		"last_output_tokens":      n.LastOutputTokens,
+		"last_reason":             n.LastReason,
+		"last_source":             n.LastSource,
+		"last_observed_at":        n.LastObservedAt,
+		"last_probe_at":           n.LastProbeAt,
+		"hasProxy":                n.ProxyURL != "",
+		"createdAt":               n.CreatedAt,
+		"updatedAt":               n.UpdatedAt,
 	}
 }

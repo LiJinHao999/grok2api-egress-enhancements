@@ -1084,6 +1084,28 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 	store.bumpStat(source, res.Classification, res.OutputTokens)
 }
 
+// disableNodeForWindow ends the account-window cool-off aftermath: push
+// production off the node and clear its bound accounts from scheduling so host
+// candidates never include a marked exit. Recovery is time-based, not probe-based.
+func disableNodeForWindow(store *stateStore, nodeID, reason string) {
+	if store == nil || nodeID == "" {
+		return
+	}
+	n, ok := store.getNode(nodeID)
+	if !ok || n == nil || !n.DisabledByNodeWindow {
+		return
+	}
+	store.appendEvent(guardEvent{
+		Event:    "node_window_disabled",
+		NodeID:   n.ID,
+		NodeName: n.Name,
+		Reason:   reason,
+	})
+	if err := migrateAuthsOffNode(store, n); err != nil {
+		store.appendEvent(guardEvent{Event: "accounts_migration_failed", NodeID: n.ID, NodeName: n.Name, Reason: err.Error()})
+	}
+}
+
 func quarantineNode(store *stateStore, nodeID, reason string, tps float64, class string) {
 	pol := store.policy()
 	enabledHealthy := 0
@@ -1093,7 +1115,7 @@ func quarantineNode(store *stateStore, nodeID, reason string, tps float64, class
 			target = o
 			continue
 		}
-		if o.Enabled && !o.DisabledByGuard {
+		if nodeSchedulable(o) {
 			enabledHealthy++
 		}
 	}
@@ -1308,6 +1330,16 @@ func handlePassiveUsage(store *stateStore, record map[string]any) {
 	if class == "hard" && !failed && pol.ThinkingGuard && !hasThinking {
 		res.Error = "响应缺少 thinking_content（降智）"
 	}
+	// Account-window cool-off: real requests (never probes or failures) count
+	// distinct auths per egress. At the threshold the node is isolated so a
+	// shared exit cannot mark more accounts.
+	if nodeID != "" && class != "error" && class != "ignored" && class != "unknown" && !failed && authKey != "" && authKey != "probe-api" {
+		if store.recordNodeAuthUsage(nodeID, authKey) {
+			if n, ok := store.getNode(nodeID); ok && n != nil {
+				disableNodeForWindow(store, nodeID, n.NodeWindowReason)
+			}
+		}
+	}
 	if nodeID == "" {
 		store.bumpStat("passive", class, outTokens)
 		if class == "hard" || class == "soft" {
@@ -1394,13 +1426,27 @@ func startGuardWorker(ctx context.Context, store *stateStore) {
 				pol := store.policy()
 				now := float64(time.Now().Unix())
 				for _, n := range store.listNodes() {
+					// Account-window cool-off expiry: time-based restore, never
+					// probe-based, so a marked exit needs no traffic to come back.
+					if n.DisabledByNodeWindow && n.NodeWindowUntil > 0 && now >= n.NodeWindowUntil {
+						if store.clearNodeWindow(n.ID) {
+							store.appendEvent(guardEvent{
+								Event:    "node_window_restored",
+								NodeID:   n.ID,
+								NodeName: n.Name,
+								Reason:   "账号窗口冷却到期，自动恢复",
+							})
+						}
+						continue
+					}
 					if n.DisabledByGuard && n.QuarantinedUntil > 0 && now >= n.QuarantinedUntil {
 						_, _ = runNodeQuality(store, n.ID)
 						continue
 					}
 					if pol.Mode == "active" || pol.Mode == "hybrid" {
-						// light active cadence per node via last probe
-						if n.Enabled && !n.DisabledByGuard && (n.LastProbeAt == 0 || now-n.LastProbeAt >= float64(pol.ActiveIntervalSec)) {
+						// light active cadence per node via last probe; cooled-off
+						// nodes are not probed so no probe tokens are burned.
+						if nodeSchedulable(n) && (n.LastProbeAt == 0 || now-n.LastProbeAt >= float64(pol.ActiveIntervalSec)) {
 							// don't stampede — one per tick
 							_, _ = runNodeQuality(store, n.ID)
 							break
