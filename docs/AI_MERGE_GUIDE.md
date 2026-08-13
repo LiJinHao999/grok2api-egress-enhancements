@@ -4,6 +4,8 @@
 
 本页只描述 Grok2API 补丁移植。纯 CPA 插件的安装、代理规划、账号容量、隔离恢复和强制住宅 IP 轮换请单独阅读 [CPA 出口守护 AI 部署与运维指南](../cpa-plugin/AI_USAGE_GUIDE.md)，不要把两套运行时混为一体。
 
+如果目标部署包含家宽 sticky、Resin 动态池或 Mihomo，请先阅读[推荐出口部署方式](./RECOMMENDED_DEPLOYMENT.md)。它定义了上游分片、listener、`fixed`/`pool` 节点语义，以及轮换和质量复测边界；本页的补丁合并规则不能替代这些部署约束。
+
 ## 推荐提示词
 
 ```text
