@@ -4,11 +4,14 @@ This is an unofficial enhancement distribution for [chenyme/grok2api](https://gi
 
 Current baseline:
 
-- Upstream release: `v3.0.11`
-- Upstream commit: `090104504b403d65675a01dab9c92b3a235ee832`
-- Patch commit: `334dbe0f01ea0294318856873136c4196f835a04`
-- Upstream draft PR: [chenyme/grok2api#837](https://github.com/chenyme/grok2api/pull/837)
-- Runnable fork: [lij768423-svg/grok2api](https://github.com/lij768423-svg/grok2api/tree/agent/egress-resilience-quality-guard)
+- Upstream release: `v3.1.2` (quality guard and probe-wait recovery are already upstream)
+- Upstream commit: `6e9eef7619b83899c82e24353177c8a819f15914`
+- Today's delta: **degraded-account monitor** on the quality-guard page (filters, timeline, bulk mute/unmute)
+- Patch file: `patches/0002-feat-add-degraded-account-monitor.patch`
+- Upstream PR: [chenyme/grok2api#907](https://github.com/chenyme/grok2api/pull/907)
+- Runnable fork: [lij768423-svg/grok2api](https://github.com/lij768423-svg/grok2api) `main`
+
+If you are still on `v3.0.11`, keep using the legacy patch `patches/0001-feat-add-egress-recovery-and-quality-guard.patch` (closed [#837](https://github.com/chenyme/grok2api/pull/837)).
 
 ## Features
 
@@ -39,6 +42,14 @@ Current baseline:
 - Automatically discover proxied Build nodes when `QUALITY_GUARD_NODE_IDS` is empty while publishing resolved IDs for compatibility with older admin pages.
 - Python sidecar, Docker Compose and systemd examples, security notes, and bilingual documentation.
 
+### Degraded-account monitor (v3.1.2 delta)
+
+- Adds a Quality Guard tab that classifies user streaming requests (excluding quality-test probes) as `buffered_burst` / `soft_tps` / `hard_tps`.
+- Same panel formula: `outputTokens * 1000 / (durationMs - firstTokenMs)`, defaults soft 500 / hard 1000; windows shorter than 1s that reach soft are `buffered_burst`.
+- Windows: 1h / 6h / 24h / 7d. Filter by email/ID, schedule status, class, and hit count.
+- Timeline bars grow from the bottom. Any row is selectable; bulk mute or unmute uses the existing account batch API with string `ids`.
+- Endpoint: `GET /api/admin/v1/request-audits/degrade-accounts`.
+
 ### CPA-native egress guard plugin
 
 `cpa-plugin/` is now the **v1.0.8 pure-CPA plugin**. It has no runtime dependency on Grok2API: it uses CPA Host APIs for auth files and usage events, binds `proxy_url` stickily to egress nodes, and provides node CRUD, line-based bulk import, batch operations, connectivity/real-model tests, quarantine migration, hot-reloadable policy, statistics, events, and light/dark themes. In v1.0.8, store-install registration no longer blocks on a full auth scan (fixes plugins stuck as inactive/unregistered with many accounts). In v1.0.7, CPA scheduling skips quarantined or cooling egresses; credential, quota, and permission failures are recorded as ignored instead of quarantining a node; migrations are read-back verified; and an optional allowlisted internal IP-rotation webhook is available. See [cpa-plugin/README.md](./cpa-plugin/README.md) for build instructions and the Chinese [AI deployment and operations guide](./cpa-plugin/AI_USAGE_GUIDE.md) for proxy topology, capacity planning, quarantine recovery, and forced residential-IP rotation.
@@ -56,11 +67,11 @@ From a clean grok2api checkout:
 
 ```sh
 git fetch --tags origin
-git checkout -b egress-enhancements v3.0.11
-git am --3way /path/to/grok2api-egress-enhancements/patches/0001-feat-add-egress-recovery-and-quality-guard.patch
+git checkout -b egress-enhancements v3.1.2
+git am --3way /path/to/grok2api-egress-enhancements/patches/0002-feat-add-degraded-account-monitor.patch
 ```
 
-For newer upstream versions, follow [AI_MERGE_GUIDE.md](./docs/AI_MERGE_GUIDE.md) and resolve conflicts according to the documented invariants instead of replacing newer files wholesale.
+On `v3.0.11`, apply `patches/0001-feat-add-egress-recovery-and-quality-guard.patch` instead. For newer upstream versions, follow [AI_MERGE_GUIDE.md](./docs/AI_MERGE_GUIDE.md) and resolve conflicts according to the documented invariants instead of replacing newer files wholesale.
 
 ## Validate
 

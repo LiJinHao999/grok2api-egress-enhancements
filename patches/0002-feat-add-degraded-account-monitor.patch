@@ -1,0 +1,1276 @@
+From 89beb375584346e3ab06eb9df1a1b9aeb7dea943 Mon Sep 17 00:00:00 2001
+From: lij768423-svg <lij768423@gmail.com>
+Date: Thu, 13 Aug 2026 16:01:30 +0800
+Subject: [PATCH] feat: add degraded-account monitor to quality guard
+
+Surface streaming TPS anomalies by account on the quality-guard page
+so operators can filter repeat offenders and mute or unmute them with
+the existing account batch API.
+
+Classification matches the panel formula: output tokens over generation
+time, with buffered_burst for short windows.
+---
+ backend/internal/application/audit/degrade.go | 331 ++++++++++++++++++
+ .../application/audit/degrade_test.go         |  64 ++++
+ backend/internal/domain/audit/degrade.go      |  36 ++
+ backend/internal/domain/audit/degrade_test.go |  27 ++
+ .../relational/audit_repository.go            |  62 ++++
+ backend/internal/repository/audit.go          |  26 ++
+ .../internal/transport/http/audit/handler.go  | 100 ++++++
+ .../transport/http/audit/handler_test.go      |  37 ++
+ .../quality-guard/degrade-accounts-panel.tsx  | 310 ++++++++++++++++
+ .../quality-guard/quality-guard-api.ts        |  69 +++-
+ .../quality-guard/quality-guard-page.tsx      |  13 +
+ frontend/src/shared/i18n/index.ts             |  35 +-
+ 12 files changed, 1108 insertions(+), 2 deletions(-)
+ create mode 100644 backend/internal/application/audit/degrade.go
+ create mode 100644 backend/internal/application/audit/degrade_test.go
+ create mode 100644 backend/internal/domain/audit/degrade.go
+ create mode 100644 backend/internal/domain/audit/degrade_test.go
+ create mode 100644 frontend/src/features/quality-guard/degrade-accounts-panel.tsx
+
+diff --git a/backend/internal/application/audit/degrade.go b/backend/internal/application/audit/degrade.go
+new file mode 100644
+index 0000000..9675871
+--- /dev/null
++++ b/backend/internal/application/audit/degrade.go
+@@ -0,0 +1,331 @@
++package audit
++
++import (
++	"context"
++	"math"
++	"sort"
++	"time"
++
++	auditdomain "github.com/chenyme/grok2api/backend/internal/domain/audit"
++	"github.com/chenyme/grok2api/backend/internal/repository"
++)
++
++const (
++	degradeWindow1h       = "1h"
++	degradeWindow6h       = "6h"
++	degradeWindow24h      = "24h"
++	degradeWindow7d       = "7d"
++	degradeEventLimit     = 20_000
++	degradeRecentEventCap = 80
++)
++
++type DegradeThresholds struct {
++	SoftTPS  float64
++	HardTPS  float64
++	MinGenMS int64
++	MinOut   int64
++}
++
++type DegradeSummary struct {
++	Window      string
++	GeneratedAt time.Time
++	Thresholds  DegradeThresholds
++	Totals      DegradeTotals
++	Series      []DegradeBucket
++	Nodes       []DegradeNode
++	Accounts    []DegradeAccount
++	Events      []DegradeEventView
++}
++
++type DegradeTotals struct {
++	Hits         int
++	Accounts     int
++	StillEnabled int
++	Disabled     int
++	Hard         int
++	Soft         int
++	Burst        int
++	MaxTPS       float64
++}
++
++type DegradeBucket struct {
++	Label  string `json:"label"`
++	Count  int    `json:"count"`
++	Severe int    `json:"severe"`
++}
++
++type DegradeNode struct {
++	Name     string  `json:"name"`
++	Hits     int     `json:"hits"`
++	Accounts int     `json:"accounts"`
++	MaxTPS   float64 `json:"maxTPS"`
++}
++
++type DegradeAccount struct {
++	ID      uint64
++	Name    string
++	Email   string
++	Hits    int
++	MaxTPS  float64
++	Classes map[string]int
++	Nodes   []string
++	Last    time.Time
++	Enabled bool
++	BFS     int
++	Found   bool
++}
++
++type DegradeEventView struct {
++	ID           uint64
++	RequestID    string
++	AccountID    *uint64
++	AccountName  string
++	NodeName     string
++	OutputTokens int64
++	TPS          float64
++	Class        string
++	CreatedAt    time.Time
++	Model        string
++}
++
++func (s *Service) DegradeSummary(ctx context.Context, window string, thresholds DegradeThresholds) (DegradeSummary, error) {
++	window, start, end, err := resolveDegradeWindow(window, s.now().UTC())
++	if err != nil {
++		return DegradeSummary{}, err
++	}
++	thresholds = normalizeDegradeThresholds(thresholds)
++	events, err := s.audits.ListDegradeEvents(ctx, repository.DegradeEventQuery{
++		Start: start, End: end, MinOutputTokens: thresholds.MinOut, Limit: degradeEventLimit,
++	})
++	if err != nil {
++		return DegradeSummary{}, err
++	}
++	return buildDegradeSummary(window, end, thresholds, events), nil
++}
++
++func resolveDegradeWindow(value string, now time.Time) (string, time.Time, time.Time, error) {
++	if value == "" {
++		value = degradeWindow24h
++	}
++	var duration time.Duration
++	switch value {
++	case degradeWindow1h:
++		duration = time.Hour
++	case degradeWindow6h:
++		duration = 6 * time.Hour
++	case degradeWindow24h:
++		duration = 24 * time.Hour
++	case degradeWindow7d:
++		duration = 7 * 24 * time.Hour
++	default:
++		return "", time.Time{}, time.Time{}, ErrInvalidPeriod
++	}
++	return value, now.Add(-duration), now, nil
++}
++
++func normalizeDegradeThresholds(value DegradeThresholds) DegradeThresholds {
++	if value.SoftTPS <= 0 || math.IsNaN(value.SoftTPS) || math.IsInf(value.SoftTPS, 0) {
++		value.SoftTPS = auditdomain.DefaultDegradeSoftTPS
++	}
++	if value.HardTPS <= 0 || math.IsNaN(value.HardTPS) || math.IsInf(value.HardTPS, 0) {
++		value.HardTPS = auditdomain.DefaultDegradeHardTPS
++	}
++	if value.SoftTPS >= value.HardTPS {
++		value.SoftTPS = auditdomain.DefaultDegradeSoftTPS
++		value.HardTPS = auditdomain.DefaultDegradeHardTPS
++	}
++	if value.MinGenMS <= 0 {
++		value.MinGenMS = auditdomain.DefaultDegradeMinGenMS
++	}
++	if value.MinOut <= 0 {
++		value.MinOut = auditdomain.DefaultDegradeMinOutput
++	}
++	return value
++}
++
++func buildDegradeSummary(window string, now time.Time, thresholds DegradeThresholds, events []repository.DegradeEvent) DegradeSummary {
++	type accAgg struct {
++		hits    int
++		maxTPS  float64
++		classes map[string]int
++		nodes   map[string]struct{}
++		last    time.Time
++		name    string
++		email   string
++		enabled bool
++		found   bool
++		bfs     int
++	}
++	type nodeAgg struct {
++		hits     int
++		accounts map[uint64]struct{}
++		maxTPS   float64
++	}
++	accounts := map[uint64]*accAgg{}
++	nodes := map[string]*nodeAgg{}
++	classCounts := map[string]int{}
++	var classified []DegradeEventView
++	var maxTPS float64
++
++	for _, event := range events {
++		class, tps, _ := auditdomain.ClassifyOutputSpeed(event.OutputTokens, event.FirstTokenMS, event.DurationMS, thresholds.SoftTPS, thresholds.HardTPS, thresholds.MinGenMS)
++		if class == "" {
++			continue
++		}
++		classCounts[class]++
++		if tps > maxTPS {
++			maxTPS = tps
++		}
++		nodeName := event.EgressNodeName
++		if nodeName == "" {
++			nodeName = "?"
++		}
++		classified = append(classified, DegradeEventView{
++			ID: event.ID, RequestID: event.RequestID, AccountID: event.AccountID, AccountName: event.AccountName,
++			NodeName: nodeName, OutputTokens: event.OutputTokens, TPS: math.Round(tps*100) / 100, Class: class,
++			CreatedAt: event.CreatedAt, Model: event.Model,
++		})
++		if event.AccountID == nil || *event.AccountID == 0 {
++			continue
++		}
++		id := *event.AccountID
++		rec := accounts[id]
++		if rec == nil {
++			rec = &accAgg{classes: map[string]int{}, nodes: map[string]struct{}{}}
++			accounts[id] = rec
++		}
++		rec.hits++
++		if tps > rec.maxTPS {
++			rec.maxTPS = tps
++		}
++		rec.classes[class]++
++		rec.nodes[nodeName] = struct{}{}
++		if event.CreatedAt.After(rec.last) {
++			rec.last = event.CreatedAt
++			rec.name = event.AccountName
++		}
++		if rec.name == "" {
++			rec.name = event.AccountName
++		}
++		if event.Email != "" {
++			rec.email = event.Email
++		}
++		if event.Enabled != nil {
++			rec.enabled = *event.Enabled
++			rec.found = true
++		}
++		if event.BuildBotFlagSource > rec.bfs {
++			rec.bfs = event.BuildBotFlagSource
++		}
++		nd := nodes[nodeName]
++		if nd == nil {
++			nd = &nodeAgg{accounts: map[uint64]struct{}{}}
++			nodes[nodeName] = nd
++		}
++		nd.hits++
++		nd.accounts[id] = struct{}{}
++		if tps > nd.maxTPS {
++			nd.maxTPS = tps
++		}
++	}
++
++	accountViews := make([]DegradeAccount, 0, len(accounts))
++	enabled, disabled := 0, 0
++	for id, rec := range accounts {
++		if rec.found && rec.enabled {
++			enabled++
++		} else {
++			disabled++
++		}
++		nodeNames := make([]string, 0, len(rec.nodes))
++		for name := range rec.nodes {
++			nodeNames = append(nodeNames, name)
++		}
++		sort.Strings(nodeNames)
++		email := rec.email
++		if email == "" {
++			email = rec.name
++		}
++		accountViews = append(accountViews, DegradeAccount{
++			ID: id, Name: rec.name, Email: email, Hits: rec.hits, MaxTPS: math.Round(rec.maxTPS*10) / 10,
++			Classes: rec.classes, Nodes: nodeNames, Last: rec.last, Enabled: rec.found && rec.enabled, BFS: rec.bfs, Found: rec.found,
++		})
++	}
++	sort.Slice(accountViews, func(i, j int) bool {
++		if accountViews[i].Hits != accountViews[j].Hits {
++			return accountViews[i].Hits > accountViews[j].Hits
++		}
++		return accountViews[i].MaxTPS > accountViews[j].MaxTPS
++	})
++
++	nodeViews := make([]DegradeNode, 0, len(nodes))
++	for name, rec := range nodes {
++		nodeViews = append(nodeViews, DegradeNode{Name: name, Hits: rec.hits, Accounts: len(rec.accounts), MaxTPS: math.Round(rec.maxTPS*10) / 10})
++	}
++	sort.Slice(nodeViews, func(i, j int) bool { return nodeViews[i].Hits > nodeViews[j].Hits })
++
++	recent := classified
++	if len(recent) > degradeRecentEventCap {
++		recent = recent[:degradeRecentEventCap]
++	}
++
++	return DegradeSummary{
++		Window: window, GeneratedAt: now, Thresholds: thresholds,
++		Totals: DegradeTotals{
++			Hits: len(classified), Accounts: len(accounts), StillEnabled: enabled, Disabled: disabled,
++			Hard: classCounts[auditdomain.DegradeClassHard], Soft: classCounts[auditdomain.DegradeClassSoft],
++			Burst: classCounts[auditdomain.DegradeClassBurst], MaxTPS: maxTPS,
++		},
++		Series: bucketDegradeSeries(classified, window, now),
++		Nodes:  nodeViews, Accounts: accountViews, Events: recent,
++	}
++}
++
++func bucketDegradeSeries(events []DegradeEventView, window string, now time.Time) []DegradeBucket {
++	var step time.Duration
++	var start time.Time
++	var label func(time.Time) string
++	switch window {
++	case degradeWindow7d:
++		step = 2 * time.Hour
++		start = now.Add(-7 * 24 * time.Hour)
++		label = func(t time.Time) string { return t.Format("01-02 15:00") }
++	case degradeWindow24h:
++		step = time.Hour
++		start = now.Add(-24 * time.Hour)
++		label = func(t time.Time) string { return t.Format("15:00") }
++	case degradeWindow6h:
++		step = 20 * time.Minute
++		start = now.Add(-6 * time.Hour)
++		label = func(t time.Time) string { return t.Format("15:04") }
++	default:
++		step = 5 * time.Minute
++		start = now.Add(-time.Hour)
++		label = func(t time.Time) string { return t.Format("15:04") }
++	}
++	var buckets []time.Time
++	for cursor := start; cursor.Before(now); cursor = cursor.Add(step) {
++		buckets = append(buckets, cursor)
++	}
++	if len(buckets) == 0 {
++		return nil
++	}
++	counts := make([]int, len(buckets))
++	severe := make([]int, len(buckets))
++	stepSeconds := step.Seconds()
++	for _, event := range events {
++		idx := int(event.CreatedAt.Sub(start).Seconds() / stepSeconds)
++		if idx < 0 || idx >= len(counts) {
++			continue
++		}
++		counts[idx]++
++		if event.Class == auditdomain.DegradeClassHard || event.Class == auditdomain.DegradeClassBurst {
++			severe[idx]++
++		}
++	}
++	out := make([]DegradeBucket, len(buckets))
++	for i, bucket := range buckets {
++		out[i] = DegradeBucket{Label: label(bucket), Count: counts[i], Severe: severe[i]}
++	}
++	return out
++}
+diff --git a/backend/internal/application/audit/degrade_test.go b/backend/internal/application/audit/degrade_test.go
+new file mode 100644
+index 0000000..24d40fe
+--- /dev/null
++++ b/backend/internal/application/audit/degrade_test.go
+@@ -0,0 +1,64 @@
++package audit
++
++import (
++	"context"
++	"log/slog"
++	"path/filepath"
++	"testing"
++	"time"
++
++	auditdomain "github.com/chenyme/grok2api/backend/internal/domain/audit"
++	"github.com/chenyme/grok2api/backend/internal/infra/persistence/relational"
++)
++
++func TestDegradeSummaryClassifiesStreamingAnomalies(t *testing.T) {
++	ctx := context.Background()
++	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "degrade.db"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer database.Close()
++	if err := database.InitializeSchema(ctx); err != nil {
++		t.Fatal(err)
++	}
++	repo := relational.NewAuditRepository(database)
++	now := time.Now().UTC()
++	first := int64(100)
++	accountID := uint64(7)
++	records := []auditdomain.Record{
++		{RequestID: "hard-1", ClientKeyID: 1, ModelRouteID: 1, Provider: "grok_build", AccountID: &accountID, AccountName: "hot", EgressNodeName: "node-a", StatusCode: 200, Streaming: true, OutputTokens: 2000, FirstTokenMS: &first, DurationMS: 1100, CreatedAt: now.Add(-time.Hour)},
++		{RequestID: "quality_skip_me", ClientKeyID: 1, ModelRouteID: 1, Provider: "grok_build", AccountID: &accountID, StatusCode: 200, Streaming: true, OutputTokens: 2000, FirstTokenMS: &first, DurationMS: 1100, CreatedAt: now.Add(-time.Hour)},
++		{RequestID: "non-stream", ClientKeyID: 1, ModelRouteID: 1, Provider: "grok_build", AccountID: &accountID, StatusCode: 200, Streaming: false, OutputTokens: 2000, FirstTokenMS: &first, DurationMS: 1100, CreatedAt: now.Add(-time.Hour)},
++	}
++	if err := repo.CreateBatch(ctx, records); err != nil {
++		t.Fatal(err)
++	}
++	service := NewService(repo, slog.Default(), 8, 4, time.Second)
++	service.now = func() time.Time { return now }
++	summary, err := service.DegradeSummary(ctx, "24h", DegradeThresholds{SoftTPS: 500, HardTPS: 1000})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if summary.Totals.Hits != 1 || summary.Totals.Accounts != 1 || summary.Totals.Hard != 1 {
++		t.Fatalf("totals = %#v", summary.Totals)
++	}
++	if len(summary.Accounts) != 1 || summary.Accounts[0].ID != 7 || summary.Accounts[0].Hits != 1 {
++		t.Fatalf("accounts = %#v", summary.Accounts)
++	}
++}
++
++func TestDegradeSummaryRejectsUnknownWindow(t *testing.T) {
++	ctx := context.Background()
++	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "degrade-window.db"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer database.Close()
++	if err := database.InitializeSchema(ctx); err != nil {
++		t.Fatal(err)
++	}
++	service := NewService(relational.NewAuditRepository(database), slog.Default(), 8, 4, time.Second)
++	if _, err := service.DegradeSummary(ctx, "3h", DegradeThresholds{}); err != ErrInvalidPeriod {
++		t.Fatalf("error = %v", err)
++	}
++}
+diff --git a/backend/internal/domain/audit/degrade.go b/backend/internal/domain/audit/degrade.go
+new file mode 100644
+index 0000000..f1b5711
+--- /dev/null
++++ b/backend/internal/domain/audit/degrade.go
+@@ -0,0 +1,36 @@
++package audit
++
++const (
++	DegradeClassBurst = "buffered_burst"
++	DegradeClassSoft  = "soft_tps"
++	DegradeClassHard  = "hard_tps"
++)
++
++const (
++	DefaultDegradeSoftTPS   = 500.0
++	DefaultDegradeHardTPS   = 1000.0
++	DefaultDegradeMinGenMS  = int64(1000)
++	DefaultDegradeMinOutput = int64(32)
++)
++
++// ClassifyOutputSpeed matches the quality-guard panel formula:
++// output tokens / (durationMs - firstTokenMs). Short generation windows with
++// a soft-or-higher rate are buffered_burst; otherwise the hard and soft
++// thresholds apply in that order.
++func ClassifyOutputSpeed(outputTokens, firstTokenMS, durationMS int64, softTPS, hardTPS float64, minGenMS int64) (class string, tps float64, genMS int64) {
++	genMS = durationMS - firstTokenMS
++	if genMS <= 0 || outputTokens <= 0 {
++		return "", 0, genMS
++	}
++	tps = float64(outputTokens) * 1000 / float64(genMS)
++	if minGenMS > 0 && genMS < minGenMS && tps >= softTPS {
++		return DegradeClassBurst, tps, genMS
++	}
++	if tps >= hardTPS {
++		return DegradeClassHard, tps, genMS
++	}
++	if tps >= softTPS {
++		return DegradeClassSoft, tps, genMS
++	}
++	return "", tps, genMS
++}
+diff --git a/backend/internal/domain/audit/degrade_test.go b/backend/internal/domain/audit/degrade_test.go
+new file mode 100644
+index 0000000..24ac8c8
+--- /dev/null
++++ b/backend/internal/domain/audit/degrade_test.go
+@@ -0,0 +1,27 @@
++package audit
++
++import "testing"
++
++func TestClassifyOutputSpeed(t *testing.T) {
++	tests := []struct {
++		name                    string
++		output, first, duration int64
++		soft, hard              float64
++		minGen                  int64
++		wantClass               string
++	}{
++		{name: "hard", output: 2000, first: 200, duration: 1200, soft: 500, hard: 1000, minGen: 1000, wantClass: DegradeClassHard},
++		{name: "soft", output: 600, first: 200, duration: 1400, soft: 500, hard: 1000, minGen: 1000, wantClass: DegradeClassSoft},
++		{name: "burst short window", output: 200, first: 50, duration: 250, soft: 500, hard: 1000, minGen: 1000, wantClass: DegradeClassBurst},
++		{name: "healthy", output: 100, first: 200, duration: 2200, soft: 500, hard: 1000, minGen: 1000, wantClass: ""},
++		{name: "zero generation", output: 100, first: 500, duration: 500, soft: 500, hard: 1000, minGen: 1000, wantClass: ""},
++	}
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			class, _, _ := ClassifyOutputSpeed(test.output, test.first, test.duration, test.soft, test.hard, test.minGen)
++			if class != test.wantClass {
++				t.Fatalf("class = %q, want %q", class, test.wantClass)
++			}
++		})
++	}
++}
+diff --git a/backend/internal/infra/persistence/relational/audit_repository.go b/backend/internal/infra/persistence/relational/audit_repository.go
+index 820824e..6b2e8cd 100644
+--- a/backend/internal/infra/persistence/relational/audit_repository.go
++++ b/backend/internal/infra/persistence/relational/audit_repository.go
+@@ -683,6 +683,68 @@ func (r *AuditRepository) Summarize(ctx context.Context, input repository.AuditS
+ 	return result, nil
+ }
+ 
++const degradeEventScanLimit = 20_000
++
++type degradeEventRow struct {
++	ID                 uint64    `gorm:"column:id"`
++	RequestID          string    `gorm:"column:request_id"`
++	AccountID          *uint64   `gorm:"column:account_id"`
++	AccountName        string    `gorm:"column:account_name"`
++	Email              string    `gorm:"column:email"`
++	Enabled            *bool     `gorm:"column:enabled"`
++	BuildBotFlagSource int       `gorm:"column:build_bot_flag_source"`
++	EgressNodeID       *uint64   `gorm:"column:egress_node_id"`
++	EgressNodeName     string    `gorm:"column:egress_node_name"`
++	OutputTokens       int64     `gorm:"column:output_tokens"`
++	FirstTokenMS       int64     `gorm:"column:first_token_ms"`
++	DurationMS         int64     `gorm:"column:duration_ms"`
++	CreatedAt          time.Time `gorm:"column:created_at"`
++	Model              string    `gorm:"column:model_upstream_model"`
++}
++
++func (r *AuditRepository) ListDegradeEvents(ctx context.Context, input repository.DegradeEventQuery) ([]repository.DegradeEvent, error) {
++	limit := input.Limit
++	if limit <= 0 || limit > degradeEventScanLimit {
++		limit = degradeEventScanLimit
++	}
++	minOut := input.MinOutputTokens
++	if minOut <= 0 {
++		minOut = audit.DefaultDegradeMinOutput
++	}
++	var rows []degradeEventRow
++	query := r.db.db.WithContext(ctx).Table("request_audits AS a").
++		Select("a.id, a.request_id, a.account_id, a.account_name, a.egress_node_id, a.egress_node_name, a.output_tokens, a.first_token_ms, a.duration_ms, a.created_at, a.model_upstream_model, p.email, p.enabled, COALESCE(c.build_bot_flag_source, 0) AS build_bot_flag_source").
++		Joins("LEFT JOIN provider_accounts p ON p.id = a.account_id").
++		Joins("LEFT JOIN account_credentials c ON c.account_id = a.account_id").
++		Where("a.provider = ?", "grok_build").
++		Where("a.streaming = ?", true).
++		Where(auditSuccessPredicate).
++		Where("a.output_tokens >= ?", minOut).
++		Where("a.first_token_ms IS NOT NULL").
++		Where("a.duration_ms > a.first_token_ms").
++		Where("a.request_id NOT LIKE ?", "quality_%")
++	if !input.Start.IsZero() {
++		query = query.Where("a.created_at >= ?", input.Start)
++	}
++	if !input.End.IsZero() {
++		query = query.Where("a.created_at < ?", input.End)
++	}
++	if err := query.Order("a.created_at DESC").Limit(limit).Scan(&rows).Error; err != nil {
++		return nil, err
++	}
++	out := make([]repository.DegradeEvent, 0, len(rows))
++	for _, row := range rows {
++		out = append(out, repository.DegradeEvent{
++			ID: row.ID, RequestID: row.RequestID, AccountID: row.AccountID, AccountName: row.AccountName,
++			Email: row.Email, Enabled: row.Enabled, BuildBotFlagSource: row.BuildBotFlagSource,
++			EgressNodeID: row.EgressNodeID, EgressNodeName: row.EgressNodeName,
++			OutputTokens: row.OutputTokens, FirstTokenMS: row.FirstTokenMS, DurationMS: row.DurationMS,
++			CreatedAt: row.CreatedAt, Model: row.Model,
++		})
++	}
++	return out, nil
++}
++
+ func applyAuditQuery(query *gorm.DB, search string, start, end time.Time, filter repository.AuditListFilter) *gorm.DB {
+ 	if value := strings.TrimSpace(search); value != "" {
+ 		pattern := "%" + strings.ToLower(value) + "%"
+diff --git a/backend/internal/repository/audit.go b/backend/internal/repository/audit.go
+index a29e56d..4be019a 100644
+--- a/backend/internal/repository/audit.go
++++ b/backend/internal/repository/audit.go
+@@ -16,4 +16,30 @@ type AuditRepository interface {
+ 	ListCursor(ctx context.Context, query AuditCursorQuery) ([]audit.Record, bool, error)
+ 	Summarize(ctx context.Context, query AuditSummaryQuery) (audit.Summary, error)
+ 	SumTokensByAccountsSince(ctx context.Context, accountIDs []uint64, since time.Time) (map[uint64]int64, error)
++	ListDegradeEvents(ctx context.Context, query DegradeEventQuery) ([]DegradeEvent, error)
++}
++
++type DegradeEventQuery struct {
++	Start           time.Time
++	End             time.Time
++	MinOutputTokens int64
++	Limit           int
++}
++
++// DegradeEvent is a slim streaming-success audit plus optional account flags.
++type DegradeEvent struct {
++	ID                 uint64
++	RequestID          string
++	AccountID          *uint64
++	AccountName        string
++	Email              string
++	Enabled            *bool
++	BuildBotFlagSource int
++	EgressNodeID       *uint64
++	EgressNodeName     string
++	OutputTokens       int64
++	FirstTokenMS       int64
++	DurationMS         int64
++	CreatedAt          time.Time
++	Model              string
+ }
+diff --git a/backend/internal/transport/http/audit/handler.go b/backend/internal/transport/http/audit/handler.go
+index d3dd2f0..ccdb450 100644
+--- a/backend/internal/transport/http/audit/handler.go
++++ b/backend/internal/transport/http/audit/handler.go
+@@ -29,6 +29,7 @@ func NewQualityGuardHandler(service *auditapp.Service, clientKeyID uint64) *Hand
+ func (h *Handler) Register(router *gin.RouterGroup) {
+ 	router.GET("/request-audits", h.list)
+ 	router.GET("/request-audits/summary", h.summary)
++	router.GET("/request-audits/degrade-accounts", h.degradeAccounts)
+ 	router.GET("/request-audits/:id", h.get)
+ }
+ 
+@@ -333,6 +334,105 @@ func (h *Handler) summary(c *gin.Context) {
+ 	})
+ }
+ 
++func (h *Handler) degradeAccounts(c *gin.Context) {
++	softTPS, _ := strconv.ParseFloat(c.Query("softTPS"), 64)
++	hardTPS, _ := strconv.ParseFloat(c.Query("hardTPS"), 64)
++	result, err := h.service.DegradeSummary(c.Request.Context(), c.DefaultQuery("window", "24h"), auditapp.DegradeThresholds{SoftTPS: softTPS, HardTPS: hardTPS})
++	if errors.Is(err, auditapp.ErrInvalidPeriod) {
++		response.Error(c, http.StatusBadRequest, "invalidAuditPeriod", "window 仅支持 1h、6h、24h、7d")
++		return
++	}
++	if err != nil {
++		response.Error(c, http.StatusInternalServerError, "auditDegradeFailed", "读取降智账号失败")
++		return
++	}
++	accounts := make([]degradeAccountResponse, 0, len(result.Accounts))
++	for _, account := range result.Accounts {
++		accounts = append(accounts, degradeAccountResponse{
++			ID: strconv.FormatUint(account.ID, 10), Name: account.Name, Email: account.Email, Hits: account.Hits,
++			MaxTPS: account.MaxTPS, Classes: account.Classes, Nodes: account.Nodes, Last: account.Last,
++			Enabled: account.Enabled, BFS: account.BFS,
++		})
++	}
++	events := make([]degradeEventResponse, 0, len(result.Events))
++	for _, event := range result.Events {
++		item := degradeEventResponse{
++			ID: strconv.FormatUint(event.ID, 10), RequestID: event.RequestID, AccountName: event.AccountName,
++			NodeName: event.NodeName, OutputTokens: event.OutputTokens, TPS: event.TPS, Class: event.Class,
++			CreatedAt: event.CreatedAt, Model: event.Model,
++		}
++		if event.AccountID != nil {
++			id := strconv.FormatUint(*event.AccountID, 10)
++			item.AccountID = &id
++		}
++		events = append(events, item)
++	}
++	response.Success(c, http.StatusOK, degradeSummaryResponse{
++		Window: result.Window, GeneratedAt: result.GeneratedAt,
++		Thresholds: degradeThresholdsResponse{SoftTPS: result.Thresholds.SoftTPS, HardTPS: result.Thresholds.HardTPS, MinGenMS: result.Thresholds.MinGenMS, MinOut: result.Thresholds.MinOut},
++		Totals: degradeTotalsResponse{
++			Hits: result.Totals.Hits, Accounts: result.Totals.Accounts, StillEnabled: result.Totals.StillEnabled,
++			Disabled: result.Totals.Disabled, Hard: result.Totals.Hard, Soft: result.Totals.Soft, Burst: result.Totals.Burst, MaxTPS: result.Totals.MaxTPS,
++		},
++		Series: result.Series, Nodes: result.Nodes, Accounts: accounts, Events: events,
++	})
++}
++
++type degradeSummaryResponse struct {
++	Window      string                    `json:"window"`
++	GeneratedAt time.Time                 `json:"generatedAt"`
++	Thresholds  degradeThresholdsResponse `json:"thresholds"`
++	Totals      degradeTotalsResponse     `json:"totals"`
++	Series      []auditapp.DegradeBucket  `json:"series"`
++	Nodes       []auditapp.DegradeNode    `json:"nodes"`
++	Accounts    []degradeAccountResponse  `json:"accounts"`
++	Events      []degradeEventResponse    `json:"events"`
++}
++
++type degradeThresholdsResponse struct {
++	SoftTPS  float64 `json:"softTPS"`
++	HardTPS  float64 `json:"hardTPS"`
++	MinGenMS int64   `json:"minGenMs"`
++	MinOut   int64   `json:"minOutputTokens"`
++}
++
++type degradeTotalsResponse struct {
++	Hits         int     `json:"hits"`
++	Accounts     int     `json:"accounts"`
++	StillEnabled int     `json:"stillEnabled"`
++	Disabled     int     `json:"disabled"`
++	Hard         int     `json:"hard"`
++	Soft         int     `json:"soft"`
++	Burst        int     `json:"burst"`
++	MaxTPS       float64 `json:"maxTPS"`
++}
++
++type degradeAccountResponse struct {
++	ID      string         `json:"id"`
++	Name    string         `json:"name"`
++	Email   string         `json:"email"`
++	Hits    int            `json:"hits"`
++	MaxTPS  float64        `json:"maxTPS"`
++	Classes map[string]int `json:"classes"`
++	Nodes   []string       `json:"nodes"`
++	Last    time.Time      `json:"last"`
++	Enabled bool           `json:"enabled"`
++	BFS     int            `json:"bfs"`
++}
++
++type degradeEventResponse struct {
++	ID           string    `json:"id"`
++	RequestID    string    `json:"requestId"`
++	AccountID    *string   `json:"accountId,omitempty"`
++	AccountName  string    `json:"accountName"`
++	NodeName     string    `json:"nodeName"`
++	OutputTokens int64     `json:"outputTokens"`
++	TPS          float64   `json:"tps"`
++	Class        string    `json:"class"`
++	CreatedAt    time.Time `json:"createdAt"`
++	Model        string    `json:"model"`
++}
++
+ func newListFilter(c *gin.Context) auditapp.ListFilter {
+ 	return auditapp.ListFilter{
+ 		Model: c.Query("model"), Status: c.Query("status"), Mode: c.Query("mode"),
+diff --git a/backend/internal/transport/http/audit/handler_test.go b/backend/internal/transport/http/audit/handler_test.go
+index 0a9a682..7e139f0 100644
+--- a/backend/internal/transport/http/audit/handler_test.go
++++ b/backend/internal/transport/http/audit/handler_test.go
+@@ -163,3 +163,40 @@ func TestAuditResponseExplainsBillingWithoutChangingStoredTotal(t *testing.T) {
+ 		t.Fatalf("historical billing = %#v", historical.Billing)
+ 	}
+ }
++
++func TestDegradeAccountsListsHardHitsAndRejectsUnknownWindow(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	ctx := context.Background()
++	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "degrade-handler.db"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer database.Close()
++	if err := database.InitializeSchema(ctx); err != nil {
++		t.Fatal(err)
++	}
++	repo := relational.NewAuditRepository(database)
++	now := time.Now().UTC()
++	first := int64(100)
++	accountID := uint64(11)
++	if err := repo.Create(ctx, auditdomain.Record{
++		RequestID: "degrade-hard", ClientKeyID: 1, ModelRouteID: 1, Provider: "grok_build", AccountID: &accountID, AccountName: "noisy",
++		EgressNodeName: "edge-1", StatusCode: 200, Streaming: true, OutputTokens: 2000, FirstTokenMS: &first, DurationMS: 1100, CreatedAt: now.Add(-time.Minute),
++	}); err != nil {
++		t.Fatal(err)
++	}
++	router := gin.New()
++	NewHandler(auditapp.NewService(repo, slog.Default(), 8, 4, time.Second)).Register(router.Group("/api/admin/v1"))
++
++	ok := httptest.NewRecorder()
++	router.ServeHTTP(ok, httptest.NewRequest(http.MethodGet, "/api/admin/v1/request-audits/degrade-accounts?window=24h&softTPS=500&hardTPS=1000", nil))
++	if ok.Code != http.StatusOK || !strings.Contains(ok.Body.String(), `"id":"11"`) || !strings.Contains(ok.Body.String(), `"hard":1`) {
++		t.Fatalf("status=%d body=%s", ok.Code, ok.Body.String())
++	}
++
++	bad := httptest.NewRecorder()
++	router.ServeHTTP(bad, httptest.NewRequest(http.MethodGet, "/api/admin/v1/request-audits/degrade-accounts?window=3h", nil))
++	if bad.Code != http.StatusBadRequest || !strings.Contains(bad.Body.String(), "invalidAuditPeriod") {
++		t.Fatalf("bad window status=%d body=%s", bad.Code, bad.Body.String())
++	}
++}
+diff --git a/frontend/src/features/quality-guard/degrade-accounts-panel.tsx b/frontend/src/features/quality-guard/degrade-accounts-panel.tsx
+new file mode 100644
+index 0000000..66dd821
+--- /dev/null
++++ b/frontend/src/features/quality-guard/degrade-accounts-panel.tsx
+@@ -0,0 +1,310 @@
++import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
++import { AlertTriangle, Gauge, Power, PowerOff, RefreshCw, Search, Users } from "lucide-react";
++import { useMemo, useState } from "react";
++import { useTranslation } from "react-i18next";
++import { toast } from "sonner";
++
++import { Badge } from "@/components/ui/badge";
++import { Button } from "@/components/ui/button";
++import { Checkbox } from "@/components/ui/checkbox";
++import { Input } from "@/components/ui/input";
++import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
++import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
++import { updateAccountsEnabled } from "@/features/accounts/accounts-api";
++import { getDegradeAccounts, type DegradeAccountDTO, type DegradeClass, type DegradeSummaryDTO, type DegradeWindow } from "@/features/quality-guard/quality-guard-api";
++import { EmptyState, ErrorState } from "@/shared/components/data-state";
++import { cn } from "@/shared/lib/cn";
++import { formatCompactDateTime } from "@/shared/lib/format";
++
++const MUTE_TOAST_ID = "quality-guard-degrade-mute";
++
++export function DegradeAccountsPanel({ softTPS, hardTPS }: { softTPS?: number; hardTPS?: number }) {
++  const { t, i18n } = useTranslation();
++  const queryClient = useQueryClient();
++  const [period, setPeriod] = useState<DegradeWindow>("24h");
++  const [search, setSearch] = useState("");
++  const [status, setStatus] = useState<"all" | "on" | "off">("all");
++  const [cls, setCls] = useState<"all" | DegradeClass>("all");
++  const [hitsMin, setHitsMin] = useState(1);
++  const [selected, setSelected] = useState<Set<string>>(() => new Set());
++
++  const query = useQuery({
++    queryKey: ["quality-guard-degrade-accounts", period, softTPS, hardTPS],
++    queryFn: () => getDegradeAccounts({ window: period, softTPS, hardTPS }),
++    refetchInterval: 15_000,
++  });
++
++  const data = query.data;
++  const rows = useMemo(() => filterAccounts(data, { search, status, cls, hitsMin }), [data, search, status, cls, hitsMin]);
++  const selectable = rows;
++  const selectedRows = selectable.filter((account) => selected.has(account.id));
++  const selectedEnabled = selectedRows.filter((account) => account.enabled);
++  const selectedMuted = selectedRows.filter((account) => !account.enabled);
++  const allSelected = selectable.length > 0 && selectedRows.length === selectable.length;
++
++  const muteMutation = useMutation({
++    mutationFn: (ids: string[]) => updateAccountsEnabled(ids, false, "grok_build"),
++    onMutate: () => toast.loading(t("qualityGuard.degrade.muting"), { id: MUTE_TOAST_ID }),
++    onSuccess: (_, ids) => {
++      setSelected(new Set());
++      void queryClient.invalidateQueries({ queryKey: ["quality-guard-degrade-accounts"] });
++      void queryClient.invalidateQueries({ queryKey: ["accounts"] });
++      toast.success(t("qualityGuard.degrade.muted", { count: ids.length }), { id: MUTE_TOAST_ID });
++    },
++    onError: (error) => toast.error(error instanceof Error ? error.message : t("qualityGuard.degrade.muteFailed"), { id: MUTE_TOAST_ID }),
++  });
++  const unmuteMutation = useMutation({
++    mutationFn: (ids: string[]) => updateAccountsEnabled(ids, true, "grok_build"),
++    onMutate: () => toast.loading(t("qualityGuard.degrade.unmuting"), { id: MUTE_TOAST_ID }),
++    onSuccess: (_, ids) => {
++      setSelected(new Set());
++      void queryClient.invalidateQueries({ queryKey: ["quality-guard-degrade-accounts"] });
++      void queryClient.invalidateQueries({ queryKey: ["accounts"] });
++      toast.success(t("qualityGuard.degrade.unmuted", { count: ids.length }), { id: MUTE_TOAST_ID });
++    },
++    onError: (error) => toast.error(error instanceof Error ? error.message : t("qualityGuard.degrade.unmuteFailed"), { id: MUTE_TOAST_ID }),
++  });
++  const busy = muteMutation.isPending || unmuteMutation.isPending;
++
++  const toggleAll = (checked: boolean) => {
++    setSelected((current) => {
++      const next = new Set(current);
++      selectable.forEach((account) => {
++        if (checked) next.add(account.id);
++        else next.delete(account.id);
++      });
++      return next;
++    });
++  };
++
++  if (query.isError && !data) return <ErrorState message={query.error.message} onRetry={() => void query.refetch()} />;
++  if (!data) return null;
++
++  return (
++    <div className="space-y-4">
++      <section className="grid overflow-hidden rounded-lg bg-card sm:grid-cols-2 xl:grid-cols-4" aria-label={t("qualityGuard.degrade.overview")}>
++        <Metric icon={AlertTriangle} label={t("qualityGuard.degrade.hits")} value={String(data.totals.hits)} detail={t("qualityGuard.degrade.hitsHelp", { burst: data.totals.burst, soft: data.totals.soft, hard: data.totals.hard })} tone={data.totals.hits ? "bad" : "good"} />
++        <Metric icon={Users} label={t("qualityGuard.degrade.accounts")} value={String(data.totals.accounts)} detail={t("qualityGuard.degrade.accountsHelp")} />
++        <Metric icon={PowerOff} label={t("qualityGuard.degrade.stillEnabled")} value={String(data.totals.stillEnabled)} detail={t("qualityGuard.degrade.stillEnabledHelp")} tone={data.totals.stillEnabled ? "bad" : "good"} />
++        <Metric icon={Gauge} label={t("qualityGuard.degrade.maxTPS")} value={Math.round(data.totals.maxTPS).toString()} detail={t("qualityGuard.degrade.maxTPSHelp")} tone={data.totals.maxTPS >= data.thresholds.hardTPS ? "bad" : undefined} />
++      </section>
++
++      <div className="grid items-stretch gap-3 xl:grid-cols-[minmax(0,1.4fr)_minmax(260px,0.8fr)]">
++        <SeriesChart series={data.series} empty={t("qualityGuard.degrade.noHits")} title={t("qualityGuard.degrade.series")} />
++        <NodeList nodes={data.nodes} empty={t("qualityGuard.degrade.noNodes")} title={t("qualityGuard.degrade.nodes")} />
++      </div>
++
++      <section className="overflow-hidden rounded-lg bg-card">
++        <div className="flex flex-col gap-3 border-b px-4 py-4 sm:flex-row sm:items-start sm:justify-between sm:px-5">
++          <div>
++            <h2 className="text-sm font-medium">{t("qualityGuard.degrade.accountsTitle")}</h2>
++            <p className="mt-1 text-xs text-muted-foreground">
++              {hitsMin > 1
++                ? t("qualityGuard.degrade.accountsHintFiltered", { shown: rows.length, total: data.accounts.length, min: hitsMin })
++                : t("qualityGuard.degrade.accountsHint", { shown: rows.length, total: data.accounts.length })}
++            </p>
++          </div>
++          <div className="flex flex-wrap items-center gap-1.5">
++            <div className="relative">
++              <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
++              <Input className="h-8 w-44 pl-8" value={search} onChange={(event) => setSearch(event.target.value)} placeholder={t("qualityGuard.degrade.search")} />
++            </div>
++            <FilterSelect value={period} onChange={(value) => { setSelected(new Set()); setPeriod(value as DegradeWindow); }} items={[["1h", t("qualityGuard.degrade.windows.1h")], ["6h", t("qualityGuard.degrade.windows.6h")], ["24h", t("qualityGuard.degrade.windows.24h")], ["7d", t("qualityGuard.degrade.windows.7d")]]} />
++            <FilterSelect value={status} onChange={(value) => setStatus(value as "all" | "on" | "off")} items={[["all", t("qualityGuard.degrade.statusAll")], ["on", t("qualityGuard.degrade.statusOn")], ["off", t("qualityGuard.degrade.statusOff")]]} />
++            <FilterSelect value={cls} onChange={(value) => setCls(value as "all" | DegradeClass)} items={[["all", t("qualityGuard.degrade.classAll")], ["buffered_burst", "burst"], ["soft_tps", "soft"], ["hard_tps", "hard"]]} />
++            <FilterSelect value={String(hitsMin)} onChange={(value) => setHitsMin(Number(value))} items={[["1", t("qualityGuard.degrade.hitsAll")], ["2", t("qualityGuard.degrade.hitsMin", { count: 2 })], ["3", t("qualityGuard.degrade.hitsMin", { count: 3 })], ["5", t("qualityGuard.degrade.hitsMin", { count: 5 })], ["10", t("qualityGuard.degrade.hitsMin", { count: 10 })]]} />
++            <Button type="button" variant="secondary" size="sm" className="bg-destructive/10 text-destructive hover:bg-destructive/15 hover:text-destructive" disabled={selectedEnabled.length === 0 || busy} onClick={() => {
++              if (!window.confirm(t("qualityGuard.degrade.muteConfirm", { count: selectedEnabled.length }))) return;
++              muteMutation.mutate(selectedEnabled.map((account) => account.id));
++            }}>
++              <PowerOff />{selectedEnabled.length ? t("qualityGuard.degrade.muteSelectedCount", { count: selectedEnabled.length }) : t("qualityGuard.degrade.muteSelected")}
++            </Button>
++            <Button type="button" variant="secondary" size="sm" disabled={selectedMuted.length === 0 || busy} onClick={() => {
++              if (!window.confirm(t("qualityGuard.degrade.unmuteConfirm", { count: selectedMuted.length }))) return;
++              unmuteMutation.mutate(selectedMuted.map((account) => account.id));
++            }}>
++              <Power />{selectedMuted.length ? t("qualityGuard.degrade.unmuteSelectedCount", { count: selectedMuted.length }) : t("qualityGuard.degrade.unmuteSelected")}
++            </Button>
++            <Button type="button" variant="ghost" size="icon" className="size-8" onClick={() => void query.refetch()} disabled={query.isFetching} aria-label={t("common.refresh")}>
++              <RefreshCw className={cn("size-4", query.isFetching && "animate-spin")} />
++            </Button>
++          </div>
++        </div>
++        <div className="overflow-x-auto">
++          <Table className="min-w-[920px]">
++            <TableHeader>
++              <TableRow>
++                <TableHead className="w-10 px-3"><Checkbox checked={allSelected ? true : selectedRows.length > 0 ? "indeterminate" : false} disabled={selectable.length === 0} onCheckedChange={(checked) => toggleAll(checked === true)} aria-label={t("common.selectPage")} /></TableHead>
++                <TableHead>{t("qualityGuard.degrade.account")}</TableHead>
++                <TableHead>{t("qualityGuard.degrade.status")}</TableHead>
++                <TableHead className="text-right">{t("qualityGuard.degrade.hitCount")}</TableHead>
++                <TableHead className="text-right">{t("qualityGuard.outputTPS")}</TableHead>
++                <TableHead>{t("qualityGuard.degrade.class")}</TableHead>
++                <TableHead>{t("qualityGuard.node")}</TableHead>
++                <TableHead>{t("qualityGuard.lastObserved")}</TableHead>
++              </TableRow>
++            </TableHeader>
++            <TableBody>
++              {rows.length === 0 ? (
++                <TableRow><TableCell colSpan={8}><EmptyState message={t("qualityGuard.degrade.noAccounts")} /></TableCell></TableRow>
++              ) : rows.map((account) => (
++                <TableRow key={account.id} className="cursor-pointer" onClick={() => {
++                  setSelected((current) => {
++                    const next = new Set(current);
++                    if (next.has(account.id)) next.delete(account.id);
++                    else next.add(account.id);
++                    return next;
++                  });
++                }}>
++                  <TableCell className="px-3" onClick={(event) => event.stopPropagation()}>
++                    <label className="flex size-8 cursor-pointer items-center justify-center">
++                      <Checkbox checked={selected.has(account.id)} onCheckedChange={(checked) => setSelected((current) => {
++                        const next = new Set(current);
++                        if (checked === true) next.add(account.id);
++                        else next.delete(account.id);
++                        return next;
++                      })} />
++                    </label>
++                  </TableCell>
++                  <TableCell>
++                    <div className="font-mono text-xs text-muted-foreground">#{account.id}</div>
++                    <div className="text-sm">{account.email || account.name || "-"}</div>
++                  </TableCell>
++                  <TableCell className="whitespace-nowrap">
++                    {account.enabled ? <Badge variant="outline" className="whitespace-nowrap text-destructive">{t("qualityGuard.degrade.scheduling")}</Badge> : <Badge variant="outline" className="whitespace-nowrap text-emerald-600 dark:text-emerald-400">{t("qualityGuard.degrade.mutedStatus")}</Badge>}
++                    {account.bfs ? <Badge variant="outline" className="ml-1 whitespace-nowrap text-muted-foreground">bfs {account.bfs}</Badge> : null}
++                  </TableCell>
++                  <TableCell className="text-right font-mono tabular-nums">{account.hits}</TableCell>
++                  <TableCell className={cn("text-right font-mono tabular-nums", account.maxTPS >= data.thresholds.hardTPS ? "text-destructive" : account.maxTPS >= data.thresholds.softTPS ? "text-amber-600 dark:text-amber-400" : "")}>{account.maxTPS}</TableCell>
++                  <TableCell className="text-xs text-muted-foreground">{classSummary(account.classes)}</TableCell>
++                  <TableCell className="text-xs">{account.nodes.join(" · ") || "-"}</TableCell>
++                  <TableCell className="font-mono text-xs">{account.last ? formatCompactDateTime(account.last, i18n.language) : "-"}</TableCell>
++                </TableRow>
++              ))}
++            </TableBody>
++          </Table>
++        </div>
++      </section>
++
++      <section className="overflow-hidden rounded-lg bg-card">
++        <div className="border-b px-4 py-4 sm:px-5">
++          <h2 className="text-sm font-medium">{t("qualityGuard.degrade.events")}</h2>
++          <p className="mt-1 text-xs text-muted-foreground">{t("qualityGuard.degrade.eventsHelp")}</p>
++        </div>
++        <div className="max-h-72 overflow-auto">
++          {data.events.length === 0 ? <EmptyState message={t("qualityGuard.degrade.noEvents")} /> : data.events.map((event) => (
++            <div key={event.id} className="grid grid-cols-[7.5rem_minmax(0,1fr)_auto] gap-3 border-b px-4 py-2 last:border-b-0 sm:px-5">
++              <div className="font-mono text-[11px] text-muted-foreground">{formatCompactDateTime(event.createdAt, i18n.language)}</div>
++              <div className="truncate text-xs">#{event.accountId ?? "-"} {event.accountName} · {event.nodeName} · out {event.outputTokens} · {event.requestId}</div>
++              <div className="flex items-center gap-2">{classBadge(event.class)}<span className="font-mono text-xs tabular-nums">{event.tps}</span></div>
++            </div>
++          ))}
++        </div>
++      </section>
++    </div>
++  );
++}
++
++function filterAccounts(data: DegradeSummaryDTO | undefined, filters: { search: string; status: "all" | "on" | "off"; cls: "all" | DegradeClass; hitsMin: number }) {
++  if (!data) return [];
++  const search = filters.search.trim().toLowerCase();
++  return data.accounts.filter((account) => {
++    if (account.hits < filters.hitsMin) return false;
++    if (filters.status === "on" && !account.enabled) return false;
++    if (filters.status === "off" && account.enabled) return false;
++    if (filters.cls !== "all" && (account.classes[filters.cls] ?? 0) <= 0) return false;
++    if (search && !`${account.id} ${account.email} ${account.name}`.toLowerCase().includes(search)) return false;
++    return true;
++  });
++}
++
++function classSummary(classes: DegradeAccountDTO["classes"]) {
++  return [
++    classes.buffered_burst ? `burst ${classes.buffered_burst}` : "",
++    classes.soft_tps ? `soft ${classes.soft_tps}` : "",
++    classes.hard_tps ? `hard ${classes.hard_tps}` : "",
++  ].filter(Boolean).join(" · ") || "-";
++}
++
++function classBadge(cls: DegradeClass) {
++  if (cls === "hard_tps") return <Badge variant="outline" className="text-destructive">hard</Badge>;
++  if (cls === "buffered_burst") return <Badge variant="outline" className="text-amber-600 dark:text-amber-400">burst</Badge>;
++  return <Badge variant="outline" className="text-muted-foreground">soft</Badge>;
++}
++
++function FilterSelect({ value, onChange, items }: { value: string; onChange: (value: string) => void; items: string[][] }) {
++  return (
++    <Select value={value} onValueChange={onChange}>
++      <SelectTrigger className="h-8 w-auto min-w-28"><SelectValue /></SelectTrigger>
++      <SelectContent>{items.map(([itemValue, label]) => <SelectItem key={itemValue} value={itemValue}>{label}</SelectItem>)}</SelectContent>
++    </Select>
++  );
++}
++
++function Metric({ icon: Icon, label, value, detail, tone }: { icon: typeof AlertTriangle; label: string; value: string; detail: string; tone?: "good" | "bad" }) {
++  return (
++    <div className="flex min-h-24 items-center gap-3 border-b p-4 last:border-b-0 sm:[&:nth-child(odd)]:border-r xl:border-b-0 xl:border-r xl:last:border-r-0">
++      <span className={cn("flex size-9 shrink-0 items-center justify-center rounded-md bg-secondary text-muted-foreground", tone === "good" && "text-emerald-600 dark:text-emerald-400", tone === "bad" && "text-destructive")}><Icon className="size-4" /></span>
++      <div className="min-w-0">
++        <p className="text-xs text-muted-foreground">{label}</p>
++        <p className="mt-1 truncate text-lg font-medium tabular-nums">{value}</p>
++        <p className="mt-1 truncate text-[11px] text-muted-foreground">{detail}</p>
++      </div>
++    </div>
++  );
++}
++
++function SeriesChart({ series, empty, title }: { series: DegradeSummaryDTO["series"]; empty: string; title: string }) {
++  const max = Math.max(1, ...series.map((item) => item.count));
++  const labelStep = series.length > 12 ? Math.ceil(series.length / 8) : 1;
++  return (
++    <section className="flex h-full min-h-64 flex-col overflow-hidden rounded-lg bg-card">
++      <div className="shrink-0 border-b px-4 py-4 sm:px-5"><h2 className="text-sm font-medium">{title}</h2></div>
++      <div className="flex min-h-0 flex-1 items-stretch gap-1 px-4 pb-3 pt-2 sm:px-5">
++        {series.length === 0 ? <p className="self-center text-xs text-muted-foreground">{empty}</p> : series.map((item, index) => {
++          const height = item.count <= 0 ? 0 : Math.max(6, Math.round((item.count / max) * 100));
++          const showLabel = index % labelStep === 0 || index === series.length - 1;
++          return (
++            <div key={`${item.label}-${index}`} className="flex min-w-0 flex-1 flex-col" title={`${item.label}: ${item.count}`}>
++              <div className="relative min-h-0 flex-1">
++                <div
++                  className={cn("absolute inset-x-0 bottom-0 rounded-t-sm", item.severe > 0 && item.severe >= item.count * 0.5 ? "bg-destructive" : "bg-amber-500")}
++                  style={{ height: `${height}%` }}
++                />
++              </div>
++              <div className="mt-1 h-4 text-center text-[10px] tabular-nums text-muted-foreground">
++                {showLabel ? shortSeriesLabel(item.label) : ""}
++              </div>
++            </div>
++          );
++        })}
++      </div>
++    </section>
++  );
++}
++
++function shortSeriesLabel(label: string) {
++  const hour = label.match(/(\d{1,2})(?::\d{2})?$/);
++  return hour ? hour[1].padStart(2, "0") : label;
++}
++
++function NodeList({ nodes, empty, title }: { nodes: DegradeSummaryDTO["nodes"]; empty: string; title: string }) {
++  const max = Math.max(1, ...nodes.map((node) => node.hits));
++  return (
++    <section className="flex h-full min-h-64 flex-col overflow-hidden rounded-lg bg-card">
++      <div className="shrink-0 border-b px-4 py-4 sm:px-5"><h2 className="text-sm font-medium">{title}</h2></div>
++      <div className="min-h-0 flex-1 space-y-2 overflow-auto p-4 sm:p-5">
++        {nodes.length === 0 ? <p className="text-xs text-muted-foreground">{empty}</p> : nodes.map((node) => (
++          <div key={node.name} className="grid grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-3 text-xs">
++            <div>
++              <div>{node.name}</div>
++              <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-muted"><i className="block h-full bg-amber-500" style={{ width: `${Math.round(node.hits / max * 100)}%` }} /></div>
++            </div>
++            <span className="font-mono">{node.hits} / {node.accounts}</span>
++            <span className="font-mono">{node.maxTPS}</span>
++          </div>
++        ))}
++      </div>
++    </section>
++  );
++}
+diff --git a/frontend/src/features/quality-guard/quality-guard-api.ts b/frontend/src/features/quality-guard/quality-guard-api.ts
+index 1922356..0ddffa1 100644
+--- a/frontend/src/features/quality-guard/quality-guard-api.ts
++++ b/frontend/src/features/quality-guard/quality-guard-api.ts
+@@ -1,5 +1,5 @@
+ import { apiRequest } from "@/shared/api/client";
+-import { createObjectDecoder, hasShape, isArrayOf, isBoolean, isNumber, isOneOf, isOptional, isRecordOf, isString } from "@/shared/api/decoder";
++import { createObjectDecoder, hasShape, isArrayOf, isBoolean, isNumber, isObject, isOneOf, isOptional, isRecordOf, isString } from "@/shared/api/decoder";
+ 
+ export type QualityGuardPolicy = {
+   mode: "active" | "passive" | "hybrid";
+@@ -151,3 +151,70 @@ export function runQualityTest(nodeId: string, status: QualityGuardStatus): Prom
+ export function updateQualityGuardPolicy(policy: QualityGuardPolicy): Promise<{ saved: boolean }> {
+   return apiRequest("/api/admin/v1/egress-quality-guard/config", { method: "PUT", body: policy }, createObjectDecoder("quality guard config update", { saved: isBoolean }));
+ }
++
++export type DegradeWindow = "1h" | "6h" | "24h" | "7d";
++export type DegradeClass = "buffered_burst" | "soft_tps" | "hard_tps";
++
++export type DegradeAccountDTO = {
++  id: string;
++  name: string;
++  email: string;
++  hits: number;
++  maxTPS: number;
++  classes: Partial<Record<DegradeClass, number>>;
++  nodes: string[];
++  last: string;
++  enabled: boolean;
++  bfs: number;
++};
++
++export type DegradeEventDTO = {
++  id: string;
++  requestId: string;
++  accountId?: string;
++  accountName: string;
++  nodeName: string;
++  outputTokens: number;
++  tps: number;
++  class: DegradeClass;
++  createdAt: string;
++  model: string;
++};
++
++export type DegradeSummaryDTO = {
++  window: DegradeWindow;
++  generatedAt: string;
++  thresholds: { softTPS: number; hardTPS: number; minGenMs: number; minOutputTokens: number };
++  totals: { hits: number; accounts: number; stillEnabled: number; disabled: number; hard: number; soft: number; burst: number; maxTPS: number };
++  series: { label: string; count: number; severe: number }[];
++  nodes: { name: string; hits: number; accounts: number; maxTPS: number }[];
++  accounts: DegradeAccountDTO[];
++  events: DegradeEventDTO[];
++};
++
++const degradeClassValidator = isOneOf("buffered_burst", "soft_tps", "hard_tps");
++
++const decodeDegradeSummary = createObjectDecoder<DegradeSummaryDTO>("degrade accounts", {
++  window: isOneOf("1h", "6h", "24h", "7d"),
++  generatedAt: isString,
++  thresholds: hasShape({ softTPS: isNumber, hardTPS: isNumber, minGenMs: isNumber, minOutputTokens: isNumber }),
++  totals: hasShape({ hits: isNumber, accounts: isNumber, stillEnabled: isNumber, disabled: isNumber, hard: isNumber, soft: isNumber, burst: isNumber, maxTPS: isNumber }),
++  series: isArrayOf(hasShape({ label: isString, count: isNumber, severe: isNumber })),
++  nodes: isArrayOf(hasShape({ name: isString, hits: isNumber, accounts: isNumber, maxTPS: isNumber })),
++  accounts: isArrayOf(hasShape({
++    id: isString, name: isString, email: isString, hits: isNumber, maxTPS: isNumber,
++    classes: isObject, nodes: isArrayOf(isString), last: isString, enabled: isBoolean, bfs: isNumber,
++  })),
++  events: isArrayOf(hasShape({
++    id: isString, requestId: isString, accountId: isOptional(isString), accountName: isString,
++    nodeName: isString, outputTokens: isNumber, tps: isNumber, class: degradeClassValidator,
++    createdAt: isString, model: isString,
++  })),
++});
++
++export function getDegradeAccounts(input: { window: DegradeWindow; softTPS?: number; hardTPS?: number }): Promise<DegradeSummaryDTO> {
++  const query = new URLSearchParams({ window: input.window });
++  if (input.softTPS) query.set("softTPS", String(input.softTPS));
++  if (input.hardTPS) query.set("hardTPS", String(input.hardTPS));
++  return apiRequest(`/api/admin/v1/request-audits/degrade-accounts?${query}`, {}, decodeDegradeSummary);
++}
+diff --git a/frontend/src/features/quality-guard/quality-guard-page.tsx b/frontend/src/features/quality-guard/quality-guard-page.tsx
+index 65551e6..ce682c1 100644
+--- a/frontend/src/features/quality-guard/quality-guard-page.tsx
++++ b/frontend/src/features/quality-guard/quality-guard-page.tsx
+@@ -18,6 +18,8 @@ import { Label } from "@/components/ui/label";
+ import { Spinner } from "@/components/ui/spinner";
+ import { Switch } from "@/components/ui/switch";
+ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
++import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
++import { DegradeAccountsPanel } from "@/features/quality-guard/degrade-accounts-panel";
+ import { getQualityGuardStatus, runQualityTest, updateQualityGuardPolicy, type QualityGuardEvent, type QualityGuardNodeState, type QualityGuardPolicy, type QualityGuardStatistics, type QualityGuardStatus, type QualityTestResult } from "@/features/quality-guard/quality-guard-api";
+ import { createEgressNode, deleteEgressNodes, listAllEgressNodes, updateEgressNode, updateEgressNodesEnabled, type EgressNodeDTO, type EgressNodeInput } from "@/features/settings/settings-api";
+ import { ErrorState } from "@/shared/components/data-state";
+@@ -159,6 +161,15 @@ export function QualityGuardPage() {
+         )}
+       />
+ 
++      <Tabs defaultValue="nodes">
++        <TabsList>
++          <TabsTrigger value="nodes">{t("qualityGuard.nodesTab")}</TabsTrigger>
++          <TabsTrigger value="accounts">{t("qualityGuard.degrade.tab")}</TabsTrigger>
++        </TabsList>
++        <TabsContent value="accounts" className="mt-6">
++          <DegradeAccountsPanel softTPS={status?.config?.soft_tps} hardTPS={status?.config?.hard_tps} />
++        </TabsContent>
++        <TabsContent value="nodes" className="mt-6 space-y-6">
+       {!status?.available ? <UnavailableState /> : (
+         <>
+           <section className="grid overflow-hidden rounded-lg bg-card sm:grid-cols-2 xl:grid-cols-4" aria-label={t("qualityGuard.overview")}>
+@@ -224,6 +235,8 @@ export function QualityGuardPage() {
+           </AlertDialog>
+         </>
+       )}
++        </TabsContent>
++      </Tabs>
+     </div>
+   );
+ }
+diff --git a/frontend/src/shared/i18n/index.ts b/frontend/src/shared/i18n/index.ts
+index bef6f88..169df23 100644
+--- a/frontend/src/shared/i18n/index.ts
++++ b/frontend/src/shared/i18n/index.ts
+@@ -443,6 +443,22 @@ const resources = {
+         reasons: { unknown: "未记录原因", hard_tps: "超过硬阈值", soft_tps: "超过软阈值", buffered_burst: "短窗口输出突增，等待原 IP 复测", passive_hard_tps: "请求速度超过硬阈值", passive_soft_tps: "请求速度连续超过软阈值", quality_probe_healthy: "模型质量检测恢复正常", expected_marker_missing: "响应标记缺失", insufficient_output_tokens: "输出 Token 不足", insufficient_visible_tokens: "可见 Token 不足", insufficient_generation_window: "有效生成窗口不足", probe_errors: "主动检测连续失败", probe_no_account: "暂无可调度账号，已延后复测", recovery_probe_error: "恢复检测失败", rotation_error: "更换 IP 失败" },
+         policy: "当前策略", editPolicy: "编辑策略", editPolicyTitle: "编辑质量守护策略", editPolicyDescription: "保存后由守护进程热加载，无需重启服务。", restoreDefaults: "恢复默认值", policySaved: "策略已保存，正在热加载", invalidPolicyValue: "数值超出允许范围", softThresholdMustBeLower: "软阈值必须低于硬阈值", activeIntervalSeconds: "主动检测间隔（秒）", passiveIntervalSeconds: "被动审计间隔（秒）", consecutiveSoft: "软阈值连续次数", consecutiveErrors: "检测错误连续次数", quarantineSeconds: "隔离时长（秒）", softThreshold: "软阈值", hardThreshold: "硬阈值", activeInterval: "主动间隔", passiveInterval: "审计间隔", quarantineDuration: "隔离时长", minimumNodes: "最少保留节点",
+         unavailable: "质量守护尚未连接", unavailableHelp: "在 config.yaml 中启用 qualityGuard，并启动 quality-guard Compose profile 后，这里会显示实时状态。", testing: "正在检测节点质量", testComplete: "检测完成：{{speed}}", testFailed: "质量检测暂不可用，请稍后重试",
++        nodesTab: "节点质量",
++        degrade: {
++          tab: "降智账号", overview: "降智账号概览", series: "降智时序", nodes: "按出口节点",
++          hits: "降智次数", hitsHelp: "burst {{burst}} · soft {{soft}} · hard {{hard}}",
++          accounts: "涉及账号", accountsHelp: "窗口内去重", stillEnabled: "仍在调度", stillEnabledHelp: "漏网，可批量禁",
++          maxTPS: "峰值 TPS", maxTPSHelp: "单次请求最高",
++          accountsTitle: "降智账号", accountsHint: "显示 {{shown}} / {{total}}", accountsHintFiltered: "显示 {{shown}} / {{total}} · 命中≥{{min}}",
++          search: "搜邮箱 / ID", statusAll: "全部状态", statusOn: "仍在调度", statusOff: "已禁言",
++          classAll: "全部类型", class: "类型", account: "账号", status: "状态", hitCount: "命中",
++          hitsAll: "全部次数", hitsMin: "命中 ≥ {{count}}",
++          windows: { "1h": "近 1 小时", "6h": "近 6 小时", "24h": "近 24 小时", "7d": "近 7 天" },
++          muteSelected: "禁掉所选", muteSelectedCount: "禁掉所选 ({{count}})", muteConfirm: "确认禁掉 {{count}} 个仍在调度的降智账号？", muting: "正在禁言账号", muted: "已禁言 {{count}} 个账号", muteFailed: "禁言失败", unmuteSelected: "解除禁用", unmuteSelectedCount: "解除禁用 ({{count}})", unmuteConfirm: "确认恢复 {{count}} 个已禁账号到调度？", unmuting: "正在恢复账号", unmuted: "已恢复 {{count}} 个账号", unmuteFailed: "恢复失败",
++          scheduling: "调度", mutedStatus: "已禁",
++          events: "最近事件", eventsHelp: "用户请求，不含 quality-test 探针",
++          noHits: "这个窗口没有降智请求", noNodes: "无节点数据", noAccounts: "没有匹配账号", noEvents: "无事件",
++        },
+         refreshNodes: "刷新节点", nodeEnabled: "节点已启用", nodeDisabled: "节点已停用", nodesEnabled: "所选节点已启用", nodesDisabled: "所选节点已停用", enableNode: "启用节点 {{name}}", disableNode: "停用节点 {{name}}",
+         nodeEditorDescription: "管理质量守护使用的 Grok Build 出口。代理地址仅写入；编辑时留空会保留现有配置。", nodeCapacityHelp: "最多可绑定的账号数，0 表示不限制。", deleteNodeTitle: "删除代理节点？", deleteNodeDescription: "将永久删除节点“{{name}}”。此操作无法撤销。", deleteNodesTitle: "删除所选 {{count}} 个节点？", deleteNodesDescription: "所选代理节点将被永久删除，此操作无法撤销。",
+       },
+@@ -1335,7 +1351,24 @@ const resources = {
+       media: { images: { title: "Gallery", description: "Browse generated image assets", search: "Search ID, type, or hash", empty: "No images", noMatches: "No matching images", totalImages: "Total images", totalBytes: "Storage", pageSummary: "Showing {{count}} / {{total}}", openImage: "Open image {{id}}", deleteTitle: "Delete {{count}} selected images?", deleteDescription: "The image files and gallery records will be permanently removed, and existing image links will stop working. This cannot be undone.", deleted: "Deleted {{count}} images" }, videos: { title: "Video Gallery", description: "View video generation job records", search: "Search prompt or ID", empty: "No video jobs", statusFilter: "Status filter", totalJobs: "Total jobs", queued: "Queued", inProgress: "In progress", completed: "Completed", failed: "Failed", prompt: "Prompt", model: "Model", status: "Status", progress: "Progress", statusProgress: "Status / progress", spec: "Spec", owner: "Owner", createdAt: "Created", completedAt: "Completed", time: "Time", createdShort: "Created", completedShort: "Done", preview: "Preview video", previewTitle: "Video preview", previewUnavailable: "Local video unavailable", deleteTitle: "Delete {{count}} video records?", deleteDescription: "The task records and their local videos will be permanently removed, and existing video links will stop working. This cannot be undone.", deleted: "Deleted {{count}} video records", seconds: "{{count}} sec", pageSummary: "Showing {{count}} / {{total}}" }, videoStatus: { queued: "Queued", in_progress: "In progress", completed: "Completed", failed: "Failed" } },
+       auth: { title: "Admin sign in", productTitle: "Lightweight API gateway", subtitle: "Manage upstream accounts, model routes, and client access.", username: "Username", password: "Password", usernameRequired: "Enter your username", passwordRequired: "Enter your password", signIn: "Sign in", signingIn: "Signing in", signOut: "Sign out", changePassword: "Change password", currentPassword: "Current password", newPassword: "New password", passwordUpdated: "Password updated. Sign in again.", sessionUnavailable: "Unable to restore the session", sessionUnavailableDescription: "The service may be temporarily unavailable. Your session was not cleared; please retry shortly.", retrySession: "Retry" },
+       shell: { appearance: "Appearance", dark: "Dark", light: "Light", system: "System", language: "Language", navigation: "Navigation", openNavigation: "Open navigation" },
+-      qualityGuard: { title: "Quality guard", description: "Monitor Grok egress quality and quarantine anomalous nodes automatically.", overview: "Quality guard overview", serviceStatus: "Guard service", running: "Running", stale: "Status stale", mode: "Detection mode", availableNodes: "Enabled nodes", quarantinedNodes: "Quarantined", modes: { active: "Active probes", passive: "Passive audits", hybrid: "Hybrid" }, nodes: "Node quality", nodesHelp: "Speed matches the grok2api panel: output tokens include reasoning tokens. Passive anomalies only trigger an active confirmation. Strike counts are passive / active / errors.", updatedAt: "Updated {{time}}", node: "Node", state: "State", outputTPS: "Panel output speed", firstToken: "First token", source: "Source", strikes: "Strikes", lastObserved: "Last observed", test: "Test", sources: { active: "Active probe", passive: "Request audit" }, quarantined: "Quarantined", fixedFallback: "Fixed fallback (protected)", suspect: "Suspect", healthy: "Healthy", pending: "Pending", probeFailed: "Probe failed", events: "Recent events", noEvents: "No anomaly or recovery events", eventTypes: { node_quarantined: "Node quarantined", node_restored: "Node restored", node_rotated: "Node IP rotated", passive_audit_anomaly: "Anomalous request detected" }, statistics: "Automatic detection statistics", statisticsSince: "Accumulated since {{time}}. Manual tests are excluded.", statisticsChecks: "Valid checks", statisticsChecksHelp: "Active probes and valid passive audits", statisticsActive: "Active probes", statisticsActiveDetail: "Healthy {{healthy}}, errors {{errors}}", statisticsPassive: "Passive audits", statisticsPassiveDetail: "Healthy {{healthy}}, from real requests", statisticsTokens: "Active output tokens", statisticsTokensHelp: "Includes reasoning tokens; not proxy traffic", statisticsAnomalies: "Anomaly hits", statisticsAnomalyDetail: "Soft {{soft}}, hard {{hard}}", statisticsQuarantines: "Quarantines applied", statisticsActionDetail: "Restored {{restored}}, protected {{suppressed}}", reasons: { unknown: "No reason recorded", hard_tps: "Hard threshold exceeded", soft_tps: "Soft threshold exceeded", buffered_burst: "Short-window output burst; retesting the same IP", passive_hard_tps: "Request exceeded hard threshold", passive_soft_tps: "Requests repeatedly exceeded soft threshold", quality_probe_healthy: "Model quality probe recovered", expected_marker_missing: "Expected marker missing", insufficient_output_tokens: "Too few output tokens", insufficient_visible_tokens: "Too few visible tokens", insufficient_generation_window: "Generation window too short", probe_errors: "Repeated probe errors", probe_no_account: "No schedulable probe account; retry deferred", recovery_probe_error: "Recovery probe failed", rotation_error: "IP rotation failed" }, policy: "Current policy", editPolicy: "Edit policy", editPolicyTitle: "Edit quality guard policy", editPolicyDescription: "The guard hot-reloads saved changes without a service restart.", restoreDefaults: "Restore defaults", policySaved: "Policy saved and queued for hot reload", invalidPolicyValue: "Value is outside the allowed range", softThresholdMustBeLower: "The soft threshold must be lower than the hard threshold", activeIntervalSeconds: "Active interval (seconds)", passiveIntervalSeconds: "Passive interval (seconds)", consecutiveSoft: "Consecutive soft strikes", consecutiveErrors: "Consecutive probe errors", quarantineSeconds: "Quarantine (seconds)", softThreshold: "Soft threshold", hardThreshold: "Hard threshold", activeInterval: "Active interval", passiveInterval: "Audit interval", quarantineDuration: "Quarantine", minimumNodes: "Minimum nodes", unavailable: "Quality guard is not connected", unavailableHelp: "Enable qualityGuard in config.yaml and start the quality-guard Compose profile to display live status here.", testing: "Testing node quality", testComplete: "Test complete: {{speed}}", testFailed: "Quality test is temporarily unavailable. Try again shortly.", refreshNodes: "Refresh nodes", nodeEnabled: "Node enabled", nodeDisabled: "Node disabled", nodesEnabled: "Selected nodes enabled", nodesDisabled: "Selected nodes disabled", enableNode: "Enable node {{name}}", disableNode: "Disable node {{name}}", nodeEditorDescription: "Manage Grok Build egress used by the quality guard. Proxy URLs are write-only; leave the field blank while editing to keep the current value.", nodeCapacityHelp: "Maximum number of bound accounts; 0 means unlimited.", deleteNodeTitle: "Delete proxy node?", deleteNodeDescription: "Node “{{name}}” will be permanently deleted. This action cannot be undone.", deleteNodesTitle: "Delete {{count}} selected nodes?", deleteNodesDescription: "The selected proxy nodes will be permanently deleted. This action cannot be undone." },
++      qualityGuard: { title: "Quality guard", description: "Monitor Grok egress quality and quarantine anomalous nodes automatically.", overview: "Quality guard overview", serviceStatus: "Guard service", running: "Running", stale: "Status stale", mode: "Detection mode", availableNodes: "Enabled nodes", quarantinedNodes: "Quarantined", modes: { active: "Active probes", passive: "Passive audits", hybrid: "Hybrid" }, nodes: "Node quality", nodesHelp: "Speed matches the grok2api panel: output tokens include reasoning tokens. Passive anomalies only trigger an active confirmation. Strike counts are passive / active / errors.", updatedAt: "Updated {{time}}", node: "Node", state: "State", outputTPS: "Panel output speed", firstToken: "First token", source: "Source", strikes: "Strikes", lastObserved: "Last observed", test: "Test", sources: { active: "Active probe", passive: "Request audit" }, quarantined: "Quarantined", fixedFallback: "Fixed fallback (protected)", suspect: "Suspect", healthy: "Healthy", pending: "Pending", probeFailed: "Probe failed", events: "Recent events", noEvents: "No anomaly or recovery events", eventTypes: { node_quarantined: "Node quarantined", node_restored: "Node restored", node_rotated: "Node IP rotated", passive_audit_anomaly: "Anomalous request detected" }, statistics: "Automatic detection statistics", statisticsSince: "Accumulated since {{time}}. Manual tests are excluded.", statisticsChecks: "Valid checks", statisticsChecksHelp: "Active probes and valid passive audits", statisticsActive: "Active probes", statisticsActiveDetail: "Healthy {{healthy}}, errors {{errors}}", statisticsPassive: "Passive audits", statisticsPassiveDetail: "Healthy {{healthy}}, from real requests", statisticsTokens: "Active output tokens", statisticsTokensHelp: "Includes reasoning tokens; not proxy traffic", statisticsAnomalies: "Anomaly hits", statisticsAnomalyDetail: "Soft {{soft}}, hard {{hard}}", statisticsQuarantines: "Quarantines applied", statisticsActionDetail: "Restored {{restored}}, protected {{suppressed}}", reasons: { unknown: "No reason recorded", hard_tps: "Hard threshold exceeded", soft_tps: "Soft threshold exceeded", buffered_burst: "Short-window output burst; retesting the same IP", passive_hard_tps: "Request exceeded hard threshold", passive_soft_tps: "Requests repeatedly exceeded soft threshold", quality_probe_healthy: "Model quality probe recovered", expected_marker_missing: "Expected marker missing", insufficient_output_tokens: "Too few output tokens", insufficient_visible_tokens: "Too few visible tokens", insufficient_generation_window: "Generation window too short", probe_errors: "Repeated probe errors", probe_no_account: "No schedulable probe account; retry deferred", recovery_probe_error: "Recovery probe failed", rotation_error: "IP rotation failed" }, policy: "Current policy", editPolicy: "Edit policy", editPolicyTitle: "Edit quality guard policy", editPolicyDescription: "The guard hot-reloads saved changes without a service restart.", restoreDefaults: "Restore defaults", policySaved: "Policy saved and queued for hot reload", invalidPolicyValue: "Value is outside the allowed range", softThresholdMustBeLower: "The soft threshold must be lower than the hard threshold", activeIntervalSeconds: "Active interval (seconds)", passiveIntervalSeconds: "Passive interval (seconds)", consecutiveSoft: "Consecutive soft strikes", consecutiveErrors: "Consecutive probe errors", quarantineSeconds: "Quarantine (seconds)", softThreshold: "Soft threshold", hardThreshold: "Hard threshold", activeInterval: "Active interval", passiveInterval: "Audit interval", quarantineDuration: "Quarantine", minimumNodes: "Minimum nodes", unavailable: "Quality guard is not connected", unavailableHelp: "Enable qualityGuard in config.yaml and start the quality-guard Compose profile to display live status here.", testing: "Testing node quality", testComplete: "Test complete: {{speed}}", testFailed: "Quality test is temporarily unavailable. Try again shortly.", refreshNodes: "Refresh nodes", nodeEnabled: "Node enabled", nodeDisabled: "Node disabled", nodesEnabled: "Selected nodes enabled", nodesDisabled: "Selected nodes disabled", enableNode: "Enable node {{name}}", disableNode: "Disable node {{name}}", nodeEditorDescription: "Manage Grok Build egress used by the quality guard. Proxy URLs are write-only; leave the field blank while editing to keep the current value.", nodeCapacityHelp: "Maximum number of bound accounts; 0 means unlimited.", deleteNodeTitle: "Delete proxy node?", deleteNodeDescription: "Node “{{name}}” will be permanently deleted. This action cannot be undone.", deleteNodesTitle: "Delete {{count}} selected nodes?", deleteNodesDescription: "The selected proxy nodes will be permanently deleted. This action cannot be undone.",
++        nodesTab: "Node quality",
++        degrade: {
++          tab: "Degraded accounts", overview: "Degraded account overview", series: "Degrade timeline", nodes: "By egress node",
++          hits: "Degrade hits", hitsHelp: "burst {{burst}} · soft {{soft}} · hard {{hard}}",
++          accounts: "Accounts", accountsHelp: "Unique in this window", stillEnabled: "Still scheduled", stillEnabledHelp: "Still enabled; can be muted in bulk",
++          maxTPS: "Peak TPS", maxTPSHelp: "Highest single request",
++          accountsTitle: "Degraded accounts", accountsHint: "Showing {{shown}} / {{total}}", accountsHintFiltered: "Showing {{shown}} / {{total}} · hits ≥ {{min}}",
++          search: "Search email / ID", statusAll: "All statuses", statusOn: "Still scheduled", statusOff: "Muted",
++          classAll: "All classes", class: "Class", account: "Account", status: "Status", hitCount: "Hits",
++          hitsAll: "Any hit count", hitsMin: "Hits ≥ {{count}}",
++          windows: { "1h": "Last 1 hour", "6h": "Last 6 hours", "24h": "Last 24 hours", "7d": "Last 7 days" },
++          muteSelected: "Mute selected", muteSelectedCount: "Mute selected ({{count}})", muteConfirm: "Mute {{count}} still-scheduled degraded accounts?", muting: "Muting accounts", muted: "Muted {{count}} accounts", muteFailed: "Failed to mute accounts", unmuteSelected: "Unmute selected", unmuteSelectedCount: "Unmute selected ({{count}})", unmuteConfirm: "Restore {{count}} muted accounts to scheduling?", unmuting: "Restoring accounts", unmuted: "Restored {{count}} accounts", unmuteFailed: "Failed to restore accounts",
++          scheduling: "Scheduled", mutedStatus: "Muted",
++          events: "Recent events", eventsHelp: "User requests; quality-test probes are excluded",
++          noHits: "No degrade requests in this window", noNodes: "No node data", noAccounts: "No matching accounts", noEvents: "No events",
++        },
++      },
+       accountQuotaReset: { action: "Reset quota", description: "This clears only local waiting-reset and model quota blocks. It does not change upstream Billing or audit history. Accounts that remain exhausted will be marked again by real traffic.", completed: "Reset local quota state for {{reset}} accounts" },
+       accountQuotaTask: { title: "Process quota for {{count}} selected accounts", description: "Choose the quota task to run for the selected Grok Build accounts.", allTitle: "Process quota for all accounts", allDescription: "Choose the quota task to run for all enabled Grok Build accounts.", syncDescription: "Request upstream Billing and update local quota snapshots, account tiers, and recovery state.", resetAllDescription: "Clear local waiting-reset and exhausted-quota blocks for all enabled Grok Build accounts without changing upstream Billing or audit history.", execute: "Run task" },
+       accountExport: { countDescription: "Exports accounts in stable order, up to 10,000 per batch.", batchProgress: "Exported {{count}} accounts; the next download is batch {{batch}}.", nextBatch: "Export next batch", batchCompleted: "Exported {{count}} accounts in this batch", completed: "Export complete: {{count}} accounts" },
+-- 
+2.50.1 (Apple Git-155)
+

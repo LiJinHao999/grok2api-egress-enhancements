@@ -32,6 +32,20 @@
 
 `QUALITY_GUARD_NODE_IDS` 为空时，sidecar 自动管理所有已启用且配置代理的 Build 节点，并继续跟踪由守护隔离的节点以便复测恢复。它会把所有已解析的代理 Build 节点 ID 写入状态文件，使旧版管理页面不会把自动发现误判为空名单。手工停用的节点仍显示在新版管理表中，但不会被主动探测。
 
+## 降智账号面板
+
+质量守护页增加「降智账号」页签。它读取请求审计里的用户流式请求（排除 `quality-test` 探针），按与面板相同的公式归类：
+
+```text
+tps = outputTokens * 1000 / (durationMs - firstTokenMs)
+```
+
+默认 soft = 500、hard = 1000、最短生成窗口 1000ms、最少输出 32 tokens。生成窗口短于阈值且 TPS ≥ soft 记为 `buffered_burst`；否则按 hard / soft 顺序归类。未达 soft 的请求不计入降智。
+
+窗口为 `1h` / `6h` / `24h` / `7d`。页面提供时序条（从底部堆叠）、按出口节点聚合、账号表和最近事件。账号可按邮箱/ID、调度状态、类型、命中次数筛选。任意行（含已禁账号）可勾选；批量禁掉走 `PATCH /api/admin/v1/accounts/batch` 且 `ids` 必须是字符串，批量解除禁用同一接口 `enabled=true`。
+
+接口：`GET /api/admin/v1/request-audits/degrade-accounts`。响应不返回代理 URL、Cookie 或完整账号材料。
+
 ## 数据边界
 
 - 管理员令牌只保存在 sidecar 内存中。

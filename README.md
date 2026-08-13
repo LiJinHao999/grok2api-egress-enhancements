@@ -4,11 +4,14 @@
 
 当前补丁基于：
 
-- 上游版本：`v3.0.11`
-- 上游提交：`090104504b403d65675a01dab9c92b3a235ee832`
-- 补丁提交：见 `MANIFEST.json` 的 `patch_commit`（严格隔离与自动换 IP 完整版）
-- 上游 Draft PR：[chenyme/grok2api#837](https://github.com/chenyme/grok2api/pull/837)
-- 可运行 Fork：[lij768423-svg/grok2api](https://github.com/lij768423-svg/grok2api/tree/agent/egress-resilience-quality-guard)
+- 上游版本：`v3.1.2`（质量守护与固定代理快速恢复已合入官方）
+- 上游提交：`6e9eef7619b83899c82e24353177c8a819f15914`
+- 今日增量：质量守护页的**降智账号面板**（筛选、时序、批量禁/解禁）
+- 补丁文件：`patches/0002-feat-add-degraded-account-monitor.patch`
+- 上游 PR：[chenyme/grok2api#907](https://github.com/chenyme/grok2api/pull/907)
+- 可运行 Fork：[lij768423-svg/grok2api](https://github.com/lij768423-svg/grok2api) `main`
+
+仍停在 `v3.0.11` 时，继续使用遗留补丁 `patches/0001-feat-add-egress-recovery-and-quality-guard.patch`（对应已关闭的 [#837](https://github.com/chenyme/grok2api/pull/837)）。
 
 ## 包含功能
 
@@ -39,6 +42,14 @@
 - `QUALITY_GUARD_NODE_IDS` 留空时自动发现所有已启用的代理 Build 节点；状态文件同时发布已解析节点，兼容旧版管理页面。
 - 独立 Python sidecar、Docker Compose、systemd、安全说明和中英文文档。
 
+### 降智账号面板（v3.1.2 增量）
+
+- 质量守护页增加「降智账号」页签：按请求审计把用户流式请求（不含 quality-test 探针）归类为 `buffered_burst` / `soft_tps` / `hard_tps`。
+- 口径与面板一致：`outputTokens * 1000 / (durationMs - firstTokenMs)`，默认 soft 500、hard 1000；生成窗口短于 1s 且达到 soft 记为 `buffered_burst`。
+- 支持 1h / 6h / 24h / 7d 窗口，按邮箱/ID、调度状态、类型、命中次数筛选。
+- 时序条从底部堆叠；任意行可勾选，批量「禁掉所选」或「解除禁用」，走现有账号 batch API（`ids` 为字符串）。
+- 接口：`GET /api/admin/v1/request-audits/degrade-accounts`。
+
 ### CPA 原生出口守护插件
 
 `cpa-plugin/` 现为 **v1.0.8 纯 CPA 原生插件**，不依赖、不连接 Grok2API 运行时。它通过 CPA Host API 读取认证文件和 Usage 事件，把账号的 `proxy_url` 粘性绑定到出口节点，并提供节点 CRUD、逐行批量导入、批量操作、连通性/真实质量检测、隔离迁号、策略热加载、统计事件和深浅色管理 UI。v1.0.8 起商店安装后注册不再同步扫认证文件，避免多账号时一直「未生效」；v1.0.7 起 CPA 调度跳过隔离/冷却出口，账号或额度错误只记为 ignored，迁移会写后读回校验，并支持节点白名单化的内部换 IP Webhook。构建与部署方法见 [cpa-plugin/README.md](./cpa-plugin/README.md)，代理规划、账号容量、隔离恢复和强制住宅 IP 轮换见 [AI 部署与运维指南](./cpa-plugin/AI_USAGE_GUIDE.md)。
@@ -55,11 +66,11 @@ CPA 本身不会让模型“降智”；这个插件只是在多账号、多出�
 
 ```sh
 git fetch --tags origin
-git checkout -b egress-enhancements v3.0.11
-git am --3way /path/to/grok2api-egress-enhancements/patches/0001-feat-add-egress-recovery-and-quality-guard.patch
+git checkout -b egress-enhancements v3.1.2
+git am --3way /path/to/grok2api-egress-enhancements/patches/0002-feat-add-degraded-account-monitor.patch
 ```
 
-如果目标版本高于 `v3.0.11`，建议使用 [AI 合并指南](./docs/AI_MERGE_GUIDE.md)，让工具按功能不变量解决冲突，而不是直接覆盖新版文件。
+仍基于 `v3.0.11` 时改用 `patches/0001-feat-add-egress-recovery-and-quality-guard.patch`。目标版本高于补丁基线时，使用 [AI 合并指南](./docs/AI_MERGE_GUIDE.md)，按功能不变量解决冲突，不要整文件覆盖新版实现。
 
 ## 验证
 
