@@ -5,129 +5,29 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"sync/atomic"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
-var schedulerCursor atomic.Uint64
-
-func isXAIProvider(provider string) bool {
-	provider = strings.ToLower(strings.TrimSpace(provider))
-	return strings.Contains(provider, "xai") || strings.Contains(provider, "grok")
-}
-
-func requestIncludesXAI(provider string, providers []string) bool {
-	if isXAIProvider(provider) {
-		return true
-	}
-	for _, candidate := range providers {
-		if isXAIProvider(candidate) {
-			return true
-		}
-	}
-	return false
-}
-
-func schedulerCandidateAvailable(candidate pluginapi.SchedulerAuthCandidate) bool {
-	status := strings.ToLower(strings.TrimSpace(candidate.Status))
-	// Empty status is retained for older CPA hosts. Any explicit lifecycle or
-	// cooldown state other than active/ready must stay with CPA's retry logic.
-	switch status {
-	case "", "active", "ready":
-		return true
-	case "disabled", "unavailable", "error", "cooling", "cooldown", "pending", "refreshing", "retrying":
-		return false
-	default:
-		// Unknown explicit states are fail-closed; selecting them can bypass CPA's
-		// own cooldown scheduler.
-		return false
-	}
-}
-
-// handleSchedulerPick keeps the host scheduler from selecting an auth whose
-// proxy node is quarantined. Unmanaged providers and unbound accounts are
-// delegated to CPA's native scheduler.
+// handleSchedulerPick hands auth selection entirely back to the host.
+//
+// CPA only consults SessionAffinitySelector on the legacy path when the plugin
+// responds Handled:false (conductor.pickNextLegacy: "if !handled { selector.Pick }").
+// Any Handled:true answer — pinning AuthID or DelegateBuiltin — routes into
+// pickViaBuiltinScheduler, a bare round-robin cursor that bypasses session
+// affinity entirely and rotates auths on every request.
+//
+// Quarantined nodes are still defended without taking over selection:
+// migrateAuthsOffNode first disables affected auths (CPA drops candidate.Disabled),
+// then rebinds them to a healthy exit; disableAuthsOnNode is the fallback when
+// migration cannot complete. handleRequestIntercept closes the race between
+// host selection and that disable/migrate window.
 func handleSchedulerPick(request []byte) ([]byte, error) {
-	ensureStore()
-	var req pluginapi.SchedulerPickRequest
-	if err := json.Unmarshal(request, &req); err != nil {
-		return nil, fmt.Errorf("decode scheduler request: %w", err)
-	}
-	if !requestIncludesXAI(req.Provider, req.Providers) {
-		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
-	}
-
-	nodes := store.listNodes()
-	byProxy := make(map[string]*nodeRecord, len(nodes))
-	for _, node := range nodes {
-		if node.ProxyURL != "" {
-			byProxy[node.ProxyURL] = node
-		}
-	}
-	cache := refreshAuthProxyCache()
-	eligible := make([]string, 0, len(req.Candidates))
-	managed := false
-	nonXAIAvailable := false
-	for _, candidate := range req.Candidates {
-		if !isXAIProvider(candidate.Provider) {
-			nonXAIAvailable = true
-			continue
-		}
-		proxy := cache[candidate.ID]
-		if proxy == "" {
-			continue
-		}
-		node := byProxy[proxy]
-		if node == nil {
-			continue
-		}
-		managed = true
-		if !schedulerCandidateAvailable(candidate) {
-			continue
-		}
-		if node.Enabled && !node.DisabledByGuard {
-			eligible = append(eligible, candidate.ID)
-		}
-	}
-	if !managed {
-		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
-	}
-	if len(eligible) == 0 {
-		if strings.TrimSpace(req.Provider) == "" && nonXAIAvailable {
-			return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
-		}
-		return errorEnvelope("egress_no_healthy_auth", "没有可用的健康 CPA 出口账号"), nil
-	}
-	index := schedulerCursor.Add(1) - 1
-	selected := eligible[index%uint64(len(eligible))]
-	return okEnvelope(pluginapi.SchedulerPickResponse{Handled: true, AuthID: selected})
+	_ = request
+	return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
 }
 
-// handleRequestInterceptAfterAuth closes the small race between auth selection
-// and synchronous quarantine migration. A request selected during that window
-// receives a retryable response instead of reaching a known bad egress.
-func handleRequestIntercept(request []byte, afterAuth bool) ([]byte, error) {
-	ensureStore()
-	var req pluginapi.RequestInterceptRequest
-	if err := json.Unmarshal(request, &req); err != nil {
-		return nil, fmt.Errorf("decode request interceptor request: %w", err)
-	}
-	if !afterAuth || len(req.Metadata) == 0 {
-		return okEnvelope(pluginapi.RequestInterceptResponse{})
-	}
-	selected := firstString(req.Metadata, "selected_auth_id", "selectedAuthID", "auth_id", "authID")
-	if selected == "" {
-		return okEnvelope(pluginapi.RequestInterceptResponse{})
-	}
-	nodeID := resolveNodeIDForAuth(store, selected)
-	if nodeID == "" {
-		return okEnvelope(pluginapi.RequestInterceptResponse{})
-	}
-	node, ok := store.getNode(nodeID)
-	if !ok || !node.DisabledByGuard {
-		return okEnvelope(pluginapi.RequestInterceptResponse{})
-	}
+func quarantinedInterceptResponse() ([]byte, error) {
 	body, _ := json.Marshal(map[string]any{
 		"error": map[string]any{
 			"type":    "egress_quarantined",
@@ -143,4 +43,102 @@ func handleRequestIntercept(request []byte, afterAuth bool) ([]byte, error) {
 		},
 		ResponseBody: body,
 	})
+}
+
+func storeHasGuardQuarantine(s *stateStore) bool {
+	if s == nil {
+		return false
+	}
+	for _, node := range s.listNodes() {
+		if node != nil && node.DisabledByGuard {
+			return true
+		}
+	}
+	return false
+}
+
+// selectedAuthKeysFromMetadata collects every host-published auth identifier.
+// CPA writes both selected_auth_id (runtime ID, often the relative filename)
+// and selected_auth_index (stable EnsureIndex hash). The first non-empty key
+// is not enough: a cache hit on index must still be tried when the ID misses.
+func selectedAuthKeysFromMetadata(meta map[string]any) []string {
+	if len(meta) == 0 {
+		return nil
+	}
+	keys := []string{
+		"selected_auth_id", "selectedAuthID",
+		"selected_auth_index", "selectedAuthIndex",
+		"auth_id", "authID", "AuthID",
+		"AuthIndex", "auth_index",
+	}
+	out := make([]string, 0, len(keys))
+	seen := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		value := strings.TrimSpace(firstString(meta, key))
+		if value == "" {
+			continue
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
+}
+
+// handleRequestInterceptAfterAuth closes the small race between auth selection
+// and synchronous quarantine migration. A request selected during that window
+// receives a retryable response instead of reaching a known bad egress.
+//
+// After handing selection back to CPA, this interceptor is the only request-
+// level gate. Missing selected-auth metadata during an xAI quarantine
+// fail-closes. A known selected auth that does not map to a managed node is
+// unmanaged (direct / unknown proxy) and must pass — another node's isolation
+// must not 503 the rest of the pool. Clearly non-xAI traffic is left alone.
+func handleRequestIntercept(request []byte, afterAuth bool) ([]byte, error) {
+	ensureStore()
+	var req pluginapi.RequestInterceptRequest
+	if err := json.Unmarshal(request, &req); err != nil {
+		return nil, fmt.Errorf("decode request interceptor request: %w", err)
+	}
+	if !afterAuth {
+		return okEnvelope(pluginapi.RequestInterceptResponse{})
+	}
+	selected := selectedAuthKeysFromMetadata(req.Metadata)
+	if len(selected) == 0 {
+		if storeHasGuardQuarantine(store) && !interceptLooksLikeNonXAI(req) {
+			return quarantinedInterceptResponse()
+		}
+		return okEnvelope(pluginapi.RequestInterceptResponse{})
+	}
+	nodeID := resolveNodeIDForAuth(store, selected...)
+	if nodeID == "" {
+		return okEnvelope(pluginapi.RequestInterceptResponse{})
+	}
+	node, ok := store.getNode(nodeID)
+	if !ok || !node.DisabledByGuard {
+		return okEnvelope(pluginapi.RequestInterceptResponse{})
+	}
+	return quarantinedInterceptResponse()
+}
+
+func interceptLooksLikeNonXAI(req pluginapi.RequestInterceptRequest) bool {
+	blob := strings.ToLower(strings.Join([]string{
+		req.Model,
+		req.RequestedModel,
+		req.ToFormat,
+		req.SourceFormat,
+		firstString(req.Metadata, "provider", "Provider", "model_provider"),
+		firstString(req.Metadata, "model", "Model"),
+	}, " "))
+	if strings.Contains(blob, "xai") || strings.Contains(blob, "grok") {
+		return false
+	}
+	for _, marker := range []string{"gemini", "claude", "anthropic", "openai", "gpt-", "copilot", "vertex", "bedrock"} {
+		if strings.Contains(blob, marker) {
+			return true
+		}
+	}
+	return false
 }

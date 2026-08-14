@@ -64,31 +64,37 @@ func refreshAuthProxyCache() map[string]string {
 	authProxyMu.Unlock()
 
 	// listAuthFiles is itself cached; this rebuild does not stampede Host API.
-	out := map[string]string{}
 	auths, err := listAuthFiles()
-	if err == nil {
-		for _, a := range auths {
-			if a.ProxyURL == "" {
-				continue
-			}
-			if a.Index != "" {
-				out[a.Index] = a.ProxyURL
-			}
-			if a.ID != "" {
-				out[a.ID] = a.ProxyURL
-			}
-			if a.Name != "" {
-				out[a.Name] = a.ProxyURL
-				out[strings.TrimSuffix(a.Name, ".json")] = a.ProxyURL
-			}
-			if a.Email != "" {
-				out["xai-"+a.Email+".json"] = a.ProxyURL
-				out[a.Email] = a.ProxyURL
-			}
-			if a.Path != "" {
-				out[a.Path] = a.ProxyURL
-				out[filepath.Base(a.Path)] = a.ProxyURL
-			}
+	if err != nil {
+		authProxyMu.Lock()
+		defer authProxyMu.Unlock()
+		if authProxyCache != nil {
+			return authProxyCache
+		}
+		return map[string]string{}
+	}
+	out := map[string]string{}
+	for _, a := range auths {
+		if a.ProxyURL == "" {
+			continue
+		}
+		if a.Index != "" {
+			out[a.Index] = a.ProxyURL
+		}
+		if a.ID != "" {
+			out[a.ID] = a.ProxyURL
+		}
+		if a.Name != "" {
+			out[a.Name] = a.ProxyURL
+			out[strings.TrimSuffix(a.Name, ".json")] = a.ProxyURL
+		}
+		if a.Email != "" {
+			out["xai-"+a.Email+".json"] = a.ProxyURL
+			out[a.Email] = a.ProxyURL
+		}
+		if a.Path != "" {
+			out[a.Path] = a.ProxyURL
+			out[filepath.Base(a.Path)] = a.ProxyURL
 		}
 	}
 
@@ -99,9 +105,9 @@ func refreshAuthProxyCache() map[string]string {
 	return out
 }
 
-// resolveNodeIDForAuth is on the request hot path. It only consults in-memory
-// caches — never host.auth.get — so a cache miss yields "" (unmapped) rather
-// than blocking the CPA request on N Host RPCs.
+// resolveNodeIDForAuth is on the request hot path. It consults the in-memory
+// proxy map (rebuilt from the auth-list cache on TTL miss). A miss yields ""
+// rather than issuing N host.auth.get calls for the selected id.
 func resolveNodeIDForAuth(store *stateStore, authKeys ...string) string {
 	if store == nil {
 		return ""
@@ -330,6 +336,7 @@ type qualityResult struct {
 	HasThinking    bool    `json:"has_thinking,omitempty"`
 	AuthID         string  `json:"auth_id,omitempty"`
 	AuthLabel      string  `json:"auth_label,omitempty"`
+	BorrowedAuth   bool    `json:"borrowed_auth,omitempty"`
 	ExitIP         string  `json:"exit_ip,omitempty"`
 	Error          string  `json:"error,omitempty"`
 	ErrorKind      string  `json:"error_kind,omitempty"`
@@ -583,12 +590,21 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 		return res
 	}
 
-	// connectivity first for exit IP
+	// connectivity first for exit IP. A dead proxy must not burn a borrowed
+	// foreign token on a model completion.
+	connOK := false
 	if ip, _, errIP := probeConnectivity(node.ProxyURL); errIP == nil {
 		res.ExitIP = ip
+		connOK = true
 	}
 
-	candidates, err := listAuthsForNode(node, 8)
+	mode := authListBoundOnly
+	if node.DisabledByGuard {
+		// Isolated restore / rotate confirmation / manual quality: use leftover
+		// disabled bindings first, then one foreign token through this proxy.
+		mode = authListRecovery
+	}
+	candidates, err := listAuthsForNodeMode(node, 8, mode)
 	if err != nil || len(candidates) == 0 {
 		res.Classification = "error"
 		res.ErrorKind = "no_account"
@@ -597,6 +613,12 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 		} else {
 			res.Error = "没有可用的 CPA xAI 账号"
 		}
+		return res
+	}
+	if !connOK && probeCandidatesAreBorrowed(candidates, node) {
+		res.Classification = "error"
+		res.ErrorKind = "transport_error"
+		res.Error = "出口连通性失败，跳过借用账号的模型探测"
 		return res
 	}
 
@@ -787,6 +809,7 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 		res.HasThinking = hasThinking
 		res.AuthID = firstNonEmpty(auth.ID, auth.Index, auth.Name, auth.Email)
 		res.AuthLabel = authProbeLabel(auth)
+		res.BorrowedAuth = authIsBorrowed(auth, node)
 		res.TPS = computeTPS(outTokens, res.DurationMs, res.FirstTokenMs, pol.MinGenerationMs)
 		res.Classification = classifyQuality(res.TPS, outTokens, hasThinking, pol)
 		if res.Classification == "unknown" && outTokens == 0 {
@@ -895,6 +918,35 @@ func missingThinkingHit(res qualityResult, pol policyConfig) bool {
 		res.ErrorKind != "probe_unstable"
 }
 
+// shouldPreserveQualityClass keeps a real quality verdict when the new sample
+// is ignored/unknown (short reply, quota, no_account). Those must not wipe
+// soft/hard and make the node a fallback migration dest.
+func shouldPreserveQualityClass(existing, incoming string) bool {
+	switch strings.ToLower(strings.TrimSpace(incoming)) {
+	case "ignored", "unknown":
+	default:
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(existing)) {
+	case "soft", "hard", "healthy", "error":
+		return true
+	default:
+		return false
+	}
+}
+
+func probeCandidatesAreBorrowed(candidates []authFile, node *nodeRecord) bool {
+	if node == nil || len(candidates) == 0 {
+		return false
+	}
+	for _, auth := range candidates {
+		if !authIsBorrowed(auth, node) {
+			return false
+		}
+	}
+	return true
+}
+
 func applyObservation(store *stateStore, nodeID, source string, res qualityResult) {
 	pol := store.policy()
 	if res.Classification == "error" && res.ErrorKind != "transport_error" {
@@ -911,7 +963,9 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 		cvReason      string
 	)
 	updated, err := store.updateNode(nodeID, func(n *nodeRecord) error {
-		n.LastClassification = res.Classification
+		if !shouldPreserveQualityClass(n.LastClassification, res.Classification) {
+			n.LastClassification = res.Classification
+		}
 		n.LastOutputTPS = res.TPS
 		n.LastFirstTokenMs = res.FirstTokenMs
 		n.LastDurationMs = res.DurationMs
@@ -1028,7 +1082,7 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 	//     (node cross-verify may still defer quarantine; probe may use another account)
 	//   * soft/hard TPS outcomes that actually quarantine (or would, if already isolated)
 	// Soft cross-verify scheduling must NOT mark degrade yet (avoid +2 on soft).
-	if res.AuthID != "" {
+	if res.AuthID != "" && !res.BorrowedAuth {
 		if res.Classification != "error" && res.Classification != "ignored" && res.Classification != "unknown" {
 			degraded := false
 			reason := res.Error
@@ -1093,7 +1147,7 @@ func quarantineNode(store *stateStore, nodeID, reason string, tps float64, class
 			target = o
 			continue
 		}
-		if o.Enabled && !o.DisabledByGuard {
+		if nodeSchedulable(o) {
 			enabledHealthy++
 		}
 	}
@@ -1120,9 +1174,10 @@ func quarantineNode(store *stateStore, nodeID, reason string, tps float64, class
 	}
 	store.bumpAction("quarantined")
 	store.appendEvent(guardEvent{Event: "node_quarantined", NodeID: updated.ID, NodeName: updated.Name, Reason: reason, Classification: class, OutputTPS: tps})
-	// Move accounts off the bad channel synchronously. The first phase disables
-	// them, so no new request can continue using the quarantined egress while
-	// migration and post-save verification are in flight.
+	// Move accounts off the bad channel synchronously. migrateAuthsOffNode
+	// first disables them, then rebinds to a healthy (or fallback) exit.
+	// On total failure it rolls disable back so accounts are not stranded
+	// until the 1h retest. DisableAuthOnHard then re-disables leftovers.
 	if err := migrateAuthsOffNode(store, updated); err != nil {
 		store.appendEvent(guardEvent{Event: "accounts_migration_failed", NodeID: updated.ID, NodeName: updated.Name, Reason: err.Error()})
 		if pol.DisableAuthOnHard {
@@ -1356,7 +1411,7 @@ func busiestEnabledNode(store *stateStore) string {
 	bestID := ""
 	bestN := -1
 	for _, n := range store.listNodes() {
-		if !n.Enabled || n.DisabledByGuard || n.ProxyURL == "" {
+		if !nodeSchedulable(n) {
 			continue
 		}
 		if n.AssignedAccountCount > bestN {
@@ -1368,6 +1423,79 @@ func busiestEnabledNode(store *stateStore) string {
 }
 
 // backgroundWorker periodically probes quarantined / active mode nodes.
+// extendQuarantineIfStillIsolated pushes QuarantinedUntil forward after a
+// failed or inconclusive restore probe so the worker does not burn a real
+// model request every 30s.
+func extendQuarantineIfStillIsolated(store *stateStore, nodeID string) {
+	if store == nil || nodeID == "" {
+		return
+	}
+	got, ok := store.getNode(nodeID)
+	if !ok || got == nil || !got.DisabledByGuard {
+		return
+	}
+	pol := store.policy()
+	sec := pol.QuarantineSec
+	if sec <= 0 {
+		sec = 3600
+	}
+	until := float64(time.Now().Add(time.Duration(sec) * time.Second).Unix())
+	_, _ = store.updateNode(nodeID, func(n *nodeRecord) error {
+		if !n.DisabledByGuard {
+			return nil
+		}
+		n.QuarantinedUntil = until
+		return nil
+	})
+}
+
+type guardWorkerJobKind string
+
+const (
+	guardWorkerJobQuality      guardWorkerJobKind = "quality"
+	guardWorkerJobConnectivity guardWorkerJobKind = "connectivity"
+)
+
+type guardWorkerJob struct {
+	NodeID string
+	Kind   guardWorkerJobKind
+}
+
+// planGuardWorkerJobs picks at most one isolated restore and, if none, at most
+// one regular quality probe. Empty isolated nodes only get connectivity so
+// they do not all borrow foreign[0] in the same tick.
+func planGuardWorkerJobs(nodes []*nodeRecord, now float64, pol policyConfig) []guardWorkerJob {
+	jobs := make([]guardWorkerJob, 0, 1)
+	restoreScheduled := false
+	for _, node := range nodes {
+		if node == nil {
+			continue
+		}
+		if node.DisabledByGuard && node.QuarantinedUntil > 0 && now >= node.QuarantinedUntil {
+			if restoreScheduled {
+				continue
+			}
+			restoreScheduled = true
+			kind := guardWorkerJobConnectivity
+			if nodeHasBoundRestoreFuel(node) {
+				kind = guardWorkerJobQuality
+			}
+			jobs = append(jobs, guardWorkerJob{NodeID: node.ID, Kind: kind})
+			continue
+		}
+		if restoreScheduled {
+			continue
+		}
+		if (pol.Mode == "active" || pol.Mode == "hybrid") &&
+			nodeSchedulable(node) && node.AssignedAccountCount > 0 &&
+			(node.LastProbeAt == 0 || now-node.LastProbeAt >= float64(pol.ActiveIntervalSec)) {
+			jobs = append(jobs, guardWorkerJob{NodeID: node.ID, Kind: guardWorkerJobQuality})
+			break
+		}
+	}
+	return jobs
+}
+
 func startGuardWorker(ctx context.Context, store *stateStore) {
 	go func() {
 		// First reconcile is deferred so plugin.register never blocks on
@@ -1393,18 +1521,18 @@ func startGuardWorker(ctx context.Context, store *stateStore) {
 				tick++
 				pol := store.policy()
 				now := float64(time.Now().Unix())
-				for _, n := range store.listNodes() {
-					if n.DisabledByGuard && n.QuarantinedUntil > 0 && now >= n.QuarantinedUntil {
-						_, _ = runNodeQuality(store, n.ID)
-						continue
+				for _, job := range planGuardWorkerJobs(store.listNodes(), now, pol) {
+					isolated := false
+					if node, ok := store.getNode(job.NodeID); ok && node != nil && node.DisabledByGuard {
+						isolated = true
 					}
-					if pol.Mode == "active" || pol.Mode == "hybrid" {
-						// light active cadence per node via last probe
-						if n.Enabled && !n.DisabledByGuard && (n.LastProbeAt == 0 || now-n.LastProbeAt >= float64(pol.ActiveIntervalSec)) {
-							// don't stampede — one per tick
-							_, _ = runNodeQuality(store, n.ID)
-							break
-						}
+					if job.Kind == guardWorkerJobConnectivity {
+						_, _ = runNodeConnectivity(store, job.NodeID)
+					} else {
+						_, _ = runNodeQuality(store, job.NodeID)
+					}
+					if isolated {
+						extendQuarantineIfStillIsolated(store, job.NodeID)
 					}
 				}
 				// Assigned counts are maintained on rebalance/migrate; a slow

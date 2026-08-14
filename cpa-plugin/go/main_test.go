@@ -174,20 +174,25 @@ func TestProbeUnstableErrDetection(t *testing.T) {
 	}
 }
 
-
-func TestDefaultPolicyThinkingFeaturesOn(t *testing.T) {
+func TestDefaultPolicyDefaults(t *testing.T) {
 	pol := defaultPolicy()
 	if !pol.ThinkingGuard {
 		t.Fatal("default ThinkingGuard should be on")
 	}
-	if !pol.ThinkingCrossVerify {
-		t.Fatal("default ThinkingCrossVerify should be on")
+	if pol.ThinkingCrossVerify {
+		t.Fatal("default ThinkingCrossVerify should be off to minimize active probes")
 	}
-	if !pol.SoftCrossVerify {
-		t.Fatal("default SoftCrossVerify should be on")
+	if pol.SoftCrossVerify {
+		t.Fatal("default SoftCrossVerify should be off to minimize active probes")
 	}
 	if pol.ConsecutiveMissingThinking != 1 {
 		t.Fatalf("default consecutive missing thinking=%d, want 1", pol.ConsecutiveMissingThinking)
+	}
+	if pol.QuarantineSec != 3600 {
+		t.Fatalf("default quarantine seconds=%d, want 3600", pol.QuarantineSec)
+	}
+	if pol.PolicySchema != 4 {
+		t.Fatalf("default policy schema=%d, want 4", pol.PolicySchema)
 	}
 	if got := classifyQuality(100, 64, false, pol); got != "hard" {
 		t.Fatalf("missing thinking with guard=%q, want hard", got)
@@ -204,17 +209,20 @@ func TestNormalizePolicyFillsAbsentBoolDefaults(t *testing.T) {
 	if !p.ThinkingGuard {
 		t.Fatal("absent thinking_guard must default on")
 	}
-	if !p.ThinkingCrossVerify {
-		t.Fatal("schema migration must turn thinking_cross_verify on")
+	if p.ThinkingCrossVerify {
+		t.Fatal("schema migration must default thinking_cross_verify off")
 	}
-	if !p.SoftCrossVerify {
-		t.Fatal("absent soft_cross_verify must default on")
+	if p.SoftCrossVerify {
+		t.Fatal("absent soft_cross_verify must default off")
 	}
 	if p.ConsecutiveMissingThinking != 1 {
 		t.Fatalf("consecutive_missing_thinking=%d, want 1", p.ConsecutiveMissingThinking)
 	}
-	if p.PolicySchema != 3 {
-		t.Fatalf("policy_schema=%d, want 3", p.PolicySchema)
+	if p.PolicySchema != 4 {
+		t.Fatalf("policy_schema=%d, want 4", p.PolicySchema)
+	}
+	if p.QuarantineSec != 3600 {
+		t.Fatalf("migrated quarantine_seconds=%d, want 3600", p.QuarantineSec)
 	}
 
 	// Intermediate build: explicit thinking_cross_verify=false but schema still 0.
@@ -226,29 +234,71 @@ func TestNormalizePolicyFillsAbsentBoolDefaults(t *testing.T) {
 		"thinking_cross_verify":        false,
 		"consecutive_missing_thinking": 1,
 	})
-	if !pMid.ThinkingCrossVerify {
-		t.Fatal("schema<2 must migrate thinking_cross_verify to default on even if false was persisted")
+	if pMid.ThinkingCrossVerify {
+		t.Fatal("schema<2 must migrate thinking_cross_verify to default off even if true was persisted")
 	}
-	if !pMid.SoftCrossVerify {
-		t.Fatal("schema migration must turn soft_cross_verify on")
+	if pMid.SoftCrossVerify {
+		t.Fatal("schema migration must turn soft_cross_verify off")
 	}
-	if pMid.PolicySchema != 3 {
-		t.Fatalf("migrated policy_schema=%d, want 3", pMid.PolicySchema)
+	if pMid.PolicySchema != 4 {
+		t.Fatalf("migrated policy_schema=%d, want 4", pMid.PolicySchema)
 	}
 
-	// After redesign (schema 2), explicit false must stick.
-	p2 := policyConfig{HardTPS: 1000, SoftTPS: 500, ThinkingGuard: true, ThinkingCrossVerify: false, SoftCrossVerify: false, ConsecutiveMissingThinking: 2, PolicySchema: 3}
+	// Live 1.0.8 leftover: schema 3 with both cross-verify flags still true.
+	pLive := policyConfig{HardTPS: 1000, SoftTPS: 500, ThinkingGuard: true, ThinkingCrossVerify: true, SoftCrossVerify: true, ConsecutiveMissingThinking: 1, QuarantineSec: 120, PolicySchema: 3}
+	normalizePolicy(&pLive, map[string]any{
+		"hard_tps":              1000,
+		"soft_tps":              500,
+		"thinking_guard":        true,
+		"thinking_cross_verify": true,
+		"soft_cross_verify":     true,
+		"quarantine_seconds":    120,
+		"policy_schema":         3,
+	})
+	if pLive.ThinkingCrossVerify {
+		t.Fatal("schema 3 leftover thinking_cross_verify=true must migrate off")
+	}
+	if pLive.SoftCrossVerify {
+		t.Fatal("schema 3 leftover soft_cross_verify=true must migrate off")
+	}
+	if pLive.QuarantineSec != 3600 {
+		t.Fatalf("schema 3 leftover quarantine 120s must migrate to 3600, got %d", pLive.QuarantineSec)
+	}
+	if pLive.PolicySchema != 4 {
+		t.Fatalf("live leftover policy_schema=%d, want 4", pLive.PolicySchema)
+	}
+
+	// Operator-chosen quarantine interval must survive the schema bump.
+	pCustom := policyConfig{HardTPS: 1000, SoftTPS: 500, ThinkingGuard: true, ThinkingCrossVerify: true, SoftCrossVerify: true, QuarantineSec: 300, PolicySchema: 3}
+	normalizePolicy(&pCustom, map[string]any{
+		"hard_tps":              1000,
+		"soft_tps":              500,
+		"thinking_guard":        true,
+		"thinking_cross_verify": true,
+		"soft_cross_verify":     true,
+		"quarantine_seconds":    300,
+		"policy_schema":         3,
+	})
+	if pCustom.QuarantineSec != 300 {
+		t.Fatalf("custom quarantine_seconds must stay 300, got %d", pCustom.QuarantineSec)
+	}
+	if pCustom.ThinkingCrossVerify || pCustom.SoftCrossVerify {
+		t.Fatal("schema 3 leftover cross-verify flags must migrate off even when quarantine is custom")
+	}
+
+	// After schema 4, explicit true must stick (operator re-enabled in panel).
+	p2 := policyConfig{HardTPS: 1000, SoftTPS: 500, ThinkingGuard: true, ThinkingCrossVerify: true, SoftCrossVerify: true, ConsecutiveMissingThinking: 2, PolicySchema: 4}
 	normalizePolicy(&p2, map[string]any{
 		"hard_tps":                     1000,
 		"soft_tps":                     500,
 		"thinking_guard":               true,
-		"thinking_cross_verify":        false,
-		"soft_cross_verify":            false,
+		"thinking_cross_verify":        true,
+		"soft_cross_verify":            true,
 		"consecutive_missing_thinking": 2,
-		"policy_schema":                3,
+		"policy_schema":                4,
 	})
-	if p2.ThinkingCrossVerify {
-		t.Fatal("explicit false after schema 2 must stay false")
+	if !p2.ThinkingCrossVerify || !p2.SoftCrossVerify {
+		t.Fatal("explicit true after schema 4 must stay true")
 	}
 
 	// Explicit thinking_guard=false stays false and forces cross-verify off.
@@ -363,8 +413,6 @@ func TestSoftCrossVerifySchedulesInsteadOfQuarantine(t *testing.T) {
 	endCrossVerify(node.ID)
 }
 
-
-
 func TestAuthDegradeCountsPassiveEvenWhenCrossVerifyScheduled(t *testing.T) {
 	store := newStateStore(filepath.Join(t.TempDir(), "state.json"))
 	node, err := store.createNode("n1", "http://127.0.0.1:7951", true, false, 10)
@@ -472,19 +520,6 @@ func TestManualDisabledAuthIsNotRestored(t *testing.T) {
 	}
 }
 
-func TestSchedulerSkipsCoolingStatuses(t *testing.T) {
-	for _, status := range []string{"disabled", "unavailable", "error", "cooling", "pending", "refreshing", "future-state"} {
-		if schedulerCandidateAvailable(pluginapi.SchedulerAuthCandidate{Status: status}) {
-			t.Fatalf("status %q should not be selected", status)
-		}
-	}
-	for _, status := range []string{"", "active", "ready"} {
-		if !schedulerCandidateAvailable(pluginapi.SchedulerAuthCandidate{Status: status}) {
-			t.Fatalf("status %q should be selectable", status)
-		}
-	}
-}
-
 func TestMigrationFailsClosedAndVerifiesHostAuthSave(t *testing.T) {
 	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
 	bad, err := store.createNode("bad", "http://127.0.0.1:7951", true, false, 10)
@@ -588,7 +623,414 @@ func TestMigrationFailsClosedAndVerifiesHostAuthSave(t *testing.T) {
 	}
 }
 
-func TestSchedulerSkipsQuarantinedNode(t *testing.T) {
+func withMockAuths(t *testing.T, auths map[string]map[string]any) {
+	t.Helper()
+	originalHostCall := hostCall
+	hostCall = func(method string, payload []byte) (json.RawMessage, error) {
+		switch method {
+		case pluginabi.MethodHostAuthList:
+			entries := make([]pluginapi.HostAuthFileEntry, 0, len(auths))
+			for name, raw := range auths {
+				disabled, _ := raw["disabled"].(bool)
+				entries = append(entries, pluginapi.HostAuthFileEntry{ID: name, AuthIndex: name, Name: name, Provider: "xai", Type: "xai", Disabled: disabled})
+			}
+			return json.Marshal(hostAuthListResponse{Files: entries})
+		case pluginabi.MethodHostAuthGet:
+			var request map[string]string
+			_ = json.Unmarshal(payload, &request)
+			name := request["auth_index"]
+			if name == "" {
+				name = request["name"]
+			}
+			raw, ok := auths[name]
+			if !ok {
+				return nil, fmt.Errorf("auth not found: %s", name)
+			}
+			body, _ := json.Marshal(raw)
+			return json.Marshal(hostAuthGetResponse{AuthIndex: name, Name: name, Path: "/auths/" + name, JSON: body})
+		case pluginabi.MethodHostAuthSave:
+			var request struct {
+				Name string          `json:"name"`
+				JSON json.RawMessage `json:"json"`
+			}
+			if err := json.Unmarshal(payload, &request); err != nil {
+				return nil, err
+			}
+			updated := map[string]any{}
+			if err := json.Unmarshal(request.JSON, &updated); err != nil {
+				return nil, err
+			}
+			auths[request.Name] = updated
+			return json.Marshal(pluginapi.HostAuthSaveResponse{Name: request.Name, Path: "/auths/" + request.Name})
+		default:
+			return nil, fmt.Errorf("unexpected host callback %s", method)
+		}
+	}
+	t.Cleanup(func() {
+		hostCall = originalHostCall
+		authProxyMu.Lock()
+		authProxyCache = nil
+		authProxyAt = time.Time{}
+		authProxyMu.Unlock()
+		invalidateAuthListCache()
+	})
+}
+
+func TestMigrationFallsBackWithoutRecentProbe(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	bad, err := store.createNode("bad", "http://127.0.0.1:7951", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	good, err := store.createNode("good", "http://127.0.0.1:7952", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auths := map[string]map[string]any{
+		"stuck.json": {"type": "xai", "email": "stuck@example.test", "access_token": "tok", "proxy_url": bad.ProxyURL, "disabled": false},
+	}
+	withMockAuths(t, auths)
+	if err := migrateAuthsOffNode(store, bad); err != nil {
+		t.Fatalf("cold-start fallback should succeed: %v", err)
+	}
+	if got := auths["stuck.json"]["proxy_url"]; got != good.ProxyURL {
+		t.Fatalf("auth proxy=%q, want fallback node %q", got, good.ProxyURL)
+	}
+	if disabled, _ := auths["stuck.json"]["disabled"].(bool); disabled {
+		t.Fatal("fallback-migrated auth remains disabled")
+	}
+}
+
+func TestMigrationFailureReenablesAuths(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	only, err := store.createNode("only", "http://127.0.0.1:7951", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auths := map[string]map[string]any{
+		"stuck.json": {"type": "xai", "email": "stuck@example.test", "access_token": "tok", "proxy_url": only.ProxyURL, "disabled": false},
+	}
+	withMockAuths(t, auths)
+	if err := migrateAuthsOffNode(store, only); err == nil {
+		t.Fatal("expected migrate error when no other node exists")
+	}
+	if disabled, _ := auths["stuck.json"]["disabled"].(bool); disabled {
+		t.Fatal("no-target migrate must roll back the fail-closed disable")
+	}
+	if got := auths["stuck.json"]["proxy_url"]; got != only.ProxyURL {
+		t.Fatalf("auth proxy=%q, want original", got)
+	}
+}
+
+func TestQuarantineDisableAuthOnHardFalseDoesNotLeaveDisabled(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	bad, err := store.createNode("bad", "http://127.0.0.1:7951", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	good, err := store.createNode("good", "http://127.0.0.1:7952", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pol := store.policy()
+	pol.DisableAuthOnHard = false
+	pol.MinHealthyNodes = 1
+	if err := store.updatePolicy(pol); err != nil {
+		t.Fatal(err)
+	}
+	auths := map[string]map[string]any{
+		"stuck.json": {"type": "xai", "email": "stuck@example.test", "access_token": "tok", "proxy_url": bad.ProxyURL, "disabled": false},
+	}
+	withMockAuths(t, auths)
+	original := hostCall
+	hostCall = func(method string, payload []byte) (json.RawMessage, error) {
+		if method == pluginabi.MethodHostAuthSave {
+			var request struct {
+				Name string          `json:"name"`
+				JSON json.RawMessage `json:"json"`
+			}
+			_ = json.Unmarshal(payload, &request)
+			updated := map[string]any{}
+			_ = json.Unmarshal(request.JSON, &updated)
+			if updated["proxy_url"] == good.ProxyURL {
+				return nil, fmt.Errorf("simulated dest bind failure")
+			}
+		}
+		return original(method, payload)
+	}
+	t.Cleanup(func() { hostCall = original })
+	quarantineNode(store, bad.ID, "missing thinking", 10, "hard")
+	got, _ := store.getNode(bad.ID)
+	if !got.DisabledByGuard {
+		t.Fatal("node must still be quarantined")
+	}
+	if got := auths["stuck.json"]["proxy_url"]; got != bad.ProxyURL {
+		t.Fatalf("failed dest bind must leave auth on original node, got %q", got)
+	}
+	if disabled, _ := auths["stuck.json"]["disabled"].(bool); disabled {
+		t.Fatal("DisableAuthOnHard=false must not leave the account disabled after migrate-fail rollback")
+	}
+}
+
+func TestNodeSchedulableFlags(t *testing.T) {
+	if nodeSchedulable(nil) {
+		t.Fatal("nil must not be schedulable")
+	}
+	if !nodeSchedulable(&nodeRecord{Enabled: true, ProxyURL: "http://127.0.0.1:1"}) {
+		t.Fatal("enabled node with proxy must be schedulable")
+	}
+	if nodeSchedulable(&nodeRecord{Enabled: true, DisabledByGuard: true, ProxyURL: "http://127.0.0.1:1"}) {
+		t.Fatal("quarantined node must not be schedulable")
+	}
+	if nodeSchedulable(&nodeRecord{Enabled: true}) {
+		t.Fatal("node without proxy must not be schedulable")
+	}
+}
+
+func TestNodeFallbackEligibleExcludesDegraded(t *testing.T) {
+	cold := &nodeRecord{Enabled: true, ProxyURL: "http://127.0.0.1:1"}
+	if !nodeFallbackEligible(cold) {
+		t.Fatal("never-probed node must stay fallback-eligible")
+	}
+	healthy := &nodeRecord{Enabled: true, ProxyURL: "http://127.0.0.1:1", LastClassification: "healthy"}
+	if !nodeFallbackEligible(healthy) {
+		t.Fatal("healthy node must stay fallback-eligible")
+	}
+	for _, class := range []string{"soft", "hard", "error"} {
+		n := &nodeRecord{Enabled: true, ProxyURL: "http://127.0.0.1:1", LastClassification: class}
+		if nodeFallbackEligible(n) {
+			t.Fatalf("classification %q must not be a fallback target", class)
+		}
+	}
+	ignoredOnly := &nodeRecord{Enabled: true, ProxyURL: "http://127.0.0.1:1", LastClassification: "ignored"}
+	if !nodeFallbackEligible(ignoredOnly) {
+		t.Fatal("never-quality ignored must stay fallback-eligible")
+	}
+}
+
+func TestIgnoredObservationDoesNotEraseSoftFallbackBlock(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	soft, err := store.createNode("soft", "http://127.0.0.1:7952", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad, err := store.createNode("bad", "http://127.0.0.1:7951", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyObservation(store, soft.ID, "passive", qualityResult{
+		Classification: "soft", HasThinking: true, OutputTokens: 64, TPS: 600,
+	})
+	applyObservation(store, soft.ID, "active", qualityResult{
+		Classification: "error", ErrorKind: "no_account", Error: "节点没有可用的绑定账号",
+	})
+	got, _ := store.getNode(soft.ID)
+	if got.LastClassification != "soft" {
+		t.Fatalf("ignored/no_account must not overwrite soft, got %q", got.LastClassification)
+	}
+	if nodeFallbackEligible(got) {
+		t.Fatal("soft node must stay ineligible after an ignored sample")
+	}
+	targets := fallbackMigrationTargets(store, bad)
+	for _, target := range targets {
+		if target.ID == soft.ID {
+			t.Fatal("soft-then-ignored node must not be a fallback dest")
+		}
+	}
+}
+
+func TestAuthIsBorrowedTreatsUnboundAsForeign(t *testing.T) {
+	node := &nodeRecord{ProxyURL: "http://127.0.0.1:7951"}
+	if !authIsBorrowed(authFile{ProxyURL: ""}, node) {
+		t.Fatal("unbound auth is borrowed relative to a managed node")
+	}
+	if authIsBorrowed(authFile{ProxyURL: node.ProxyURL}, node) {
+		t.Fatal("same-proxy auth is not borrowed")
+	}
+	if !authIsBorrowed(authFile{ProxyURL: "http://127.0.0.1:7952"}, node) {
+		t.Fatal("other-proxy auth is borrowed")
+	}
+}
+
+func TestAssignedCountIgnoresDisabledAndExpired(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	node, err := store.createNode("n1", "http://127.0.0.1:7951", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auths := map[string]map[string]any{
+		"live.json": {
+			"type": "xai", "email": "live@example.test", "access_token": "tok",
+			"proxy_url": node.ProxyURL, "disabled": false,
+		},
+		"disabled.json": {
+			"type": "xai", "email": "off@example.test", "access_token": "tok",
+			"proxy_url": node.ProxyURL, "disabled": true, "disabled_reason": "egress-guard 隔离中",
+		},
+		"expired.json": {
+			"type": "xai", "email": "old@example.test", "access_token": "tok",
+			"proxy_url": node.ProxyURL, "disabled": false, "expired": "2020-01-01T00:00:00Z",
+		},
+	}
+	withMockAuths(t, auths)
+	refreshAssignedCounts(store)
+	got, _ := store.getNode(node.ID)
+	if got.AssignedAccountCount != 1 {
+		t.Fatalf("AssignedAccountCount=%d, want 1 live binding", got.AssignedAccountCount)
+	}
+}
+
+func TestMigrationVerifyFailureRollsBackHostAndCache(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	bad, err := store.createNode("bad", "http://127.0.0.1:7951", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	good, err := store.createNode("good", "http://127.0.0.1:7952", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auths := map[string]map[string]any{
+		"stuck.json": {
+			"type": "xai", "email": "stuck@example.test", "access_token": "tok",
+			"proxy_url": bad.ProxyURL, "disabled": false,
+		},
+	}
+	withMockAuths(t, auths)
+	original := hostCall
+	hostCall = func(method string, payload []byte) (json.RawMessage, error) {
+		if method == pluginabi.MethodHostAuthGet {
+			var request map[string]string
+			_ = json.Unmarshal(payload, &request)
+			name := request["auth_index"]
+			if name == "" {
+				name = request["name"]
+			}
+			raw := auths[name]
+			stale := map[string]any{}
+			for k, v := range raw {
+				stale[k] = v
+			}
+			stale["proxy_url"] = bad.ProxyURL
+			body, _ := json.Marshal(stale)
+			return json.Marshal(hostAuthGetResponse{AuthIndex: name, Name: name, Path: "/auths/" + name, JSON: body})
+		}
+		return original(method, payload)
+	}
+	t.Cleanup(func() { hostCall = original })
+	if err := migrateAuthsOffNode(store, bad); err == nil {
+		t.Fatal("stale GET must fail dest verify")
+	}
+	if got := auths["stuck.json"]["proxy_url"]; got != bad.ProxyURL {
+		t.Fatalf("host file proxy=%q, want rolled back to original", got)
+	}
+	cached, err := listAuthFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range cached {
+		if item.Name == "stuck.json" && item.ProxyURL != bad.ProxyURL {
+			t.Fatalf("list cache proxy=%q, want original after verify rollback", item.ProxyURL)
+		}
+	}
+}
+
+func TestPickForeignAuthSpreadsAcrossNodes(t *testing.T) {
+	foreign := []authFile{
+		{Name: "a.json", ProxyURL: "http://127.0.0.1:1"},
+		{Name: "b.json", ProxyURL: "http://127.0.0.1:2"},
+	}
+	first, ok := pickForeignAuthForNode(&nodeRecord{ID: "a"}, foreign, nil)
+	if !ok {
+		t.Fatal("expected a foreign pick")
+	}
+	second, ok := pickForeignAuthForNode(&nodeRecord{ID: "b"}, foreign, nil)
+	if !ok {
+		t.Fatal("expected a foreign pick")
+	}
+	if first.Name == second.Name {
+		t.Fatalf("IDs a/b must hash to different pool slots, both=%s", first.Name)
+	}
+}
+
+func TestPlanGuardWorkerJobsLimitsRestoreAndSkipsEmptyModelProbe(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	emptyA, err := store.createNode("empty-a", "http://127.0.0.1:7951", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	emptyB, err := store.createNode("empty-b", "http://127.0.0.1:7952", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	live, err := store.createNode("live", "http://127.0.0.1:7953", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := float64(time.Now().Unix())
+	if _, err := store.updateNode(emptyA.ID, func(n *nodeRecord) error {
+		n.DisabledByGuard = true
+		n.QuarantinedUntil = now - 1
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.updateNode(emptyB.ID, func(n *nodeRecord) error {
+		n.DisabledByGuard = true
+		n.QuarantinedUntil = now - 1
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.updateNode(live.ID, func(n *nodeRecord) error {
+		n.AssignedAccountCount = 3
+		n.LastProbeAt = 0
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	withMockAuths(t, map[string]map[string]any{
+		"other.json": {
+			"type": "xai", "email": "other@example.test", "access_token": "tok",
+			"proxy_url": live.ProxyURL, "disabled": false,
+		},
+	})
+	emptyA, _ = store.getNode(emptyA.ID)
+	emptyB, _ = store.getNode(emptyB.ID)
+	live, _ = store.getNode(live.ID)
+	jobs := planGuardWorkerJobs([]*nodeRecord{emptyA, emptyB, live}, now, store.policy())
+	if len(jobs) != 1 {
+		t.Fatalf("jobs=%+v, want exactly one restore", jobs)
+	}
+	if jobs[0].Kind != guardWorkerJobConnectivity {
+		t.Fatalf("empty isolated restore kind=%q, want connectivity", jobs[0].Kind)
+	}
+
+	leftover, err := store.createNode("leftover", "http://127.0.0.1:7954", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.updateNode(leftover.ID, func(n *nodeRecord) error {
+		n.DisabledByGuard = true
+		n.QuarantinedUntil = now - 1
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	leftover, _ = store.getNode(leftover.ID)
+	withMockAuths(t, map[string]map[string]any{
+		"guard.json": {
+			"type": "xai", "email": "guard@example.test", "access_token": "tok",
+			"proxy_url": leftover.ProxyURL, "disabled": true, "disabled_reason": "egress-guard 隔离中",
+		},
+	})
+	jobs = planGuardWorkerJobs([]*nodeRecord{leftover}, now, store.policy())
+	if len(jobs) != 1 || jobs[0].Kind != guardWorkerJobQuality {
+		t.Fatalf("leftover isolated restore jobs=%+v, want quality", jobs)
+	}
+}
+
+func TestSchedulerHandsSelectionBackToHost(t *testing.T) {
 	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
 	bad, err := store.createNode("bad", "http://127.0.0.1:7951", true, false, 0)
 	if err != nil {
@@ -624,8 +1066,181 @@ func TestSchedulerSkipsQuarantinedNode(t *testing.T) {
 	if err := json.Unmarshal(env.Result, &response); err != nil {
 		t.Fatal(err)
 	}
-	if !response.Handled || response.AuthID != "auth-good" {
-		t.Fatalf("scheduler response=%+v", response)
+	if response.Handled || response.AuthID != "" {
+		t.Fatalf("scheduler must hand selection back to host affinity selector, response=%+v", response)
+	}
+}
+
+func decodeIntercept(t *testing.T, raw []byte) pluginapi.RequestInterceptResponse {
+	t.Helper()
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatal(err)
+	}
+	var response pluginapi.RequestInterceptResponse
+	if err := json.Unmarshal(env.Result, &response); err != nil {
+		t.Fatal(err)
+	}
+	return response
+}
+
+func TestListAuthsForNodeRecoverySkipsOperatorDisabled(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	isolated, err := store.createNode("iso", "http://127.0.0.1:7951", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := store.createNode("other", "http://127.0.0.1:7952", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auths := map[string]map[string]any{
+		"manual.json": {
+			"type": "xai", "email": "manual@example.test", "access_token": "manual-tok",
+			"proxy_url": isolated.ProxyURL, "disabled": true, "disabled_reason": "operator maintenance",
+		},
+		"guard.json": {
+			"type": "xai", "email": "guard@example.test", "access_token": "guard-tok",
+			"proxy_url": isolated.ProxyURL, "disabled": true, "disabled_reason": "egress-guard 隔离中",
+		},
+		"other.json": {
+			"type": "xai", "email": "other@example.test", "access_token": "other-tok",
+			"proxy_url": other.ProxyURL, "disabled": false,
+		},
+	}
+	withMockAuths(t, auths)
+	got, err := listAuthsForNodeMode(isolated, 8, authListRecovery)
+	if err != nil || len(got) == 0 {
+		t.Fatalf("recovery list err=%v got=%+v", err, got)
+	}
+	if got[0].Name != "guard.json" {
+		t.Fatalf("recovery must prefer guard-disabled leftover, got %+v", got[0])
+	}
+	for _, item := range got {
+		if item.Name == "manual.json" {
+			t.Fatal("operator-disabled leftover must not be used for restore probes")
+		}
+	}
+
+	delete(auths, "guard.json")
+	invalidateAuthListCache()
+	got, err = listAuthsForNodeMode(isolated, 8, authListRecovery)
+	if err != nil || len(got) != 1 || got[0].Name != "other.json" {
+		t.Fatalf("without guard leftover, recovery should borrow one foreign auth, got %+v err=%v", got, err)
+	}
+}
+
+func TestListAuthsForNodeDoesNotBorrowForeign(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	emptyNode, err := store.createNode("empty", "http://127.0.0.1:7951", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := store.createNode("other", "http://127.0.0.1:7952", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auths := map[string]map[string]any{
+		"other.json": {"type": "xai", "email": "other@example.test", "access_token": "tok", "proxy_url": other.ProxyURL, "disabled": false},
+	}
+	withMockAuths(t, auths)
+	got, err := listAuthsForNode(emptyNode, 8)
+	if err == nil {
+		t.Fatalf("empty node must not borrow a foreign auth, got %+v", got)
+	}
+	if !strings.Contains(err.Error(), "没有可用的绑定账号") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestMigrationSkipsDegradedFallbackTarget(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	bad, err := store.createNode("bad", "http://127.0.0.1:7951", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	soft, err := store.createNode("soft", "http://127.0.0.1:7952", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.updateNode(soft.ID, func(n *nodeRecord) error {
+		n.LastClassification = "soft"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	auths := map[string]map[string]any{
+		"stuck.json": {"type": "xai", "email": "stuck@example.test", "access_token": "tok", "proxy_url": bad.ProxyURL, "disabled": false},
+	}
+	withMockAuths(t, auths)
+	if err := migrateAuthsOffNode(store, bad); err == nil {
+		t.Fatal("soft dest must not be a fallback target")
+	}
+	if got := auths["stuck.json"]["proxy_url"]; got != bad.ProxyURL {
+		t.Fatalf("auth proxy=%q, want original", got)
+	}
+	if disabled, _ := auths["stuck.json"]["disabled"].(bool); disabled {
+		t.Fatal("failed fallback must roll back disable")
+	}
+}
+
+func TestMigrationSkipsSameExitIPFallback(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	bad, err := store.createNode("bad", "http://127.0.0.1:7951", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	twin, err := store.createNode("twin", "http://127.0.0.1:7952", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.updateNode(bad.ID, func(n *nodeRecord) error {
+		n.ExitIP = "203.0.113.10"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.updateNode(twin.ID, func(n *nodeRecord) error {
+		n.ExitIP = "203.0.113.10"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	bad, _ = store.getNode(bad.ID)
+	auths := map[string]map[string]any{
+		"stuck.json": {"type": "xai", "email": "stuck@example.test", "access_token": "tok", "proxy_url": bad.ProxyURL, "disabled": false},
+	}
+	withMockAuths(t, auths)
+	if err := migrateAuthsOffNode(store, bad); err == nil {
+		t.Fatal("same exit IP must not be a silent fallback success")
+	}
+	if got := auths["stuck.json"]["proxy_url"]; got != bad.ProxyURL {
+		t.Fatalf("auth proxy=%q, want original", got)
+	}
+}
+
+func TestLoadMigratesSchemaAndRecordsEvent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	raw := `{"version":1,"policy":{"mode":"hybrid","hard_tps":1000,"soft_tps":500,"thinking_guard":true,"thinking_cross_verify":true,"soft_cross_verify":true,"quarantine_seconds":120,"policy_schema":3},"nodes":{},"next_id":1}`
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := newStateStore(path)
+	pol := s.policy()
+	if pol.PolicySchema != 4 || pol.ThinkingCrossVerify || pol.SoftCrossVerify || pol.QuarantineSec != 3600 {
+		t.Fatalf("migrated policy=%+v", pol)
+	}
+	found := false
+	for _, ev := range s.events() {
+		if ev.Event == "policy_migrated" {
+			found = true
+			if !strings.Contains(ev.Reason, "schema 3") {
+				t.Fatalf("migration reason=%q", ev.Reason)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("schema upgrade must append policy_migrated")
 	}
 }
 
@@ -653,6 +1268,117 @@ func TestRequestInterceptorRejectsQuarantinedAuth(t *testing.T) {
 	_ = json.Unmarshal(env.Result, &response)
 	if !response.Terminate || response.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("interceptor response=%+v", response)
+	}
+}
+
+func TestRequestInterceptorFailClosedWithoutSelectedAuth(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	node, err := store.createNode("bad", "http://127.0.0.1:7951", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.updateNode(node.ID, func(value *nodeRecord) error { value.DisabledByGuard = true; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	rawRequest, _ := json.Marshal(pluginapi.RequestInterceptRequest{Metadata: map[string]any{}})
+	raw, err := handleRequestIntercept(rawRequest, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := decodeIntercept(t, raw)
+	if !response.Terminate || response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("missing selected auth during quarantine must fail closed, response=%+v", response)
+	}
+
+	if _, err := store.updateNode(node.ID, func(value *nodeRecord) error { value.DisabledByGuard = false; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	raw, err = handleRequestIntercept(rawRequest, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response = decodeIntercept(t, raw)
+	if response.Terminate {
+		t.Fatalf("missing selected auth with no quarantine must pass, response=%+v", response)
+	}
+}
+
+func TestRequestInterceptorAllowsUnmappedAuthDuringQuarantine(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	node, err := store.createNode("bad", "http://127.0.0.1:7951", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.updateNode(node.ID, func(value *nodeRecord) error { value.DisabledByGuard = true; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	authProxyMu.Lock()
+	authProxyCache = map[string]string{}
+	authProxyAt = time.Now()
+	authProxyMu.Unlock()
+	rawRequest, _ := json.Marshal(pluginapi.RequestInterceptRequest{Metadata: map[string]any{"selected_auth_id": "direct-unmanaged"}})
+	raw, err := handleRequestIntercept(rawRequest, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := decodeIntercept(t, raw)
+	if response.Terminate {
+		t.Fatalf("unmapped selected auth must pass during another node's quarantine, response=%+v", response)
+	}
+}
+
+func TestRequestInterceptorAllowsHealthySiblingDuringQuarantine(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	bad, err := store.createNode("bad", "http://127.0.0.1:7951", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	good, err := store.createNode("good", "http://127.0.0.1:7952", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.updateNode(bad.ID, func(value *nodeRecord) error { value.DisabledByGuard = true; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	authProxyMu.Lock()
+	authProxyCache = map[string]string{"auth-bad": bad.ProxyURL, "auth-good": good.ProxyURL}
+	authProxyAt = time.Now()
+	authProxyMu.Unlock()
+	rawRequest, _ := json.Marshal(pluginapi.RequestInterceptRequest{Metadata: map[string]any{"selected_auth_id": "auth-good"}})
+	raw, err := handleRequestIntercept(rawRequest, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := decodeIntercept(t, raw)
+	if response.Terminate {
+		t.Fatalf("healthy sibling auth must pass while another node is quarantined, response=%+v", response)
+	}
+}
+
+func TestRequestInterceptorResolvesSelectedAuthIndex(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	node, err := store.createNode("bad", "http://127.0.0.1:7951", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.updateNode(node.ID, func(value *nodeRecord) error { value.DisabledByGuard = true; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	authProxyMu.Lock()
+	authProxyCache = map[string]string{"idx-bad": node.ProxyURL}
+	authProxyAt = time.Now()
+	authProxyMu.Unlock()
+	rawRequest, _ := json.Marshal(pluginapi.RequestInterceptRequest{Metadata: map[string]any{
+		"selected_auth_id":    "runtime-uuid-not-in-cache",
+		"selected_auth_index": "idx-bad",
+	}})
+	raw, err := handleRequestIntercept(rawRequest, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := decodeIntercept(t, raw)
+	if !response.Terminate || response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("index fallback must still reject quarantined auth, response=%+v", response)
 	}
 }
 

@@ -13,19 +13,19 @@ import (
 )
 
 type policyConfig struct {
-	Mode                 string  `json:"mode"`
-	ActiveIntervalSec    int     `json:"active_interval_seconds"`
-	PassivePollSec       int     `json:"passive_poll_seconds"`
-	QuarantineSec        int     `json:"quarantine_seconds"`
-	SoftTPS              float64 `json:"soft_tps"`
-	HardTPS              float64 `json:"hard_tps"`
-	ConsecutiveSoft      int     `json:"consecutive_soft"`
-	ConsecutiveErrors    int     `json:"consecutive_errors"`
-	MinHealthyNodes      int     `json:"min_healthy_nodes"`
-	MinGenerationMs      int64   `json:"min_generation_ms"`
-	MinOutputTokens      int64   `json:"min_output_tokens"`
-	Model                string  `json:"model"`
-	DisableAuthOnHard    bool    `json:"disable_auth_on_hard"`
+	Mode              string  `json:"mode"`
+	ActiveIntervalSec int     `json:"active_interval_seconds"`
+	PassivePollSec    int     `json:"passive_poll_seconds"`
+	QuarantineSec     int     `json:"quarantine_seconds"`
+	SoftTPS           float64 `json:"soft_tps"`
+	HardTPS           float64 `json:"hard_tps"`
+	ConsecutiveSoft   int     `json:"consecutive_soft"`
+	ConsecutiveErrors int     `json:"consecutive_errors"`
+	MinHealthyNodes   int     `json:"min_healthy_nodes"`
+	MinGenerationMs   int64   `json:"min_generation_ms"`
+	MinOutputTokens   int64   `json:"min_output_tokens"`
+	Model             string  `json:"model"`
+	DisableAuthOnHard bool    `json:"disable_auth_on_hard"`
 	// ThinkingGuard enables missing-thinking 降智 detection. When false, quality
 	// classification falls back to the original soft/hard Token/s thresholds only.
 	// Absent in old state.json → default true (see normalizePolicy).
@@ -34,10 +34,12 @@ type policyConfig struct {
 	// on the same egress are required before isolation / cross-verify. Default 1.
 	ConsecutiveMissingThinking int `json:"consecutive_missing_thinking"`
 	// ThinkingCrossVerify defers missing-thinking isolation until an active probe
-	// also lacks thinking. Default true. May delay isolation and spend probe tokens.
+	// also lacks thinking. Default false to minimize active probes; operators can
+	// re-enable confirmation in the panel.
 	ThinkingCrossVerify bool `json:"thinking_cross_verify"`
 	// SoftCrossVerify defers soft-TPS isolation until an active probe confirms the
-	// anomaly. Default true.
+	// anomaly. Default false: passive observations quarantine directly to minimize
+	// active probes; operators can re-enable confirmation in the panel.
 	SoftCrossVerify      bool `json:"soft_cross_verify"`
 	MaxOutputTokensProbe int  `json:"max_output_tokens"`
 	// PolicySchema tracks policy feature revisions. Bump when new defaults must be
@@ -119,27 +121,27 @@ type statistics struct {
 
 // authDegradeRecord tracks per-account 降智 (missing-thinking) hits.
 type authDegradeRecord struct {
-	AuthID         string  `json:"auth_id"`
-	Label          string  `json:"label,omitempty"`
-	DegradedCount  int64   `json:"degraded_count"`
-	SampleCount    int64   `json:"sample_count"`
-	LastAt         float64 `json:"last_at,omitempty"`
-	LastReason     string  `json:"last_reason,omitempty"`
-	LastNodeID     string  `json:"last_node_id,omitempty"`
-	LastNodeName   string  `json:"last_node_name,omitempty"`
-	LastOutputTPS  float64 `json:"last_output_tps,omitempty"`
-	LastSource     string  `json:"last_source,omitempty"`
+	AuthID        string  `json:"auth_id"`
+	Label         string  `json:"label,omitempty"`
+	DegradedCount int64   `json:"degraded_count"`
+	SampleCount   int64   `json:"sample_count"`
+	LastAt        float64 `json:"last_at,omitempty"`
+	LastReason    string  `json:"last_reason,omitempty"`
+	LastNodeID    string  `json:"last_node_id,omitempty"`
+	LastNodeName  string  `json:"last_node_name,omitempty"`
+	LastOutputTPS float64 `json:"last_output_tps,omitempty"`
+	LastSource    string  `json:"last_source,omitempty"`
 }
 
 type guardState struct {
-	Version    int                           `json:"version"`
-	Policy     policyConfig                  `json:"policy"`
-	Nodes      map[string]*nodeRecord        `json:"nodes"`
-	Events     []guardEvent                  `json:"events"`
-	Stats      statistics                    `json:"statistics"`
-	AuthStats  map[string]*authDegradeRecord `json:"auth_stats"`
-	NextID     int                           `json:"next_id"`
-	UpdatedAt  float64                       `json:"updated_at"`
+	Version   int                           `json:"version"`
+	Policy    policyConfig                  `json:"policy"`
+	Nodes     map[string]*nodeRecord        `json:"nodes"`
+	Events    []guardEvent                  `json:"events"`
+	Stats     statistics                    `json:"statistics"`
+	AuthStats map[string]*authDegradeRecord `json:"auth_stats"`
+	NextID    int                           `json:"next_id"`
+	UpdatedAt float64                       `json:"updated_at"`
 }
 
 type stateStore struct {
@@ -158,7 +160,7 @@ func defaultPolicy() policyConfig {
 		Mode:                       "hybrid",
 		ActiveIntervalSec:          1800,
 		PassivePollSec:             5,
-		QuarantineSec:              120,
+		QuarantineSec:              3600,
 		SoftTPS:                    500,
 		HardTPS:                    1000,
 		ConsecutiveSoft:            2,
@@ -170,10 +172,10 @@ func defaultPolicy() policyConfig {
 		DisableAuthOnHard:          true,
 		ThinkingGuard:              true,
 		ConsecutiveMissingThinking: 1,
-		ThinkingCrossVerify:        true,
-		SoftCrossVerify:            true,
+		ThinkingCrossVerify:        false,
+		SoftCrossVerify:            false,
 		MaxOutputTokensProbe:       384,
-		PolicySchema:               3,
+		PolicySchema:               4,
 	}
 }
 
@@ -250,18 +252,26 @@ func normalizePolicy(p *policyConfig, rawPolicy map[string]any) {
 
 	// policy_schema migrations are one-shot product default upgrades.
 	// schema < 2: thinking redesign defaults
-	// schema < 3: soft cross-verify defaults to on
+	// schema < 3: soft cross-verify product default (now off)
+	// schema < 4: minimize active probes — both cross-verify flags off,
+	//             quarantine retest 120s -> 1h (only the old product default)
 	if p.PolicySchema < 2 {
 		if !has("consecutive_missing_thinking", "consecutiveMissingThinking") {
 			p.ConsecutiveMissingThinking = def.ConsecutiveMissingThinking
 		}
-		// Force ON once, even if an intermediate build persisted false.
 		p.ThinkingCrossVerify = def.ThinkingCrossVerify
 		p.SoftCrossVerify = def.SoftCrossVerify
+		if p.QuarantineSec == 120 {
+			p.QuarantineSec = def.QuarantineSec
+		}
 		p.PolicySchema = def.PolicySchema
 	} else if p.PolicySchema < def.PolicySchema {
-		// 2 -> 3: soft cross-verify product default flipped to on.
+		// Live 1.0.8 files are schema 3 with both cross-verify flags still true.
+		p.ThinkingCrossVerify = def.ThinkingCrossVerify
 		p.SoftCrossVerify = def.SoftCrossVerify
+		if p.QuarantineSec == 120 {
+			p.QuarantineSec = def.QuarantineSec
+		}
 		p.PolicySchema = def.PolicySchema
 	} else {
 		if !has("thinking_cross_verify", "thinkingCrossVerify") {
@@ -326,8 +336,9 @@ func (s *stateStore) load() error {
 		data.Policy = defaultPolicy()
 		rawPolicy = nil
 	}
-	beforeSchema := 0
+	beforeSchema := data.Policy.PolicySchema
 	if rawPolicy != nil {
+		beforeSchema = 0
 		// PolicySchema may be absent (0) in old files.
 		if v, ok := rawPolicy["policy_schema"].(float64); ok {
 			beforeSchema = int(v)
@@ -341,6 +352,17 @@ func (s *stateStore) load() error {
 	s.data = data
 	// Persist once when redesign migration ran so defaults become explicit keys.
 	if beforeSchema < defaultPolicy().PolicySchema {
+		s.data.Events = append(s.data.Events, guardEvent{
+			TS:    float64(time.Now().Unix()),
+			Event: "policy_migrated",
+			Reason: fmt.Sprintf(
+				"策略从 schema %d 升级到 %d：交叉验证改为产品默认关，隔离复测仅在仍为 120s 产品默认时改为 3600s",
+				beforeSchema, s.data.Policy.PolicySchema,
+			),
+		})
+		if len(s.data.Events) > 100 {
+			s.data.Events = s.data.Events[len(s.data.Events)-100:]
+		}
 		_ = s.persistLocked()
 	}
 	return nil
@@ -464,7 +486,7 @@ func (s *stateStore) updatePolicy(p policyConfig) error {
 		return fmt.Errorf("连续缺 thinking 次数需在 1 到 50 之间")
 	}
 	if p.QuarantineSec <= 0 {
-		p.QuarantineSec = 120
+		p.QuarantineSec = 3600
 	}
 	if p.ActiveIntervalSec < 60 || p.ActiveIntervalSec > 86400 {
 		return fmt.Errorf("主动检测间隔需在 60 到 86400 秒之间")
@@ -686,7 +708,6 @@ func (s *stateStore) events() []guardEvent {
 	return out
 }
 
-
 func (s *stateStore) recordAuthObservation(authID, label, source, nodeID, nodeName, class, reason string, tps float64, degraded bool) {
 	authID = strings.TrimSpace(authID)
 	if authID == "" || s == nil {
@@ -774,7 +795,6 @@ func (s *stateStore) clearAuthDegradeStats() {
 	s.data.AuthStats = map[string]*authDegradeRecord{}
 	_ = s.flushNowLocked()
 }
-
 
 func (s *stateStore) stats() statistics {
 	s.mu.Lock()

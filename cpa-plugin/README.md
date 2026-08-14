@@ -8,7 +8,7 @@
 | | |
 |---|---|
 | 插件名 | `grok2api-egress` |
-| 当前版本 | **1.0.8** |
+| 当前版本 | **1.0.9** |
 | 语言 | Go (`-buildmode=c-shared` → `.so`) |
 | CPA SDK | `CLIProxyAPI/v7` (`pluginabi` / `pluginapi`) |
 | 能力 | Management UI + Usage Plugin + Scheduler + Request Interceptor |
@@ -29,7 +29,7 @@
 - 把 CPA `xai-*.json` 账号的 `proxy_url` **粘性绑定**到 Node
 - 用 **被动 usage 观测 + 主动 quality probe** 判定 healthy / soft / hard / error；账号、额度、上游权限失败只记录为 ignored，不消耗出口错误次数
 - **隔离（quarantine）坏节点**，并 **migrate** 账号到健康通道
-- 调度阶段跳过隔离/冷却账号；选定账号与迁移发生竞态时返回可重试的 `503 + Retry-After: 1`
+- 选号交还 CPA session affinity，避免插件 round-robin 乱切账号；隔离时先 disable 受影响账号再迁出，选定账号与迁移竞态返回可重试的 `503 + Retry-After: 1`
 - 可选调用受信任的内部换 IP Webhook；只有确认出口 IP 已变化并通过真实模型复测才恢复节点
 - 提供完整 **管理 UI**（节点 CRUD、批量、重平衡、质量测试、策略、事件）
 
@@ -88,9 +88,10 @@
 
 | 能力 | 说明 |
 |---|---|
+| Session affinity | 选号交还 CPA `SessionAffinitySelector`，同一会话不轮询切号 |
 | Rebalance | 把启用中的 xAI 账号均分到健康节点 |
-| Migrate on quarantine | 隔离后立刻把账号迁到其他健康节点 |
-| Disable on hard（可选） | 隔离后无健康通道可迁移或迁移失败时，兜底 disable 原节点账号 |
+| Migrate on quarantine | 隔离后立刻先 disable 再把账号迁到其他健康节点 |
+| Disable on hard（可选） | 迁号完全失败并回滚 disable 后，是否再把仍挂在原节点的账号 disable；关则只靠节点隔离 + 拦截器挡流量 |
 
 绑定介质是 CPA auth JSON 里的 **`proxy_url` 字段**，不引入外部账号库。
 
@@ -374,6 +375,18 @@ CPA_LOADTEST_LOG_DIR=/var/log/cpa-loadtest \
 
 ---
 
+## 调度（v1.0.9）
+
+v1.0.5 起插件以 `Handled: true` 自己 round-robin 选号，本意是跳过隔离出口，但会绕过 CPA session affinity，同一会话每次请求换账号。v1.0.9 起 `handleSchedulerPick` 恒定 `Handled: false`，选号交还 host。隔离出口仍靠：
+
+- 迁号前先把受影响账号写成 `disabled`（CPA 丢弃 `candidate.Disabled`）
+- 再把账号绑到近期主动检测 healthy 且出口 IP 不同的节点；没有这类目标时降级迁到其他可调度且未判 soft/hard/error、出口 IP 也不同的节点；仍失败则回滚 disable
+- 选号与迁号竞态由 `handleRequestIntercept` 返回 `503 + Retry-After: 1`；选号后 metadata 缺少账号标识、同时存在隔离节点时同样 fail-closed。已选出但未映射到本插件节点的账号（直连/未托管出口）放行，不因池里另有隔离节点而被 503
+
+主动质量探测不经过这段 hook：它只使用本节点已绑定账号，经节点代理直连上游，空节点不借号。
+
+thinking / soft 交叉验证默认关（面板开关保留）；降智隔离复测默认 `120s → 3600s`，仅改写旧产品默认，操作员自定义值不覆盖。现网 1.0.8（`PolicySchema=3`）加载后一次性迁到 schema 4，并写一条 `policy_migrated` 事件。
+
 ## 性能（v1.0.8）
 
 低配机器上若出现 CPA 整体变卡 / CPU 打满，通常不是探测本身，而是旧版热路径对 `host.auth.list` + N 次 `host.auth.get` 的反复全量扫描，以及每条 usage 事件全量 `MarshalIndent` 写 `state.json`。
@@ -405,7 +418,7 @@ v1.0.7 起：
    强制 Grok/xAI 客户端头；节点上多账号轮试，降低单账号 401 误判。
 
 3. **隔离与恢复**
-   quarantine 写状态 → 同步摘除账号 → 仅迁移到近期主动检测 healthy 且出口 IP 不同的节点 → 后台 worker 到期探测 → restore。迁移写入后会从 CPA Host API 再读一次，校验 `proxy_url` 与 disabled 状态。
+   quarantine 写状态 → 同步摘除账号 → 优先迁到近期主动检测 healthy 且出口 IP 不同的节点，否则降级迁到未判异常且出口 IP 不同的可调度节点 → 仍失败则回滚 disable → 后台 worker 到期、且节点上仍有绑定账号时才复测 → restore。空节点保持隔离，不借号探测。迁移写入后会从 CPA Host API 再读一次，校验 `proxy_url` 与 disabled 状态。
 
 4. **误报控制**
    - 最短生成窗口 `min_generation_ms`
