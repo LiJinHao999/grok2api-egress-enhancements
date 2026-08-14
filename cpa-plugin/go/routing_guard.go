@@ -93,9 +93,10 @@ func selectedAuthKeysFromMetadata(meta map[string]any) []string {
 //
 // After handing selection back to CPA, this interceptor is the only request-
 // level gate. Missing selected-auth metadata during an xAI quarantine
-// fail-closes. A known selected auth that does not map to a managed node is
-// unmanaged (direct / unknown proxy) and must pass — another node's isolation
-// must not 503 the rest of the pool. Clearly non-xAI traffic is left alone.
+// fail-closes. A selected key that cannot be resolved (cold cache / list miss)
+// also fail-closes — a cache miss is not proof the auth is unmanaged. Only an
+// auth we positively know is unmanaged (direct / unknown proxy) may pass while
+// another node is isolated. Clearly non-xAI traffic is left alone.
 func handleRequestIntercept(request []byte, afterAuth bool) ([]byte, error) {
 	ensureStore()
 	var req pluginapi.RequestInterceptRequest
@@ -112,7 +113,13 @@ func handleRequestIntercept(request []byte, afterAuth bool) ([]byte, error) {
 		}
 		return okEnvelope(pluginapi.RequestInterceptResponse{})
 	}
-	nodeID := resolveNodeIDForAuth(store, selected...)
+	nodeID, known := lookupAuthBinding(store, selected...)
+	if !known {
+		if storeHasGuardQuarantine(store) && !interceptLooksLikeNonXAI(req) {
+			return quarantinedInterceptResponse()
+		}
+		return okEnvelope(pluginapi.RequestInterceptResponse{})
+	}
 	if nodeID == "" {
 		return okEnvelope(pluginapi.RequestInterceptResponse{})
 	}
@@ -124,21 +131,23 @@ func handleRequestIntercept(request []byte, afterAuth bool) ([]byte, error) {
 }
 
 func interceptLooksLikeNonXAI(req pluginapi.RequestInterceptRequest) bool {
-	blob := strings.ToLower(strings.Join([]string{
+	// Wire format (ToFormat/SourceFormat=openai) is not provider identity.
+	// CPA OpenAI-compat clients set SourceFormat=openai for Grok too.
+	provider := strings.ToLower(firstString(req.Metadata, "provider", "Provider", "model_provider"))
+	model := strings.ToLower(strings.Join([]string{
 		req.Model,
 		req.RequestedModel,
-		req.ToFormat,
-		req.SourceFormat,
-		firstString(req.Metadata, "provider", "Provider", "model_provider"),
 		firstString(req.Metadata, "model", "Model"),
 	}, " "))
+	blob := strings.TrimSpace(provider + " " + model)
 	if strings.Contains(blob, "xai") || strings.Contains(blob, "grok") {
 		return false
 	}
-	for _, marker := range []string{"gemini", "claude", "anthropic", "openai", "gpt-", "copilot", "vertex", "bedrock"} {
+	for _, marker := range []string{"gemini", "claude", "anthropic", "copilot", "vertex", "bedrock"} {
 		if strings.Contains(blob, marker) {
 			return true
 		}
 	}
-	return false
+	// Explicit non-xAI provider only. Model aliases like gpt-4 may be Grok.
+	return strings.Contains(provider, "openai")
 }

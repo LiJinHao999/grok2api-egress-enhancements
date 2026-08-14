@@ -286,6 +286,20 @@ func isGuardDisabledAuth(a authFile) bool {
 	return strings.Contains(reason, "egress-guard") || strings.Contains(reason, "降智")
 }
 
+func snapshotDisabledAuth(a authFile, reason string) authFile {
+	a.Disabled = true
+	obj := map[string]any{}
+	for k, v := range a.Raw {
+		obj[k] = v
+	}
+	obj["disabled"] = true
+	if reason != "" {
+		obj["disabled_reason"] = reason
+	}
+	a.Raw = obj
+	return a
+}
+
 // applyAuthBinding writes proxy/disabled flags, then read-back verifies.
 // If verify fails after a successful save, roll the host file and list cache
 // back to the pre-call binding so leftovers are not stranded on a dest the
@@ -303,6 +317,7 @@ func applyAuthBinding(a authFile, proxyURL string, disabled bool, reason string)
 	if err := verifyAuthBinding(a, proxyURL, disabled); err != nil {
 		if rbErr := setAuthProxyAndFlags(a, prevProxy, prevDisabled, prevReason); rbErr != nil {
 			invalidateAuthListCache()
+			invalidateAuthProxyCache()
 		}
 		return err
 	}
@@ -508,8 +523,8 @@ const (
 	authListBoundOnly authListMode = iota
 	// authListRecovery is for quarantined restore / rotate confirmation /
 	// manual quality on an isolated node. Prefer bound accounts (including
-	// guard-disabled leftovers), then borrow one foreign token. The HTTP
-	// client still goes through the quarantined proxy.
+	// guard-disabled leftovers). It never borrows a foreign token: an empty
+	// isolated node stays isolated until leftover fuel exists.
 	authListRecovery
 )
 
@@ -532,7 +547,7 @@ func listAuthsForNodeMode(node *nodeRecord, limit int, mode authListMode) ([]aut
 	if err != nil {
 		return nil, err
 	}
-	var primary, expired, disabledBound, foreign, foreignExpired []authFile
+	var primary, expired, disabledBound []authFile
 	for _, a := range auths {
 		tok, _ := a.Raw["access_token"].(string)
 		if strings.TrimSpace(tok) == "" {
@@ -545,22 +560,14 @@ func listAuthsForNodeMode(node *nodeRecord, limit int, mode authListMode) ([]aut
 			}
 			continue
 		}
-		if onNode {
-			if isAuthExpired(a) {
-				expired = append(expired, a)
-				continue
-			}
-			primary = append(primary, a)
-			continue
-		}
-		if mode != authListRecovery {
+		if !onNode {
 			continue
 		}
 		if isAuthExpired(a) {
-			foreignExpired = append(foreignExpired, a)
+			expired = append(expired, a)
 			continue
 		}
-		foreign = append(foreign, a)
+		primary = append(primary, a)
 	}
 	out := make([]authFile, 0, limit)
 	out = append(out, primary...)
@@ -569,11 +576,6 @@ func listAuthsForNodeMode(node *nodeRecord, limit int, mode authListMode) ([]aut
 	}
 	if len(out) == 0 && mode == authListRecovery {
 		out = append(out, disabledBound...)
-	}
-	if len(out) == 0 && mode == authListRecovery {
-		if picked, ok := pickForeignAuthForNode(node, foreign, foreignExpired); ok {
-			out = append(out, picked)
-		}
 	}
 	if len(out) > limit {
 		out = out[:limit]
@@ -772,7 +774,7 @@ func migrateAuthsOffNode(store *stateStore, bad *nodeRecord) error {
 		return nil
 	}
 	// Remove every affected account from scheduling before changing its proxy.
-	for _, a := range affected {
+	for i, a := range affected {
 		if a.Disabled {
 			continue
 		}
@@ -780,6 +782,9 @@ func migrateAuthsOffNode(store *stateStore, bad *nodeRecord) error {
 			_ = enableAuthsOnNode(bad)
 			return fmt.Errorf("隔离账号 %s 失败: %w", a.Name, err)
 		}
+		// applyAuthBinding rolls back to this snapshot. Keep leftovers disabled
+		// on the bad proxy if dest verify fails mid-migrate.
+		affected[i] = snapshotDisabledAuth(a, "egress-guard 隔离中")
 	}
 	healthy, usedFallback := pickMigrationTargets(store, bad)
 	if len(healthy) == 0 {

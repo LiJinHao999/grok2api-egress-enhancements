@@ -852,18 +852,27 @@ func (s *stateStore) setAssignedCounts(counts map[string]int) {
 }
 
 // nodeIDByProxy returns the node id bound to proxyURL (O(nodes), typically small).
+// If two records share a proxy, prefer the quarantined one so the interceptor
+// fail-closes instead of treating the shared line as a healthy sibling.
 func (s *stateStore) nodeIDByProxy(proxyURL string) string {
 	if s == nil || proxyURL == "" {
 		return ""
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	fallback := ""
 	for _, n := range s.data.Nodes {
-		if n.ProxyURL == proxyURL {
+		if n.ProxyURL != proxyURL {
+			continue
+		}
+		if n.DisabledByGuard {
 			return n.ID
 		}
+		if fallback == "" {
+			fallback = n.ID
+		}
 	}
-	return ""
+	return fallback
 }
 
 func publicNode(n *nodeRecord) map[string]any {

@@ -772,6 +772,107 @@ func TestQuarantineDisableAuthOnHardFalseDoesNotLeaveDisabled(t *testing.T) {
 	}
 }
 
+func TestQuarantineDisableAuthOnHardLeavesLeftoverDisabled(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	bad, err := store.createNode("bad", "http://127.0.0.1:7951", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	good, err := store.createNode("good", "http://127.0.0.1:7952", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pol := store.policy()
+	if !pol.DisableAuthOnHard {
+		t.Fatal("default DisableAuthOnHard must be true")
+	}
+	pol.MinHealthyNodes = 1
+	if err := store.updatePolicy(pol); err != nil {
+		t.Fatal(err)
+	}
+	auths := map[string]map[string]any{
+		"stuck.json": {"type": "xai", "email": "stuck@example.test", "access_token": "tok", "proxy_url": bad.ProxyURL, "disabled": false},
+	}
+	withMockAuths(t, auths)
+	original := hostCall
+	hostCall = func(method string, payload []byte) (json.RawMessage, error) {
+		if method == pluginabi.MethodHostAuthSave {
+			var request struct {
+				Name string          `json:"name"`
+				JSON json.RawMessage `json:"json"`
+			}
+			_ = json.Unmarshal(payload, &request)
+			updated := map[string]any{}
+			_ = json.Unmarshal(request.JSON, &updated)
+			if updated["proxy_url"] == good.ProxyURL {
+				return nil, fmt.Errorf("simulated dest bind failure")
+			}
+		}
+		return original(method, payload)
+	}
+	t.Cleanup(func() { hostCall = original })
+	quarantineNode(store, bad.ID, "missing thinking", 10, "hard")
+	if got := auths["stuck.json"]["proxy_url"]; got != bad.ProxyURL {
+		t.Fatalf("failed dest bind must leave auth on original node, got %q", got)
+	}
+	if disabled, _ := auths["stuck.json"]["disabled"].(bool); !disabled {
+		t.Fatal("default DisableAuthOnHard must leave leftover disabled on the original proxy")
+	}
+}
+
+func TestApplyAuthBindingVerifyFailureKeepsDisabledSnapshot(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	bad, err := store.createNode("bad", "http://127.0.0.1:7951", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	good, err := store.createNode("good", "http://127.0.0.1:7952", true, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auths := map[string]map[string]any{
+		"stuck.json": {
+			"type": "xai", "email": "stuck@example.test", "access_token": "tok",
+			"proxy_url": bad.ProxyURL, "disabled": true, "disabled_reason": "egress-guard 隔离中",
+		},
+	}
+	withMockAuths(t, auths)
+	original := hostCall
+	hostCall = func(method string, payload []byte) (json.RawMessage, error) {
+		if method == pluginabi.MethodHostAuthGet {
+			var request map[string]string
+			_ = json.Unmarshal(payload, &request)
+			name := request["auth_index"]
+			if name == "" {
+				name = request["name"]
+			}
+			raw := auths[name]
+			stale := map[string]any{}
+			for k, v := range raw {
+				stale[k] = v
+			}
+			stale["proxy_url"] = bad.ProxyURL
+			body, _ := json.Marshal(stale)
+			return json.Marshal(hostAuthGetResponse{AuthIndex: name, Name: name, Path: "/auths/" + name, JSON: body})
+		}
+		return original(method, payload)
+	}
+	t.Cleanup(func() { hostCall = original })
+	items, err := listAuthFiles()
+	if err != nil || len(items) != 1 {
+		t.Fatalf("listAuthFiles err=%v items=%+v", err, items)
+	}
+	if err := applyAuthBinding(items[0], good.ProxyURL, false, ""); err == nil {
+		t.Fatal("stale GET must fail dest verify")
+	}
+	if got := auths["stuck.json"]["proxy_url"]; got != bad.ProxyURL {
+		t.Fatalf("host file proxy=%q, want original", got)
+	}
+	if disabled, _ := auths["stuck.json"]["disabled"].(bool); !disabled {
+		t.Fatal("verify-fail rollback must keep the pre-call disabled snapshot")
+	}
+}
+
 func TestNodeSchedulableFlags(t *testing.T) {
 	if nodeSchedulable(nil) {
 		t.Fatal("nil must not be schedulable")
@@ -827,6 +928,9 @@ func TestIgnoredObservationDoesNotEraseSoftFallbackBlock(t *testing.T) {
 	got, _ := store.getNode(soft.ID)
 	if got.LastClassification != "soft" {
 		t.Fatalf("ignored/no_account must not overwrite soft, got %q", got.LastClassification)
+	}
+	if got.SoftStrikes == 0 {
+		t.Fatal("ignored sample must not reset soft strikes")
 	}
 	if nodeFallbackEligible(got) {
 		t.Fatal("soft node must stay ineligible after an ignored sample")
@@ -1125,8 +1229,11 @@ func TestListAuthsForNodeRecoverySkipsOperatorDisabled(t *testing.T) {
 	delete(auths, "guard.json")
 	invalidateAuthListCache()
 	got, err = listAuthsForNodeMode(isolated, 8, authListRecovery)
-	if err != nil || len(got) != 1 || got[0].Name != "other.json" {
-		t.Fatalf("without guard leftover, recovery should borrow one foreign auth, got %+v err=%v", got, err)
+	if err == nil {
+		t.Fatalf("empty isolated recovery must not borrow a foreign auth, got %+v", got)
+	}
+	if !strings.Contains(err.Error(), "没有可用于隔离复测") {
+		t.Fatalf("error=%v", err)
 	}
 }
 
@@ -1313,7 +1420,7 @@ func TestRequestInterceptorAllowsUnmappedAuthDuringQuarantine(t *testing.T) {
 		t.Fatal(err)
 	}
 	authProxyMu.Lock()
-	authProxyCache = map[string]string{}
+	authProxyCache = map[string]string{"direct-unmanaged": authProxyUnmanaged}
 	authProxyAt = time.Now()
 	authProxyMu.Unlock()
 	rawRequest, _ := json.Marshal(pluginapi.RequestInterceptRequest{Metadata: map[string]any{"selected_auth_id": "direct-unmanaged"}})
@@ -1323,7 +1430,7 @@ func TestRequestInterceptorAllowsUnmappedAuthDuringQuarantine(t *testing.T) {
 	}
 	response := decodeIntercept(t, raw)
 	if response.Terminate {
-		t.Fatalf("unmapped selected auth must pass during another node's quarantine, response=%+v", response)
+		t.Fatalf("known unmanaged selected auth must pass during another node's quarantine, response=%+v", response)
 	}
 }
 
@@ -1379,6 +1486,92 @@ func TestRequestInterceptorResolvesSelectedAuthIndex(t *testing.T) {
 	response := decodeIntercept(t, raw)
 	if !response.Terminate || response.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("index fallback must still reject quarantined auth, response=%+v", response)
+	}
+}
+
+func TestRequestInterceptorFailClosedOnUnresolvedAuthDuringQuarantine(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	node, err := store.createNode("bad", "http://127.0.0.1:7951", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.updateNode(node.ID, func(value *nodeRecord) error { value.DisabledByGuard = true; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	authProxyMu.Lock()
+	authProxyCache = map[string]string{}
+	authProxyAt = time.Now()
+	authProxyMu.Unlock()
+	rawRequest, _ := json.Marshal(pluginapi.RequestInterceptRequest{Metadata: map[string]any{"selected_auth_id": "maybe-quarantined"}})
+	raw, err := handleRequestIntercept(rawRequest, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := decodeIntercept(t, raw)
+	if !response.Terminate || response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("unresolved selected auth during quarantine must fail closed, response=%+v", response)
+	}
+}
+
+func TestRequestInterceptorFailClosedIgnoresOpenAIWireFormat(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	node, err := store.createNode("bad", "http://127.0.0.1:7951", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.updateNode(node.ID, func(value *nodeRecord) error { value.DisabledByGuard = true; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	rawRequest, _ := json.Marshal(pluginapi.RequestInterceptRequest{
+		ToFormat:     "openai",
+		SourceFormat: "openai",
+		Metadata:     map[string]any{},
+	})
+	raw, err := handleRequestIntercept(rawRequest, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := decodeIntercept(t, raw)
+	if !response.Terminate || response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("openai wire format without selected auth must still fail closed, response=%+v", response)
+	}
+
+	rawRequest, _ = json.Marshal(pluginapi.RequestInterceptRequest{
+		Model:        "grok-4.5",
+		ToFormat:     "openai",
+		SourceFormat: "openai",
+		Metadata:     map[string]any{},
+	})
+	raw, err = handleRequestIntercept(rawRequest, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response = decodeIntercept(t, raw)
+	if !response.Terminate {
+		t.Fatal("grok model with openai wire format must still fail closed")
+	}
+}
+
+func TestRequestInterceptorAllowsNonXAIWithoutSelectedAuth(t *testing.T) {
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	node, err := store.createNode("bad", "http://127.0.0.1:7951", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.updateNode(node.ID, func(value *nodeRecord) error { value.DisabledByGuard = true; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	rawRequest, _ := json.Marshal(pluginapi.RequestInterceptRequest{
+		Model:    "claude-sonnet-4",
+		Metadata: map[string]any{},
+	})
+	raw, err := handleRequestIntercept(rawRequest, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := decodeIntercept(t, raw)
+	if response.Terminate {
+		t.Fatalf("explicit non-xAI model must pass during xAI quarantine, response=%+v", response)
 	}
 }
 

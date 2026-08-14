@@ -48,8 +48,13 @@ var (
 	authProxyAt    time.Time
 )
 
+// authProxyUnmanaged marks an auth we have seen with no managed proxy_url.
+// A missing cache key is not the same thing: that is an unresolved miss.
+const authProxyUnmanaged = "\x00unmanaged"
+
 func invalidateAuthProxyCache() {
 	authProxyMu.Lock()
+	authProxyCache = nil
 	authProxyAt = time.Time{}
 	authProxyMu.Unlock()
 }
@@ -75,27 +80,11 @@ func refreshAuthProxyCache() map[string]string {
 	}
 	out := map[string]string{}
 	for _, a := range auths {
-		if a.ProxyURL == "" {
-			continue
+		proxy := strings.TrimSpace(a.ProxyURL)
+		if proxy == "" {
+			proxy = authProxyUnmanaged
 		}
-		if a.Index != "" {
-			out[a.Index] = a.ProxyURL
-		}
-		if a.ID != "" {
-			out[a.ID] = a.ProxyURL
-		}
-		if a.Name != "" {
-			out[a.Name] = a.ProxyURL
-			out[strings.TrimSuffix(a.Name, ".json")] = a.ProxyURL
-		}
-		if a.Email != "" {
-			out["xai-"+a.Email+".json"] = a.ProxyURL
-			out[a.Email] = a.ProxyURL
-		}
-		if a.Path != "" {
-			out[a.Path] = a.ProxyURL
-			out[filepath.Base(a.Path)] = a.ProxyURL
-		}
+		indexAuthProxyKeys(out, a, proxy)
 	}
 
 	authProxyMu.Lock()
@@ -105,32 +94,70 @@ func refreshAuthProxyCache() map[string]string {
 	return out
 }
 
-// resolveNodeIDForAuth is on the request hot path. It consults the in-memory
-// proxy map (rebuilt from the auth-list cache on TTL miss). A miss yields ""
-// rather than issuing N host.auth.get calls for the selected id.
-func resolveNodeIDForAuth(store *stateStore, authKeys ...string) string {
+func indexAuthProxyKeys(out map[string]string, a authFile, proxy string) {
+	if out == nil || proxy == "" {
+		return
+	}
+	if a.Index != "" {
+		out[a.Index] = proxy
+	}
+	if a.ID != "" {
+		out[a.ID] = proxy
+	}
+	if a.Name != "" {
+		out[a.Name] = proxy
+		out[strings.TrimSuffix(a.Name, ".json")] = proxy
+	}
+	if a.Email != "" {
+		out["xai-"+a.Email+".json"] = proxy
+		out[a.Email] = proxy
+	}
+	if a.Path != "" {
+		out[a.Path] = proxy
+		out[filepath.Base(a.Path)] = proxy
+	}
+}
+
+// lookupAuthBinding resolves selected-auth keys against the in-memory proxy map.
+// known=true means we have seen this auth (managed node, empty proxy, or an
+// unknown proxy URL). known=false is a cache/list miss and must not be treated
+// as unmanaged during quarantine.
+func lookupAuthBinding(store *stateStore, authKeys ...string) (nodeID string, known bool) {
 	if store == nil {
-		return ""
+		return "", false
 	}
 	cache := refreshAuthProxyCache()
 	var proxy string
+	found := false
 	for _, k := range authKeys {
 		k = strings.TrimSpace(k)
 		if k == "" {
 			continue
 		}
-		if p, ok := cache[k]; ok && p != "" {
+		if p, ok := cache[k]; ok {
 			proxy = p
+			found = true
 			break
 		}
 	}
-	if proxy == "" {
-		return ""
+	if !found {
+		return "", false
+	}
+	if proxy == "" || proxy == authProxyUnmanaged {
+		return "", true
 	}
 	if id := store.nodeIDByProxy(proxy); id != "" {
-		return id
+		return id, true
 	}
-	return ""
+	return "", true
+}
+
+// resolveNodeIDForAuth is on the request hot path. It consults the in-memory
+// proxy map (rebuilt from the auth-list cache on TTL miss). A miss yields ""
+// rather than issuing N host.auth.get calls for the selected id.
+func resolveNodeIDForAuth(store *stateStore, authKeys ...string) string {
+	id, _ := lookupAuthBinding(store, authKeys...)
+	return id
 }
 
 func classifyTPS(tps float64, soft, hard float64) string {
@@ -590,18 +617,25 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 		return res
 	}
 
-	// connectivity first for exit IP. A dead proxy must not burn a borrowed
-	// foreign token on a model completion.
+	// connectivity first for exit IP. Isolated restore never borrows a foreign
+	// token; empty isolated nodes stay on connectivity only.
 	connOK := false
 	if ip, _, errIP := probeConnectivity(node.ProxyURL); errIP == nil {
 		res.ExitIP = ip
 		connOK = true
 	}
 
+	if node.DisabledByGuard && !nodeHasBoundRestoreFuel(node) {
+		res.Classification = "error"
+		res.ErrorKind = "no_account"
+		res.Error = "隔离节点没有可用于复测的绑定账号"
+		return res
+	}
+
 	mode := authListBoundOnly
 	if node.DisabledByGuard {
-		// Isolated restore / rotate confirmation / manual quality: use leftover
-		// disabled bindings first, then one foreign token through this proxy.
+		// Isolated restore / rotate confirmation / manual quality: leftover
+		// bindings only. Never borrow another egress's quota.
 		mode = authListRecovery
 	}
 	candidates, err := listAuthsForNodeMode(node, 8, mode)
@@ -972,7 +1006,10 @@ func applyObservation(store *stateStore, nodeID, source string, res qualityResul
 		n.LastOutputTokens = res.OutputTokens
 		n.LastSource = source
 		n.LastObservedAt = now
-		if source == "active" {
+		// ignored/unknown must not refresh verified-dest freshness. A quota or
+		// no_account sample would otherwise make a stale-healthy node look recently
+		// probed and become a migrate dest.
+		if source == "active" && res.Classification != "ignored" && res.Classification != "unknown" {
 			n.LastProbeAt = now
 		}
 		if res.ExitIP != "" {

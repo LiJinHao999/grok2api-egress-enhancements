@@ -381,7 +381,7 @@ v1.0.5 起插件以 `Handled: true` 自己 round-robin 选号，本意是跳过�
 
 - 迁号前先把受影响账号写成 `disabled`（CPA 丢弃 `candidate.Disabled`）
 - 再把账号绑到近期主动检测 healthy 且出口 IP 不同的节点；没有这类目标时降级迁到其他可调度且未判 soft/hard/error、出口 IP 也不同的节点；仍失败则回滚 disable
-- 选号与迁号竞态由 `handleRequestIntercept` 返回 `503 + Retry-After: 1`；选号后 metadata 缺少账号标识、同时存在隔离节点时同样 fail-closed。已选出但未映射到本插件节点的账号（直连/未托管出口）放行，不因池里另有隔离节点而被 503
+- 选号与迁号竞态由 `handleRequestIntercept` 返回 `503 + Retry-After: 1`；选号后 metadata 缺少账号标识、同时存在隔离节点时同样 fail-closed。缓存 miss / 解析不到绑定也 fail-closed，不能把“查不到”当成直连。只有明确已知未托管（无 `proxy_url` 或未知代理）的账号才放行。OpenAI 兼容的 `SourceFormat`/`ToFormat` 不算非 xAI 证据
 
 主动质量探测不经过这段 hook：它只使用本节点已绑定账号，经节点代理直连上游，空节点不借号。
 
