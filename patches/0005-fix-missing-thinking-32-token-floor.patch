@@ -1,0 +1,48 @@
+From 8d73c80a33d8ea80bff93206bfb0f5033a39bc28 Mon Sep 17 00:00:00 2001
+From: lij768423-svg <lij768423@gmail.com>
+Date: Fri, 14 Aug 2026 21:56:07 +0800
+Subject: [PATCH] fix: treat 32+ token replies with no thinking as degrade
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Short 降智 answers (30-40 tokens, reasoning=0) were skipped by the
+64-token floor. Isolate those; keep sub-32 samples ignored.
+---
+ tools/egress-quality-guard/quality_guard.py      | 4 ++--
+ tools/egress-quality-guard/quality_guard_test.py | 4 +++-
+ 2 files changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/tools/egress-quality-guard/quality_guard.py b/tools/egress-quality-guard/quality_guard.py
+index 7c03a82..591ad98 100755
+--- a/tools/egress-quality-guard/quality_guard.py
++++ b/tools/egress-quality-guard/quality_guard.py
+@@ -433,8 +433,8 @@ def classify_audit(value: dict[str, Any], config: Config) -> tuple[str, str, flo
+     speed = float(output_tokens) * 1000 / float(generation_ms)
+     reasoning_tokens = max(0, int(value.get("reasoningTokens") or 0))
+     # Backend model swaps often keep a normal 80-200 TPS but drop thinking.
+-    # TPS-only rules treat those as healthy.
+-    if output_tokens >= 64 and reasoning_tokens <= 0:
++    # A few reasoning tokens on a long reply is the same failure mode.
++    if output_tokens >= 32 and reasoning_tokens <= 0:
+         return "hard", "missing_thinking", speed, output_tokens
+     if config.fail_closed and generation_ms < config.min_generation_ms and speed >= config.soft_tps:
+         return "hard", "buffered_burst", speed, output_tokens
+diff --git a/tools/egress-quality-guard/quality_guard_test.py b/tools/egress-quality-guard/quality_guard_test.py
+index 4daa289..9deaf13 100644
+--- a/tools/egress-quality-guard/quality_guard_test.py
++++ b/tools/egress-quality-guard/quality_guard_test.py
+@@ -78,7 +78,9 @@ class ClassificationTests(unittest.TestCase):
+         self.assertEqual((classification, reason), ("healthy", "within_threshold"))
+         self.assertAlmostEqual(speed, 100.0)
+         short = {**base, "outputTokens": 50, "reasoningTokens": 0, "durationMs": 2500}
+-        self.assertEqual(quality_guard.classify_audit(short, cfg)[0], "healthy")
++        self.assertEqual(quality_guard.classify_audit(short, cfg)[:2], ("hard", "missing_thinking"))
++        tiny = {**base, "outputTokens": 20, "reasoningTokens": 0, "durationMs": 2200}
++        self.assertEqual(quality_guard.classify_audit(tiny, cfg)[0], "ignored")
+ 
+     def test_probe_missing_thinking_is_hard(self):
+         cfg = config()
+-- 
+2.50.1 (Apple Git-155)
+

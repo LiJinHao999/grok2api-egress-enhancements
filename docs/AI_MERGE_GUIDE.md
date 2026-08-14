@@ -14,11 +14,12 @@
 基线补丁（v3.1.2+）：patches/0002-feat-add-degraded-account-monitor.patch
 增量补丁（探针方案）：patches/0003-feat-add-quality-guard-probe-profiles.patch
 增量补丁（双探针 + thinking）：patches/0004-fix-dual-probe-recovery-and-thinking-guard.patch
+增量补丁（短回复 0 thinking）：patches/0005-fix-missing-thinking-32-token-floor.patch
 遗留补丁（仅 v3.0.11）：patches/0001-feat-add-egress-recovery-and-quality-guard.patch
 设计说明：docs/FEATURES.md
 
 要求：
-1. 先阅读目标仓库当前的出口节点、代理池、请求审计、管理员路由和前端结构。目标已是 v3.1.x 时应用 0002、0003、0004，不要再打 0001。
+1. 先阅读目标仓库当前的出口节点、代理池、请求审计、管理员路由和前端结构。目标已是 v3.1.x 时应用 0002、0003、0004、0005，不要再打 0001。
 2. 使用 git am --3way 尝试应用补丁；有冲突时按语义移植，不得整文件覆盖新版实现。
 3. 保留目标版本新增的数据库字段、API、路由策略、鉴权中间件和 UI 行为。
 4. 固定代理快速恢复必须保持：先持久化冷却，再启动按节点合并的独立探针；绑定请求限时等待；健康后重新读取状态；不健康维持冷却；请求取消立即退出。
@@ -47,6 +48,7 @@ git checkout -b port-egress-enhancements v3.1.2
 git am --3way patches/0002-feat-add-degraded-account-monitor.patch
 git am --3way patches/0003-feat-add-quality-guard-probe-profiles.patch
 git am --3way patches/0004-fix-dual-probe-recovery-and-thinking-guard.patch
+git am --3way patches/0005-fix-missing-thinking-32-token-floor.patch
 ```
 
 如果 `git am` 停在冲突状态，让 AI 工具先运行 `git status`，逐个读取冲突文件的新版上下文和补丁对应 hunk。不要使用 `git checkout --theirs` 批量覆盖。

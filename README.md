@@ -6,9 +6,9 @@
 
 - 上游版本：`v3.1.2`（质量守护与固定代理快速恢复已合入官方）
 - 上游提交：`6e9eef7619b83899c82e24353177c8a819f15914`
-- 今日增量：探针方案 + 双探针恢复 + thinking 守卫
-- 补丁文件：`patches/0004-fix-dual-probe-recovery-and-thinking-guard.patch`（叠在 0003 上）
-- 上一增量：`patches/0003-feat-add-quality-guard-probe-profiles.patch`（探针方案）
+- 今日增量：探针方案 + 双探针恢复 + thinking 守卫（输出 ≥ 32 且 reasoning=0 即隔离）
+- 补丁文件：`patches/0005-fix-missing-thinking-32-token-floor.patch`（叠在 0004 上）
+- 上一增量：`patches/0004-fix-dual-probe-recovery-and-thinking-guard.patch`
 - 上游 PR：[chenyme/grok2api#930](https://github.com/chenyme/grok2api/pull/930)
 - 可运行 Fork：[lij768423-svg/grok2api](https://github.com/lij768423-svg/grok2api) `main`
 
@@ -78,6 +78,7 @@ git checkout -b egress-enhancements v3.1.2
 git am --3way /path/to/grok2api-egress-enhancements/patches/0002-feat-add-degraded-account-monitor.patch
 git am --3way /path/to/grok2api-egress-enhancements/patches/0003-feat-add-quality-guard-probe-profiles.patch
 git am --3way /path/to/grok2api-egress-enhancements/patches/0004-fix-dual-probe-recovery-and-thinking-guard.patch
+git am --3way /path/to/grok2api-egress-enhancements/patches/0005-fix-missing-thinking-32-token-floor.patch
 ```
 
 仍基于 `v3.0.11` 时改用 `patches/0001-feat-add-egress-recovery-and-quality-guard.patch`。目标版本高于补丁基线时，使用 [AI 合并指南](./docs/AI_MERGE_GUIDE.md)，按功能不变量解决冲突，不要整文件覆盖新版实现。

@@ -6,9 +6,9 @@ Current baseline:
 
 - Upstream release: `v3.1.2` (quality guard and probe-wait recovery are already upstream)
 - Upstream commit: `6e9eef7619b83899c82e24353177c8a819f15914`
-- Today's delta: probe profiles + dual-probe recovery + thinking guard
-- Patch file: `patches/0004-fix-dual-probe-recovery-and-thinking-guard.patch` (stack on 0003)
-- Previous delta: `patches/0003-feat-add-quality-guard-probe-profiles.patch`
+- Today's delta: probe profiles + dual-probe recovery + thinking guard (isolate when output ≥ 32 and reasoning=0)
+- Patch file: `patches/0005-fix-missing-thinking-32-token-floor.patch` (stack on 0004)
+- Previous delta: `patches/0004-fix-dual-probe-recovery-and-thinking-guard.patch`
 - Upstream PR: [chenyme/grok2api#930](https://github.com/chenyme/grok2api/pull/930)
 - Runnable fork: [lij768423-svg/grok2api](https://github.com/lij768423-svg/grok2api) `main`
 
@@ -72,6 +72,7 @@ git checkout -b egress-enhancements v3.1.2
 git am --3way /path/to/grok2api-egress-enhancements/patches/0002-feat-add-degraded-account-monitor.patch
 git am --3way /path/to/grok2api-egress-enhancements/patches/0003-feat-add-quality-guard-probe-profiles.patch
 git am --3way /path/to/grok2api-egress-enhancements/patches/0004-fix-dual-probe-recovery-and-thinking-guard.patch
+git am --3way /path/to/grok2api-egress-enhancements/patches/0005-fix-missing-thinking-32-token-floor.patch
 ```
 
 On `v3.0.11`, apply `patches/0001-feat-add-egress-recovery-and-quality-guard.patch` instead. For newer upstream versions, follow [AI_MERGE_GUIDE.md](./docs/AI_MERGE_GUIDE.md) and resolve conflicts according to the documented invariants instead of replacing newer files wholesale.
