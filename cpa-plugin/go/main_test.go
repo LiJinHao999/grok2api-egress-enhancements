@@ -593,6 +593,26 @@ func TestMigrationFailsClosedAndVerifiesHostAuthSave(t *testing.T) {
 			}
 			auths[request.Name] = updated
 			return json.Marshal(pluginapi.HostAuthSaveResponse{Name: request.Name, Path: "/auths/" + request.Name})
+		case pluginabi.MethodHostAuthGetRuntime:
+			var request map[string]string
+			_ = json.Unmarshal(payload, &request)
+			name := request["auth_index"]
+			if name == "" {
+				name = request["name"]
+			}
+			raw, ok := auths[name]
+			if !ok {
+				return nil, fmt.Errorf("auth not found: %s", name)
+			}
+			disabled, _ := raw["disabled"].(bool)
+			status := "active"
+			if disabled {
+				status = "disabled"
+			}
+			return json.Marshal(pluginapi.HostAuthGetRuntimeResponse{Auth: pluginapi.HostAuthFileEntry{
+				ID: name, AuthIndex: name, Name: name, Provider: "xai", Type: "xai",
+				Disabled: disabled, Status: status,
+			}})
 		default:
 			return nil, fmt.Errorf("unexpected host callback %s", method)
 		}
@@ -664,6 +684,26 @@ func withMockAuths(t *testing.T, auths map[string]map[string]any) {
 			}
 			auths[request.Name] = updated
 			return json.Marshal(pluginapi.HostAuthSaveResponse{Name: request.Name, Path: "/auths/" + request.Name})
+		case pluginabi.MethodHostAuthGetRuntime:
+			var request map[string]string
+			_ = json.Unmarshal(payload, &request)
+			name := request["auth_index"]
+			if name == "" {
+				name = request["name"]
+			}
+			raw, ok := auths[name]
+			if !ok {
+				return nil, fmt.Errorf("auth not found: %s", name)
+			}
+			disabled, _ := raw["disabled"].(bool)
+			status := "active"
+			if disabled {
+				status = "disabled"
+			}
+			return json.Marshal(pluginapi.HostAuthGetRuntimeResponse{Auth: pluginapi.HostAuthFileEntry{
+				ID: name, AuthIndex: name, Name: name, Provider: "xai", Type: "xai",
+				Disabled: disabled, Status: status,
+			}})
 		default:
 			return nil, fmt.Errorf("unexpected host callback %s", method)
 		}
@@ -1601,17 +1641,29 @@ func TestRequestInterceptorAllowsNonXAIWithoutSelectedAuth(t *testing.T) {
 	}
 }
 
-func TestRequestInterceptorHoldsReboundAuthEvenOnHealthyDest(t *testing.T) {
-	resetAuthRuntimeHolds()
-	base := time.Unix(1_700_000_000, 0)
-	authSettleNow = func() time.Time { return base }
+func withAuthRuntimeProbe(t *testing.T, probe func(keys []string) (authRuntimeSnapshot, error)) {
+	t.Helper()
+	original := probeAuthRuntime
+	probeAuthRuntime = probe
 	t.Cleanup(func() {
+		probeAuthRuntime = original
 		resetAuthRuntimeHolds()
 		authSettleNow = time.Now
 	})
+}
+
+func TestRequestInterceptorReleasesWhenRuntimeProxyMatches(t *testing.T) {
+	resetAuthRuntimeHolds()
+	base := time.Unix(1_700_000_000, 0)
+	authSettleNow = func() time.Time { return base }
+	destURL := "http://127.0.0.1:7952"
+	snapshot := authRuntimeSnapshot{Found: true, Disabled: false, Status: "active"}
+	withAuthRuntimeProbe(t, func(keys []string) (authRuntimeSnapshot, error) {
+		return snapshot, nil
+	})
 
 	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
-	dest, err := store.createNode("good", "http://127.0.0.1:7952", true, false, 0)
+	dest, err := store.createNode("good", destURL, true, false, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1620,29 +1672,54 @@ func TestRequestInterceptorHoldsReboundAuthEvenOnHealthyDest(t *testing.T) {
 	authProxyAt = time.Now()
 	authProxyMu.Unlock()
 
-	markAuthRuntimeUnsettled(authFile{ID: "auth-moved", Name: "moved.json", Index: "idx-moved"})
+	markAuthRuntimeUnsettled(authFile{ID: "auth-moved", Name: "moved.json", Index: "idx-moved", ProxyURL: destURL})
 	response := interceptSelected(t, map[string]any{"selected_auth_id": "auth-moved"})
 	if !response.Terminate || response.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("just-rebound auth must stay blocked even when cache already points at dest, response=%+v", response)
-	}
-	if got := response.ResponseHeaders.Get("Retry-After"); got != "2" {
-		t.Fatalf("Retry-After=%q, want 2 for a full settle window", got)
+		t.Fatalf("empty runtime proxy must stay blocked, response=%+v", response)
 	}
 
-	authSettleNow = func() time.Time { return base.Add(authRuntimeSettle + time.Millisecond) }
+	snapshot = authRuntimeSnapshot{Found: true, Disabled: false, Status: "active", ProxyURL: destURL, ProxyURLKnown: true}
+	authSettleNow = func() time.Time { return base.Add(authRuntimeProbeInterval) }
 	response = interceptSelected(t, map[string]any{"selected_auth_id": "auth-moved"})
 	if response.Terminate {
-		t.Fatalf("settled rebound auth on a healthy dest must pass, response=%+v", response)
+		t.Fatalf("runtime proxy match must release immediately, response=%+v", response)
 	}
 }
 
-func TestRequestInterceptorHoldBlocksAffinityRetryUntilSettle(t *testing.T) {
+func TestRequestInterceptorKeepsHoldWhenRuntimeProxyStillEmpty(t *testing.T) {
+	resetAuthRuntimeHolds()
+	base := time.Unix(1_700_000_050, 0)
+	authSettleNow = func() time.Time { return base }
+	destURL := "http://127.0.0.1:7952"
+	withAuthRuntimeProbe(t, func(keys []string) (authRuntimeSnapshot, error) {
+		return authRuntimeSnapshot{Found: true, Disabled: false, Status: "active", ProxyURL: "", ProxyURLKnown: true}, nil
+	})
+
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	dest, err := store.createNode("good", destURL, true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authProxyMu.Lock()
+	authProxyCache = map[string]string{"auth-moved": dest.ProxyURL}
+	authProxyAt = time.Now()
+	authProxyMu.Unlock()
+
+	markAuthRuntimeUnsettled(authFile{ID: "auth-moved", Name: "moved.json", ProxyURL: destURL})
+	authSettleNow = func() time.Time { return base.Add(authRuntimeSettle + time.Second) }
+	response := interceptSelected(t, map[string]any{"selected_auth_id": "auth-moved"})
+	if !response.Terminate {
+		t.Fatal("known-empty runtime proxy must stay blocked after the 2s hop")
+	}
+}
+
+func TestRequestInterceptorHoldBlocksUntilRuntimeDisabled(t *testing.T) {
 	resetAuthRuntimeHolds()
 	base := time.Unix(1_700_000_100, 0)
 	authSettleNow = func() time.Time { return base }
-	t.Cleanup(func() {
-		resetAuthRuntimeHolds()
-		authSettleNow = time.Now
+	snapshot := authRuntimeSnapshot{Found: true, Disabled: false, Status: "active"}
+	withAuthRuntimeProbe(t, func(keys []string) (authRuntimeSnapshot, error) {
+		return snapshot, nil
 	})
 
 	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
@@ -1657,19 +1734,88 @@ func TestRequestInterceptorHoldBlocksAffinityRetryUntilSettle(t *testing.T) {
 	authProxyCache = map[string]string{"sticky-auth": bad.ProxyURL}
 	authProxyAt = time.Now()
 	authProxyMu.Unlock()
-	markAuthRuntimeUnsettled(authFile{ID: "sticky-auth", Name: "sticky.json"})
+	markAuthRuntimeUnsettled(authFile{ID: "sticky-auth", Name: "sticky.json", ProxyURL: bad.ProxyURL, Disabled: true})
 
 	first := interceptSelected(t, map[string]any{"selected_auth_id": "sticky-auth"})
 	if !first.Terminate {
 		t.Fatal("affinity retry during disable settle must 503")
 	}
-	authSettleNow = func() time.Time { return base.Add(time.Second) }
+	authSettleNow = func() time.Time { return base.Add(authRuntimeSettle + time.Second) }
 	second := interceptSelected(t, map[string]any{"selected_auth_id": "sticky-auth"})
 	if !second.Terminate {
-		t.Fatal("still-unsettled sticky auth must keep 503ing")
+		t.Fatal("disable hold must not expire on the 2s clock")
 	}
-	if got := second.ResponseHeaders.Get("Retry-After"); got != "1" {
-		t.Fatalf("Retry-After=%q, want remaining 1s", got)
+
+	snapshot = authRuntimeSnapshot{Found: true, Disabled: true, Status: "disabled"}
+	authSettleNow = func() time.Time { return base.Add(authRuntimeSettle + time.Second + authRuntimeProbeInterval) }
+	third := interceptSelected(t, map[string]any{"selected_auth_id": "sticky-auth"})
+	if !third.Terminate {
+		t.Fatal("runtime disable confirmed, but selected auth is still on a quarantined node")
+	}
+}
+
+func TestRequestInterceptorHiddenProxyFallsBackToSettleWindow(t *testing.T) {
+	resetAuthRuntimeHolds()
+	base := time.Unix(1_700_000_200, 0)
+	authSettleNow = func() time.Time { return base }
+	withAuthRuntimeProbe(t, func(keys []string) (authRuntimeSnapshot, error) {
+		return authRuntimeSnapshot{Found: true, Disabled: false, Status: "active"}, nil
+	})
+
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	dest, err := store.createNode("good", "http://127.0.0.1:7952", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authProxyMu.Lock()
+	authProxyCache = map[string]string{"auth-moved": dest.ProxyURL}
+	authProxyAt = time.Now()
+	authProxyMu.Unlock()
+	markAuthRuntimeUnsettled(authFile{ID: "auth-moved", Name: "moved.json", ProxyURL: dest.ProxyURL})
+
+	first := interceptSelected(t, map[string]any{"selected_auth_id": "auth-moved"})
+	if !first.Terminate {
+		t.Fatal("hidden runtime proxy must wait the last-resort hop")
+	}
+	if got := first.ResponseHeaders.Get("Retry-After"); got != "2" {
+		t.Fatalf("Retry-After=%q, want 2 while waiting for the hidden-proxy hop", got)
+	}
+
+	authSettleNow = func() time.Time { return base.Add(authRuntimeSettle + authRuntimeProbeInterval) }
+	second := interceptSelected(t, map[string]any{"selected_auth_id": "auth-moved"})
+	if second.Terminate {
+		t.Fatalf("hidden-proxy last-resort hop must release after 2s when get_runtime works, response=%+v", second)
+	}
+}
+
+func TestRequestInterceptorHoldExpiresAtMaxWhenRuntimeNeverConfirms(t *testing.T) {
+	resetAuthRuntimeHolds()
+	base := time.Unix(1_700_000_300, 0)
+	authSettleNow = func() time.Time { return base }
+	withAuthRuntimeProbe(t, func(keys []string) (authRuntimeSnapshot, error) {
+		return authRuntimeSnapshot{}, fmt.Errorf("host down")
+	})
+
+	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	dest, err := store.createNode("good", "http://127.0.0.1:7952", true, false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authProxyMu.Lock()
+	authProxyCache = map[string]string{"auth-moved": dest.ProxyURL}
+	authProxyAt = time.Now()
+	authProxyMu.Unlock()
+	markAuthRuntimeUnsettled(authFile{ID: "auth-moved", Name: "moved.json", ProxyURL: dest.ProxyURL})
+
+	mid := interceptSelected(t, map[string]any{"selected_auth_id": "auth-moved"})
+	if !mid.Terminate {
+		t.Fatal("unreachable get_runtime must keep the hold")
+	}
+
+	authSettleNow = func() time.Time { return base.Add(authRuntimeHoldMax + time.Millisecond) }
+	done := interceptSelected(t, map[string]any{"selected_auth_id": "auth-moved"})
+	if done.Terminate {
+		t.Fatalf("hold max is a circuit breaker, response=%+v", done)
 	}
 }
 
@@ -1690,6 +1836,25 @@ func TestRequestInterceptorFailClosedOnUnmatchedProxyDuringQuarantine(t *testing
 	response := interceptSelected(t, map[string]any{"selected_auth_id": "typo-auth"})
 	if !response.Terminate || response.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("unmatched proxy during quarantine must fail closed, response=%+v", response)
+	}
+}
+
+func TestDecodeAuthRuntimeSnapshotReadsProxyURL(t *testing.T) {
+	raw, err := json.Marshal(map[string]any{
+		"auth": map[string]any{
+			"id":        "moved.json",
+			"name":      "moved.json",
+			"disabled":  false,
+			"status":    "active",
+			"proxy_url": "http://127.0.0.1:7952",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, ok := decodeAuthRuntimeSnapshot(raw)
+	if !ok || !snapshot.Found || !snapshot.ProxyURLKnown || snapshot.ProxyURL != "http://127.0.0.1:7952" {
+		t.Fatalf("snapshot=%+v ok=%v", snapshot, ok)
 	}
 }
 

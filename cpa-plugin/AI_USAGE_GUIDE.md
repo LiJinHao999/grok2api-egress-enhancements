@@ -413,7 +413,7 @@ quarantined
 
 ### 7.1 CPA 的请求级边界
 
-v1.0.9 起选号交还 CPA session affinity；隔离出口靠迁号前 disable 和请求拦截。插件会在“账号刚被选中、同时节点开始隔离迁移”的竞态窗口，以及 `host.auth.save` 之后 runtime 尚未跟上的约 2 秒窗口，返回 `503` 和 `Retry-After`。选号后 metadata 缺少账号标识、同时存在隔离节点时同样 fail-closed，避免请求打回坏出口。缓存 miss、解析不到绑定、或代理 URL 匹配不到任何节点，在隔离期也 fail-closed；只有明确已知未托管（无 `proxy_url`）的账号才放行，不因池里另有隔离节点而被误杀。OpenAI 兼容的 `SourceFormat`/`ToFormat` 不算非 xAI 证据。隔离复测、换 IP 确认和手动质量检测都只用本节点残留绑定，空节点只做连通性、不借号。但 CPA 的插件 ABI 不能透明重跑一个已经向客户端开始输出的流式请求，因此它不会伪造“中途无感重试”。正确行为是：当前请求尽快得到可重试结果，后续请求由 CPA 调度到已验证健康的出口。
+v1.0.9 起选号交还 CPA session affinity；隔离出口靠迁号前 disable 和请求拦截。插件会在“账号刚被选中、同时节点开始隔离迁移”的竞态窗口，以及 `host.auth.save` 之后 runtime 尚未跟上的窗口，返回 `503` 和 `Retry-After`。拦截器以 `host.auth.get_runtime` 为准，不靠墙钟猜 watcher；只有当前 CPA 不暴露 runtime `proxy_url` 时，启用态迁号才最多再挡约 2 秒。选号后 metadata 缺少账号标识、同时存在隔离节点时同样 fail-closed，避免请求打回坏出口。缓存 miss、解析不到绑定、或代理 URL 匹配不到任何节点，在隔离期也 fail-closed；只有明确已知未托管（无 `proxy_url`）的账号才放行，不因池里另有隔离节点而被误杀。OpenAI 兼容的 `SourceFormat`/`ToFormat` 不算非 xAI 证据。隔离复测、换 IP 确认和手动质量检测都只用本节点残留绑定，空节点只做连通性、不借号。但 CPA 的插件 ABI 不能透明重跑一个已经向客户端开始输出的流式请求，因此它不会伪造“中途无感重试”。正确行为是：当前请求尽快得到可重试结果，后续请求由 CPA 调度到已验证健康的出口。
 
 ## 8. 隔离后强制住宅 IP 轮换并复测
 

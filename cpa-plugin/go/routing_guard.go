@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
@@ -33,18 +34,40 @@ func handleSchedulerPick(request []byte) ([]byte, error) {
 	return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
 }
 
-// authRuntimeSettle is how long a just-saved auth stays blocked at the
-// interceptor. CPA v7.2.113 host.auth.save rebuilds runtime Auth as
-// StatusActive with an empty ProxyURL; the file watcher usually copies
-// disabled / proxy_url back from disk on the next Write event. Two
-// seconds covers local fsnotify and a slow Docker notify hop. Tests
-// override authSettleNow rather than sleeping.
-const authRuntimeSettle = 2 * time.Second
+// authRuntimeSettle is the last-resort wait when host.auth.get_runtime does
+// not expose ProxyURL (CPA v7.2.113 HostAuthFileEntry omits it). Disable
+// saves never use this clock: they wait until runtime.Disabled is true.
+// authRuntimeHoldMax is a circuit breaker so a dead watcher cannot 503 forever.
+const (
+	authRuntimeSettle        = 2 * time.Second
+	authRuntimeHoldMax       = 10 * time.Second
+	authRuntimeProbeInterval = 200 * time.Millisecond
+)
+
+// authRuntimeSnapshot is what the interceptor can observe about one runtime Auth.
+// ProxyURLKnown is false on CPA v7.2.113; newer hosts may publish proxy_url.
+type authRuntimeSnapshot struct {
+	Found         bool
+	Disabled      bool
+	Status        string
+	ProxyURL      string
+	ProxyURLKnown bool
+}
+
+type authRuntimeHold struct {
+	expectedDisabled bool
+	expectedProxy    string
+	since            time.Time
+	lastProbe        time.Time
+	lastSnapshot     authRuntimeSnapshot
+	probed           bool
+}
 
 var (
-	authSettleNow = time.Now
-	authHoldMu    sync.Mutex
-	authHolds     map[string]time.Time
+	authSettleNow    = time.Now
+	authHoldMu       sync.Mutex
+	authHolds        map[string]*authRuntimeHold
+	probeAuthRuntime = fetchAuthRuntime
 )
 
 func resetAuthRuntimeHolds() {
@@ -66,15 +89,19 @@ func authIdentityKeys(a authFile) []string {
 }
 
 func markAuthRuntimeUnsettled(a authFile, extraKeys ...string) {
-	until := authSettleNow().Add(authRuntimeSettle)
+	hold := &authRuntimeHold{
+		expectedDisabled: a.Disabled,
+		expectedProxy:    strings.TrimSpace(a.ProxyURL),
+		since:            authSettleNow(),
+	}
 	keys := append(authIdentityKeys(a), extraKeys...)
 	authHoldMu.Lock()
 	if authHolds == nil {
-		authHolds = map[string]time.Time{}
+		authHolds = map[string]*authRuntimeHold{}
 	}
 	now := authSettleNow()
-	for key, expiry := range authHolds {
-		if !expiry.After(now) {
+	for key, existing := range authHolds {
+		if existing == nil || now.Sub(existing.since) >= authRuntimeHoldMax {
 			delete(authHolds, key)
 		}
 	}
@@ -83,22 +110,28 @@ func markAuthRuntimeUnsettled(a authFile, extraKeys ...string) {
 		if key == "" {
 			continue
 		}
-		authHolds[key] = until
+		authHolds[key] = hold
 	}
 	authHoldMu.Unlock()
 }
 
 func markAuthRuntimeUnsettledFromSave(name string, obj map[string]any) {
 	email := ""
+	proxy := ""
+	disabled := false
 	if obj != nil {
 		email, _ = obj["email"].(string)
+		proxy, _ = obj["proxy_url"].(string)
+		disabled, _ = obj["disabled"].(bool)
 	}
-	identity := authFile{Name: name, Email: email}
+	identity := authFile{Name: name, Email: email, ProxyURL: strings.TrimSpace(proxy), Disabled: disabled}
 	authListMu.Lock()
 	for _, cached := range authListCache {
 		if cached.Name == name || cached.ID == name || cached.Index == name {
 			identity = cached
 			identity.Name = name
+			identity.ProxyURL = strings.TrimSpace(proxy)
+			identity.Disabled = disabled
 			if email != "" {
 				identity.Email = email
 			}
@@ -109,28 +142,179 @@ func markAuthRuntimeUnsettledFromSave(name string, obj map[string]any) {
 	markAuthRuntimeUnsettled(identity, name)
 }
 
-func selectedAuthRuntimeHold(keys ...string) (remaining time.Duration, held bool) {
-	now := authSettleNow()
+func lookupAuthRuntimeHold(keys ...string) *authRuntimeHold {
 	authHoldMu.Lock()
 	defer authHoldMu.Unlock()
-	var latest time.Time
 	for _, key := range keys {
 		key = strings.TrimSpace(key)
 		if key == "" {
 			continue
 		}
-		until, ok := authHolds[key]
-		if !ok || !until.After(now) {
-			continue
-		}
-		if until.After(latest) {
-			latest = until
+		if hold := authHolds[key]; hold != nil {
+			return hold
 		}
 	}
-	if latest.IsZero() {
+	return nil
+}
+
+func clearAuthRuntimeHold(hold *authRuntimeHold) {
+	if hold == nil {
+		return
+	}
+	authHoldMu.Lock()
+	defer authHoldMu.Unlock()
+	for key, existing := range authHolds {
+		if existing == hold {
+			delete(authHolds, key)
+		}
+	}
+}
+
+func refreshAuthRuntimeHoldSnapshot(hold *authRuntimeHold, keys []string) authRuntimeSnapshot {
+	now := authSettleNow()
+	authHoldMu.Lock()
+	if hold.probed && now.Sub(hold.lastProbe) < authRuntimeProbeInterval {
+		snap := hold.lastSnapshot
+		authHoldMu.Unlock()
+		return snap
+	}
+	authHoldMu.Unlock()
+
+	snapshot, err := probeAuthRuntime(keys)
+	if err != nil {
+		snapshot = authRuntimeSnapshot{}
+	}
+	authHoldMu.Lock()
+	hold.lastProbe = now
+	hold.lastSnapshot = snapshot
+	hold.probed = true
+	authHoldMu.Unlock()
+	return snapshot
+}
+
+func runtimeStatusDisabled(status string) bool {
+	return strings.EqualFold(strings.TrimSpace(status), "disabled")
+}
+
+func authRuntimeHoldSettled(hold *authRuntimeHold, snapshot authRuntimeSnapshot, now time.Time) bool {
+	if hold == nil {
+		return true
+	}
+	if now.Sub(hold.since) >= authRuntimeHoldMax {
+		return true
+	}
+	if !snapshot.Found {
+		return false
+	}
+	runtimeDisabled := snapshot.Disabled || runtimeStatusDisabled(snapshot.Status)
+	if hold.expectedDisabled {
+		return runtimeDisabled
+	}
+	if runtimeDisabled {
+		return false
+	}
+	if snapshot.ProxyURLKnown {
+		return strings.TrimSpace(snapshot.ProxyURL) == strings.TrimSpace(hold.expectedProxy)
+	}
+	// CPA v7.2.113 hides runtime ProxyURL. After a successful get_runtime
+	// (host is alive, auth still exists) wait one watcher hop, then release.
+	return now.Sub(hold.since) >= authRuntimeSettle
+}
+
+func selectedAuthRuntimeHold(keys ...string) (remaining time.Duration, held bool) {
+	hold := lookupAuthRuntimeHold(keys...)
+	if hold == nil {
 		return 0, false
 	}
-	return latest.Sub(now), true
+	now := authSettleNow()
+	snapshot := refreshAuthRuntimeHoldSnapshot(hold, keys)
+	if authRuntimeHoldSettled(hold, snapshot, now) {
+		clearAuthRuntimeHold(hold)
+		return 0, false
+	}
+	remaining = time.Second
+	if hold.expectedDisabled {
+		remaining = time.Second
+	} else if !snapshot.ProxyURLKnown {
+		if left := authRuntimeSettle - now.Sub(hold.since); left > remaining {
+			remaining = left
+		}
+	}
+	if left := authRuntimeHoldMax - now.Sub(hold.since); left > 0 && left < remaining {
+		remaining = left
+	}
+	if remaining < time.Second {
+		remaining = time.Second
+	}
+	return remaining, true
+}
+
+func fetchAuthRuntime(keys []string) (authRuntimeSnapshot, error) {
+	var lastErr error
+	for _, key := range keys {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		raw, err := hostCall(pluginabi.MethodHostAuthGetRuntime, mustJSON(map[string]any{
+			"auth_index": key,
+		}))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if snapshot, ok := decodeAuthRuntimeSnapshot(raw); ok {
+			return snapshot, nil
+		}
+	}
+	if lastErr != nil {
+		return authRuntimeSnapshot{}, lastErr
+	}
+	return authRuntimeSnapshot{}, nil
+}
+
+func decodeAuthRuntimeSnapshot(raw json.RawMessage) (authRuntimeSnapshot, bool) {
+	if len(raw) == 0 {
+		return authRuntimeSnapshot{}, false
+	}
+	var response pluginapi.HostAuthGetRuntimeResponse
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return authRuntimeSnapshot{}, false
+	}
+	entry := response.Auth
+	if strings.TrimSpace(entry.ID+entry.Name+entry.AuthIndex) == "" {
+		return authRuntimeSnapshot{}, false
+	}
+	snapshot := authRuntimeSnapshot{
+		Found:    true,
+		Disabled: entry.Disabled,
+		Status:   entry.Status,
+	}
+	var root map[string]any
+	if err := json.Unmarshal(raw, &root); err == nil {
+		if authObj, ok := root["auth"].(map[string]any); ok {
+			if proxy, known := runtimeProxyFromMap(authObj); known {
+				snapshot.ProxyURL = proxy
+				snapshot.ProxyURLKnown = true
+			}
+		}
+	}
+	return snapshot, true
+}
+
+func runtimeProxyFromMap(authObj map[string]any) (string, bool) {
+	if authObj == nil {
+		return "", false
+	}
+	for _, key := range []string{"proxy_url", "proxyUrl", "ProxyURL"} {
+		if value, ok := authObj[key]; ok {
+			if text, isString := value.(string); isString {
+				return strings.TrimSpace(text), true
+			}
+			return "", true
+		}
+	}
+	return "", false
 }
 
 func retryAfterSeconds(remaining time.Duration) int {
@@ -217,7 +401,7 @@ func selectedAuthKeysFromMetadata(meta map[string]any) []string {
 
 // handleRequestIntercept is the only request-level gate after selection is
 // handed back to CPA. It fail-closes when:
-//   - the selected auth was just rebound (runtime ProxyURL/Disabled still stale)
+//   - the selected auth was just rebound and host.auth.get_runtime is still stale
 //   - selected-auth metadata is missing during an xAI quarantine
 //   - the selected key cannot be resolved (cold cache / list miss)
 //   - the selected proxy matches a quarantined node

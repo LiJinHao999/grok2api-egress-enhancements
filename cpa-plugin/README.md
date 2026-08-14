@@ -380,7 +380,7 @@ CPA_LOADTEST_LOG_DIR=/var/log/cpa-loadtest \
 v1.0.5 起插件以 `Handled: true` 自己 round-robin 选号，本意是跳过隔离出口，但会绕过 CPA session affinity，同一会话每次请求换账号。v1.0.9 起 `handleSchedulerPick` 恒定 `Handled: false`，选号交还 host。隔离出口仍靠：
 
 - 迁号前先把受影响账号写成 `disabled`，再绑到近期主动检测 healthy 且出口 IP 不同的节点；没有这类目标时降级迁到其他可调度且未判 soft/hard/error、出口 IP 也不同的节点；仍失败则回滚 disable
-- CPA v7.2.113 的 `host.auth.save` 不会立刻把文件里的 `disabled` / `proxy_url` 写进 runtime Auth，要等文件 watcher。因此刚写完绑定的账号会在拦截器里再挡约 2 秒，避免请求打到空 `ProxyURL` 或仍粘在坏出口上
+- CPA v7.2.113 的 `host.auth.save` 不会立刻把文件里的 `disabled` / `proxy_url` 写进 runtime Auth，要等文件 watcher。拦截器会查 `host.auth.get_runtime`：disable 等到 runtime 真禁用，迁号等到 runtime 代理对上（或 CPA 仍不暴露该字段时最多再挡约 2 秒）再放行
 - 选号与迁号竞态、以及上述 runtime 未就绪窗口，由 `handleRequestIntercept` 返回 `503 + Retry-After`；选号后 metadata 缺少账号标识、同时存在隔离节点时同样 fail-closed。缓存 miss / 解析不到绑定 / 代理 URL 匹配不到任何节点，在隔离期也 fail-closed。只有明确已知未托管（无 `proxy_url`）的账号才放行。OpenAI 兼容的 `SourceFormat`/`ToFormat` 不算非 xAI 证据
 
 主动质量探测不经过这段 hook：它只使用本节点已绑定账号，经节点代理直连上游，空节点不借号。
