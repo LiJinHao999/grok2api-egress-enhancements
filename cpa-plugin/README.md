@@ -8,7 +8,7 @@
 | | |
 |---|---|
 | 插件名 | `grok2api-egress` |
-| 当前版本 | **1.0.8** |
+| 当前版本 | **1.0.9** |
 | 语言 | Go (`-buildmode=c-shared` → `.so`) |
 | CPA SDK | `CLIProxyAPI/v7` (`pluginabi` / `pluginapi`) |
 | 能力 | Management UI + Usage Plugin + Scheduler + Request Interceptor |
@@ -31,7 +31,8 @@
 - **隔离（quarantine）坏节点**，并 **migrate** 账号到健康通道
 - 调度阶段跳过隔离/冷却账号；选定账号与迁移发生竞态时返回可重试的 `503 + Retry-After: 1`
 - 可选调用受信任的内部换 IP Webhook；只有确认出口 IP 已变化并通过真实模型复测才恢复节点
-- 提供完整 **管理 UI**（节点 CRUD、批量、重平衡、质量测试、策略、事件）
+- 提供完整 **管理 UI**（节点 CRUD、批量、重平衡、质量测试、探针方案、策略、事件）
+- **可配置探针方案**：内置吞吐基线 + 预期标记（最后一行 `QUALITY_OK`），也可自建 Prompt / 包含 / 末行 / 正则匹配；标记缺失记为硬异常
 
 灵感来自 Grok2API 侧的 quality-guard / egress 思路，但实现已完全 native 化，**不需要、也不连接 Grok2API**。
 
@@ -330,8 +331,10 @@ Content-Type: application/json
 | `/nodes/rebalance` | POST | 账号重平衡 |
 | `/nodes/{id}` | GET/PUT/DELETE | 单节点 |
 | `/nodes/{id}/test` | POST | 连通测试 |
-| `/nodes/{id}/quality-test` | POST | 质量探测 |
+| `/nodes/{id}/quality-test` | POST | 质量探测；body/query 可带 `profileId` |
 | `/nodes/{id}/accounts` | GET | 绑定账号列表 |
+| `/profiles` | GET/POST | 列出 / 新建探针方案 |
+| `/profiles/{id}` | PUT/DELETE | 更新 / 删除自定义方案 |
 
 （另保留若干 `/quality-guard/*` 别名路径，便于从旧 UI 习惯迁移。）
 

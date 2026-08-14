@@ -6,9 +6,10 @@ Current baseline:
 
 - Upstream release: `v3.1.2` (quality guard and probe-wait recovery are already upstream)
 - Upstream commit: `6e9eef7619b83899c82e24353177c8a819f15914`
-- Today's delta: **degraded-account monitor** on the quality-guard page (filters, timeline, bulk mute/unmute)
-- Patch file: `patches/0002-feat-add-degraded-account-monitor.patch`
-- Upstream PR: [chenyme/grok2api#907](https://github.com/chenyme/grok2api/pull/907)
+- Today's delta: probe profiles + dual-probe recovery + thinking guard
+- Patch file: `patches/0004-fix-dual-probe-recovery-and-thinking-guard.patch` (stack on 0003)
+- Previous delta: `patches/0003-feat-add-quality-guard-probe-profiles.patch`
+- Upstream PR: [chenyme/grok2api#930](https://github.com/chenyme/grok2api/pull/930)
 - Runnable fork: [lij768423-svg/grok2api](https://github.com/lij768423-svg/grok2api) `main`
 
 If you are still on `v3.0.11`, keep using the legacy patch `patches/0001-feat-add-egress-recovery-and-quality-guard.patch` (closed [#837](https://github.com/chenyme/grok2api/pull/837)).
@@ -52,7 +53,7 @@ If you are still on `v3.0.11`, keep using the legacy patch `patches/0001-feat-ad
 
 ### CPA-native egress guard plugin
 
-`cpa-plugin/` is now the **v1.0.8 pure-CPA plugin**. It has no runtime dependency on Grok2API: it uses CPA Host APIs for auth files and usage events, binds `proxy_url` stickily to egress nodes, and provides node CRUD, line-based bulk import, batch operations, connectivity/real-model tests, quarantine migration, hot-reloadable policy, statistics, events, and light/dark themes. In v1.0.8, store-install registration no longer blocks on a full auth scan (fixes plugins stuck as inactive/unregistered with many accounts). In v1.0.7, CPA scheduling skips quarantined or cooling egresses; credential, quota, and permission failures are recorded as ignored instead of quarantining a node; migrations are read-back verified; and an optional allowlisted internal IP-rotation webhook is available. See [cpa-plugin/README.md](./cpa-plugin/README.md) for build instructions and the Chinese [AI deployment and operations guide](./cpa-plugin/AI_USAGE_GUIDE.md) for proxy topology, capacity planning, quarantine recovery, and forced residential-IP rotation.
+`cpa-plugin/` is now the **v1.0.9 pure-CPA plugin**. It has no runtime dependency on Grok2API: it uses CPA Host APIs for auth files and usage events, binds `proxy_url` stickily to egress nodes, and provides node CRUD, line-based bulk import, batch operations, connectivity/real-model tests, configurable probe profiles (throughput / expected-marker / custom prompt), quarantine migration, hot-reloadable policy, statistics, events, and light/dark themes. In v1.0.9, active probes can verify a last-line or regex marker. In v1.0.8, store-install registration no longer blocks on a full auth scan (fixes plugins stuck as inactive/unregistered with many accounts). In v1.0.7, CPA scheduling skips quarantined or cooling egresses; credential, quota, and permission failures are recorded as ignored instead of quarantining a node; migrations are read-back verified; and an optional allowlisted internal IP-rotation webhook is available. See [cpa-plugin/README.md](./cpa-plugin/README.md) for build instructions and the Chinese [AI deployment and operations guide](./cpa-plugin/AI_USAGE_GUIDE.md) for proxy topology, capacity planning, quarantine recovery, and forced residential-IP rotation.
 
 For the recommended end-to-end topology (residential/Resin -> Mihomo sharding and listeners -> Grok2API/CPA egress nodes -> Quality Guard detection, drain, rotation, and re-probing), see [Recommended egress deployment](./docs/RECOMMENDED_DEPLOYMENT.md).
 
@@ -69,6 +70,8 @@ From a clean grok2api checkout:
 git fetch --tags origin
 git checkout -b egress-enhancements v3.1.2
 git am --3way /path/to/grok2api-egress-enhancements/patches/0002-feat-add-degraded-account-monitor.patch
+git am --3way /path/to/grok2api-egress-enhancements/patches/0003-feat-add-quality-guard-probe-profiles.patch
+git am --3way /path/to/grok2api-egress-enhancements/patches/0004-fix-dual-probe-recovery-and-thinking-guard.patch
 ```
 
 On `v3.0.11`, apply `patches/0001-feat-add-egress-recovery-and-quality-guard.patch` instead. For newer upstream versions, follow [AI_MERGE_GUIDE.md](./docs/AI_MERGE_GUIDE.md) and resolve conflicts according to the documented invariants instead of replacing newer files wholesale.

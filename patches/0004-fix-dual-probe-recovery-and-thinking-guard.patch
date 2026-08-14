@@ -1,0 +1,704 @@
+From 362526e544b38e8d3ff8e78b756a6d66f151cde0 Mon Sep 17 00:00:00 2001
+From: lij768423-svg <lij768423@gmail.com>
+Date: Fri, 14 Aug 2026 19:56:53 +0800
+Subject: [PATCH] fix: dual-probe recovery and require thinking on QUALITY_OK
+
+Isolate immediately on user-traffic degrade and hold through
+quarantine_seconds. Restore only after a QUALITY_OK probe comes back
+healthy with thinking tokens. Missing thinking is a hard isolate even
+when TPS looks normal.
+---
+ frontend/src/shared/i18n/index.ts             |   4 +-
+ tools/egress-quality-guard/quality_guard.py   | 134 ++++++++---
+ .../quality_guard_test.py                     | 221 ++++++++++++++----
+ 3 files changed, 284 insertions(+), 75 deletions(-)
+
+diff --git a/frontend/src/shared/i18n/index.ts b/frontend/src/shared/i18n/index.ts
+index a49fbbc..cf35f0f 100644
+--- a/frontend/src/shared/i18n/index.ts
++++ b/frontend/src/shared/i18n/index.ts
+@@ -440,7 +440,7 @@ const resources = {
+         sources: { active: "主动探针", passive: "请求审计" }, quarantined: "已隔离", fixedFallback: "固定回退（受保护）", suspect: "可疑", healthy: "正常", pending: "待观测", probeFailed: "检测失败",
+         events: "最近事件", noEvents: "暂无异常或恢复事件", eventTypes: { node_quarantined: "节点已隔离", node_restored: "节点已恢复", node_rotated: "节点已更换 IP", passive_audit_anomaly: "检测到异常请求" },
+         statistics: "自动检测统计", statisticsSince: "自 {{time}} 开始累计，不含手动检测。", statisticsChecks: "有效检测总数", statisticsChecksHelp: "主动探测与有效被动审计", statisticsActive: "主动探测", statisticsActiveDetail: "正常 {{healthy}}，错误 {{errors}}", statisticsPassive: "被动审计", statisticsPassiveDetail: "正常 {{healthy}}，来自真实请求", statisticsTokens: "主动探测输出 Token", statisticsTokensHelp: "包含推理 Token，不代表代理流量", statisticsAnomalies: "异常命中", statisticsAnomalyDetail: "软异常 {{soft}}，硬异常 {{hard}}", statisticsQuarantines: "执行隔离", statisticsActionDetail: "已恢复 {{restored}}，受保护未隔离 {{suppressed}}",
+-        reasons: { unknown: "未记录原因", hard_tps: "超过硬阈值", soft_tps: "超过软阈值", buffered_burst: "短窗口输出突增，等待原 IP 复测", passive_hard_tps: "请求速度超过硬阈值", passive_soft_tps: "请求速度连续超过软阈值", quality_probe_healthy: "模型质量检测恢复正常", expected_marker_missing: "响应标记缺失", insufficient_output_tokens: "输出 Token 不足", insufficient_visible_tokens: "可见 Token 不足", insufficient_generation_window: "有效生成窗口不足", probe_errors: "主动检测连续失败", probe_no_account: "暂无可调度账号，已延后复测", recovery_probe_error: "恢复检测失败", rotation_error: "更换 IP 失败" },
++        reasons: { unknown: "未记录原因", hard_tps: "超过硬阈值", soft_tps: "超过软阈值", buffered_burst: "短窗口输出突增，等待原 IP 复测", missing_thinking: "输出缺少 thinking", passive_hard_tps: "请求速度超过硬阈值", passive_soft_tps: "请求速度连续超过软阈值", quality_probe_healthy: "模型质量检测恢复正常", expected_marker_missing: "响应标记缺失", insufficient_output_tokens: "输出 Token 不足", insufficient_visible_tokens: "可见 Token 不足", insufficient_generation_window: "有效生成窗口不足", probe_errors: "主动检测连续失败", probe_no_account: "暂无可调度账号，已延后复测", recovery_probe_error: "恢复检测失败", rotation_error: "更换 IP 失败" },
+         policy: "当前策略", editPolicy: "编辑策略", editPolicyTitle: "编辑质量守护策略", editPolicyDescription: "保存后由守护进程热加载，无需重启服务。", restoreDefaults: "恢复默认值", policySaved: "策略已保存，正在热加载", invalidPolicyValue: "数值超出允许范围", softThresholdMustBeLower: "软阈值必须低于硬阈值", activeIntervalSeconds: "主动检测间隔（秒）", passiveIntervalSeconds: "被动审计间隔（秒）", consecutiveSoft: "软阈值连续次数", consecutiveErrors: "检测错误连续次数", quarantineSeconds: "隔离时长（秒）", softThreshold: "软阈值", hardThreshold: "硬阈值", activeInterval: "主动间隔", passiveInterval: "审计间隔", quarantineDuration: "隔离时长", minimumNodes: "最少保留节点",
+         unavailable: "质量守护尚未连接", unavailableHelp: "在 config.yaml 中启用 qualityGuard，并启动 quality-guard Compose profile 后，这里会显示实时状态。", testing: "正在检测节点质量", testComplete: "检测完成：{{speed}}", testFailed: "质量检测暂不可用，请稍后重试",
+         nodesTab: "节点质量",
+@@ -1372,7 +1372,7 @@ const resources = {
+       media: { images: { title: "Gallery", description: "Browse generated image assets", search: "Search ID, type, or hash", empty: "No images", noMatches: "No matching images", totalImages: "Total images", totalBytes: "Storage", pageSummary: "Showing {{count}} / {{total}}", openImage: "Open image {{id}}", deleteTitle: "Delete {{count}} selected images?", deleteDescription: "The image files and gallery records will be permanently removed, and existing image links will stop working. This cannot be undone.", deleted: "Deleted {{count}} images" }, videos: { title: "Video Gallery", description: "View video generation job records", search: "Search prompt or ID", empty: "No video jobs", statusFilter: "Status filter", totalJobs: "Total jobs", queued: "Queued", inProgress: "In progress", completed: "Completed", failed: "Failed", prompt: "Prompt", model: "Model", status: "Status", progress: "Progress", statusProgress: "Status / progress", spec: "Spec", owner: "Owner", createdAt: "Created", completedAt: "Completed", time: "Time", createdShort: "Created", completedShort: "Done", preview: "Preview video", previewTitle: "Video preview", previewUnavailable: "Local video unavailable", deleteTitle: "Delete {{count}} video records?", deleteDescription: "The task records and their local videos will be permanently removed, and existing video links will stop working. This cannot be undone.", deleted: "Deleted {{count}} video records", seconds: "{{count}} sec", pageSummary: "Showing {{count}} / {{total}}" }, videoStatus: { queued: "Queued", in_progress: "In progress", completed: "Completed", failed: "Failed" } },
+       auth: { title: "Admin sign in", productTitle: "Lightweight API gateway", subtitle: "Manage upstream accounts, model routes, and client access.", username: "Username", password: "Password", usernameRequired: "Enter your username", passwordRequired: "Enter your password", signIn: "Sign in", signingIn: "Signing in", signOut: "Sign out", changePassword: "Change password", currentPassword: "Current password", newPassword: "New password", passwordUpdated: "Password updated. Sign in again.", sessionUnavailable: "Unable to restore the session", sessionUnavailableDescription: "The service may be temporarily unavailable. Your session was not cleared; please retry shortly.", retrySession: "Retry" },
+       shell: { appearance: "Appearance", dark: "Dark", light: "Light", system: "System", language: "Language", navigation: "Navigation", openNavigation: "Open navigation" },
+-      qualityGuard: { title: "Quality guard", description: "Monitor Grok egress quality and quarantine anomalous nodes automatically.", overview: "Quality guard overview", serviceStatus: "Guard service", running: "Running", stale: "Status stale", mode: "Detection mode", availableNodes: "Enabled nodes", quarantinedNodes: "Quarantined", modes: { active: "Active probes", passive: "Passive audits", hybrid: "Hybrid" }, nodes: "Node quality", nodesHelp: "Speed matches the grok2api panel: output tokens include reasoning tokens. Passive anomalies only trigger an active confirmation. Strike counts are passive / active / errors.", updatedAt: "Updated {{time}}", node: "Node", state: "State", outputTPS: "Panel output speed", firstToken: "First token", source: "Source", strikes: "Strikes", lastObserved: "Last observed", test: "Test", sources: { active: "Active probe", passive: "Request audit" }, quarantined: "Quarantined", fixedFallback: "Fixed fallback (protected)", suspect: "Suspect", healthy: "Healthy", pending: "Pending", probeFailed: "Probe failed", events: "Recent events", noEvents: "No anomaly or recovery events", eventTypes: { node_quarantined: "Node quarantined", node_restored: "Node restored", node_rotated: "Node IP rotated", passive_audit_anomaly: "Anomalous request detected" }, statistics: "Automatic detection statistics", statisticsSince: "Accumulated since {{time}}. Manual tests are excluded.", statisticsChecks: "Valid checks", statisticsChecksHelp: "Active probes and valid passive audits", statisticsActive: "Active probes", statisticsActiveDetail: "Healthy {{healthy}}, errors {{errors}}", statisticsPassive: "Passive audits", statisticsPassiveDetail: "Healthy {{healthy}}, from real requests", statisticsTokens: "Active output tokens", statisticsTokensHelp: "Includes reasoning tokens; not proxy traffic", statisticsAnomalies: "Anomaly hits", statisticsAnomalyDetail: "Soft {{soft}}, hard {{hard}}", statisticsQuarantines: "Quarantines applied", statisticsActionDetail: "Restored {{restored}}, protected {{suppressed}}", reasons: { unknown: "No reason recorded", hard_tps: "Hard threshold exceeded", soft_tps: "Soft threshold exceeded", buffered_burst: "Short-window output burst; retesting the same IP", passive_hard_tps: "Request exceeded hard threshold", passive_soft_tps: "Requests repeatedly exceeded soft threshold", quality_probe_healthy: "Model quality probe recovered", expected_marker_missing: "Expected marker missing", insufficient_output_tokens: "Too few output tokens", insufficient_visible_tokens: "Too few visible tokens", insufficient_generation_window: "Generation window too short", probe_errors: "Repeated probe errors", probe_no_account: "No schedulable probe account; retry deferred", recovery_probe_error: "Recovery probe failed", rotation_error: "IP rotation failed" }, policy: "Current policy", editPolicy: "Edit policy", editPolicyTitle: "Edit quality guard policy", editPolicyDescription: "The guard hot-reloads saved changes without a service restart.", restoreDefaults: "Restore defaults", policySaved: "Policy saved and queued for hot reload", invalidPolicyValue: "Value is outside the allowed range", softThresholdMustBeLower: "The soft threshold must be lower than the hard threshold", activeIntervalSeconds: "Active interval (seconds)", passiveIntervalSeconds: "Passive interval (seconds)", consecutiveSoft: "Consecutive soft strikes", consecutiveErrors: "Consecutive probe errors", quarantineSeconds: "Quarantine (seconds)", softThreshold: "Soft threshold", hardThreshold: "Hard threshold", activeInterval: "Active interval", passiveInterval: "Audit interval", quarantineDuration: "Quarantine", minimumNodes: "Minimum nodes", unavailable: "Quality guard is not connected", unavailableHelp: "Enable qualityGuard in config.yaml and start the quality-guard Compose profile to display live status here.", testing: "Testing node quality", testComplete: "Test complete: {{speed}}", testFailed: "Quality test is temporarily unavailable. Try again shortly.", refreshNodes: "Refresh nodes", nodeEnabled: "Node enabled", nodeDisabled: "Node disabled", nodesEnabled: "Selected nodes enabled", nodesDisabled: "Selected nodes disabled", enableNode: "Enable node {{name}}", disableNode: "Disable node {{name}}", nodeEditorDescription: "Manage Grok Build egress used by the quality guard. Proxy URLs are write-only; leave the field blank while editing to keep the current value.", nodeCapacityHelp: "Maximum number of bound accounts; 0 means unlimited.", deleteNodeTitle: "Delete proxy node?", deleteNodeDescription: "Node “{{name}}” will be permanently deleted. This action cannot be undone.", deleteNodesTitle: "Delete {{count}} selected nodes?", deleteNodesDescription: "The selected proxy nodes will be permanently deleted. This action cannot be undone.",
++      qualityGuard: { title: "Quality guard", description: "Monitor Grok egress quality and quarantine anomalous nodes automatically.", overview: "Quality guard overview", serviceStatus: "Guard service", running: "Running", stale: "Status stale", mode: "Detection mode", availableNodes: "Enabled nodes", quarantinedNodes: "Quarantined", modes: { active: "Active probes", passive: "Passive audits", hybrid: "Hybrid" }, nodes: "Node quality", nodesHelp: "Speed matches the grok2api panel: output tokens include reasoning tokens. Passive anomalies only trigger an active confirmation. Strike counts are passive / active / errors.", updatedAt: "Updated {{time}}", node: "Node", state: "State", outputTPS: "Panel output speed", firstToken: "First token", source: "Source", strikes: "Strikes", lastObserved: "Last observed", test: "Test", sources: { active: "Active probe", passive: "Request audit" }, quarantined: "Quarantined", fixedFallback: "Fixed fallback (protected)", suspect: "Suspect", healthy: "Healthy", pending: "Pending", probeFailed: "Probe failed", events: "Recent events", noEvents: "No anomaly or recovery events", eventTypes: { node_quarantined: "Node quarantined", node_restored: "Node restored", node_rotated: "Node IP rotated", passive_audit_anomaly: "Anomalous request detected" }, statistics: "Automatic detection statistics", statisticsSince: "Accumulated since {{time}}. Manual tests are excluded.", statisticsChecks: "Valid checks", statisticsChecksHelp: "Active probes and valid passive audits", statisticsActive: "Active probes", statisticsActiveDetail: "Healthy {{healthy}}, errors {{errors}}", statisticsPassive: "Passive audits", statisticsPassiveDetail: "Healthy {{healthy}}, from real requests", statisticsTokens: "Active output tokens", statisticsTokensHelp: "Includes reasoning tokens; not proxy traffic", statisticsAnomalies: "Anomaly hits", statisticsAnomalyDetail: "Soft {{soft}}, hard {{hard}}", statisticsQuarantines: "Quarantines applied", statisticsActionDetail: "Restored {{restored}}, protected {{suppressed}}", reasons: { unknown: "No reason recorded", hard_tps: "Hard threshold exceeded", soft_tps: "Soft threshold exceeded", buffered_burst: "Short-window output burst; retesting the same IP", missing_thinking: "Missing thinking tokens", passive_hard_tps: "Request exceeded hard threshold", passive_soft_tps: "Requests repeatedly exceeded soft threshold", quality_probe_healthy: "Model quality probe recovered", expected_marker_missing: "Expected marker missing", insufficient_output_tokens: "Too few output tokens", insufficient_visible_tokens: "Too few visible tokens", insufficient_generation_window: "Generation window too short", probe_errors: "Repeated probe errors", probe_no_account: "No schedulable probe account; retry deferred", recovery_probe_error: "Recovery probe failed", rotation_error: "IP rotation failed" }, policy: "Current policy", editPolicy: "Edit policy", editPolicyTitle: "Edit quality guard policy", editPolicyDescription: "The guard hot-reloads saved changes without a service restart.", restoreDefaults: "Restore defaults", policySaved: "Policy saved and queued for hot reload", invalidPolicyValue: "Value is outside the allowed range", softThresholdMustBeLower: "The soft threshold must be lower than the hard threshold", activeIntervalSeconds: "Active interval (seconds)", passiveIntervalSeconds: "Passive interval (seconds)", consecutiveSoft: "Consecutive soft strikes", consecutiveErrors: "Consecutive probe errors", quarantineSeconds: "Quarantine (seconds)", softThreshold: "Soft threshold", hardThreshold: "Hard threshold", activeInterval: "Active interval", passiveInterval: "Audit interval", quarantineDuration: "Quarantine", minimumNodes: "Minimum nodes", unavailable: "Quality guard is not connected", unavailableHelp: "Enable qualityGuard in config.yaml and start the quality-guard Compose profile to display live status here.", testing: "Testing node quality", testComplete: "Test complete: {{speed}}", testFailed: "Quality test is temporarily unavailable. Try again shortly.", refreshNodes: "Refresh nodes", nodeEnabled: "Node enabled", nodeDisabled: "Node disabled", nodesEnabled: "Selected nodes enabled", nodesDisabled: "Selected nodes disabled", enableNode: "Enable node {{name}}", disableNode: "Disable node {{name}}", nodeEditorDescription: "Manage Grok Build egress used by the quality guard. Proxy URLs are write-only; leave the field blank while editing to keep the current value.", nodeCapacityHelp: "Maximum number of bound accounts; 0 means unlimited.", deleteNodeTitle: "Delete proxy node?", deleteNodeDescription: "Node “{{name}}” will be permanently deleted. This action cannot be undone.", deleteNodesTitle: "Delete {{count}} selected nodes?", deleteNodesDescription: "The selected proxy nodes will be permanently deleted. This action cannot be undone.",
+         nodesTab: "Node quality",
+         profilesTab: "Probe profiles",
+         profilesHelp: "Prompt and expected marker for active quality probes. A missing marker is a hard failure.",
+diff --git a/tools/egress-quality-guard/quality_guard.py b/tools/egress-quality-guard/quality_guard.py
+index bed8a14..7c03a82 100755
+--- a/tools/egress-quality-guard/quality_guard.py
++++ b/tools/egress-quality-guard/quality_guard.py
+@@ -370,16 +370,15 @@ def classify_result(result: dict[str, Any], config: Config, profile: dict[str, A
+     generation_ms = int(result.get("generationMs") or 0)
+     if generation_ms <= 0:
+         generation_ms = max(0, int(result.get("durationMs") or 0) - int(result.get("firstTokenMs") or 0))
+-    # Marker profiles treat content compliance as the primary signal. A short
+-    # QUALITY_OK reply should not be punished for token count or burst TPS.
+-    if expected and bool(result.get("expectedMatched")):
+-        if output_tokens >= 32 and speed >= config.hard_tps:
+-            return "hard", "hard_tps"
+-        if output_tokens >= 32 and speed >= config.soft_tps:
+-            return "soft", "soft_tps"
+-        return "healthy", "within_threshold"
++    # QUALITY_OK is a content marker, not a quality proof. Apply the same
++    # token / window / TPS rules used for user-traffic audits.
+     if output_tokens < 32:
+         return "soft", "insufficient_output_tokens"
++    reasoning_tokens = max(0, int(result.get("reasoningTokens") or result.get("reasoning_tokens") or 0))
++    if output_tokens >= 64 and reasoning_tokens <= 0:
++        return "hard", "missing_thinking"
++    if config.fail_closed and generation_ms < config.min_generation_ms and speed >= config.soft_tps:
++        return "hard", "buffered_burst"
+     if config.fail_closed and generation_ms < config.min_generation_ms:
+         return "soft", "insufficient_generation_window"
+     if speed >= config.hard_tps:
+@@ -432,6 +431,11 @@ def classify_audit(value: dict[str, Any], config: Config) -> tuple[str, str, flo
+     if generation_ms <= 0 or output_tokens < 32:
+         return "ignored", "insufficient_output_tokens", 0.0, output_tokens
+     speed = float(output_tokens) * 1000 / float(generation_ms)
++    reasoning_tokens = max(0, int(value.get("reasoningTokens") or 0))
++    # Backend model swaps often keep a normal 80-200 TPS but drop thinking.
++    # TPS-only rules treat those as healthy.
++    if output_tokens >= 64 and reasoning_tokens <= 0:
++        return "hard", "missing_thinking", speed, output_tokens
+     if config.fail_closed and generation_ms < config.min_generation_ms and speed >= config.soft_tps:
+         return "hard", "buffered_burst", speed, output_tokens
+     if speed >= config.hard_tps:
+@@ -461,6 +465,8 @@ def default_node_state() -> dict[str, Any]:
+         "last_rotation_exit_ip": "",
+         "rotation_failures": 0,
+         "last_no_account_log_at": 0.0,
++        "quarantine_source": "",
++        "passive_degrade_repeats": 0,
+     }
+ 
+ 
+@@ -646,7 +652,7 @@ class Guard:
+             bool(self.config.rotation_url)
+             and node_id in set(self.config.rotatable_node_ids)
+             and reason in {
+-                "hard_tps", "soft_tps", "buffered_burst", "expected_marker_missing",
++                "hard_tps", "soft_tps", "buffered_burst", "missing_thinking", "expected_marker_missing",
+                 "insufficient_output_tokens", "insufficient_generation_window", "probe_errors",
+                 "recovery_probe_error", "rotation_error",
+             }
+@@ -656,7 +662,7 @@ class Guard:
+     def _probe_account_unavailable(exc: Exception) -> bool:
+         return isinstance(exc, ApiError) and exc.code == "egressQualityProbeNoAccount"
+ 
+-    def _quarantine(self, nodes: list[dict[str, Any]], node: dict[str, Any], reason: str, now: float) -> None:
++    def _quarantine(self, nodes: list[dict[str, Any]], node: dict[str, Any], reason: str, now: float, recover_now: bool = True) -> None:
+         node_id = str(node["id"])
+         state = self._state_for(node_id)
+         if not self._can_quarantine(nodes, node_id):
+@@ -664,13 +670,20 @@ class Guard:
+             log_event("quarantine_suppressed", node_id=node_id, node_name=node.get("name"), reason=reason, minimum_healthy=self.config.min_healthy_nodes)
+             return
+         previous_state = dict(state)
++        source = "passive" if not recover_now else "active"
++        repeats = int(state.get("passive_degrade_repeats", 0))
++        if source == "passive":
++            repeats += 1
++        scale = min(8, 2 ** max(0, repeats - 1)) if source == "passive" else 1
+         state.update({
+             "active_soft_strikes": 0,
+             "passive_soft_strikes": 0,
+             "error_strikes": 0,
+-            "quarantined_until": now + self.config.quarantine_seconds,
++            "quarantined_until": now + self.config.quarantine_seconds * scale,
+             "disabled_by_guard": True,
+             "last_reason": reason,
++            "quarantine_source": source,
++            "passive_degrade_repeats": repeats if source == "passive" else int(state.get("passive_degrade_repeats", 0)),
+         })
+         # Persist ownership before changing backend scheduling state. A crash
+         # after the API call can then be reconciled safely on restart.
+@@ -693,11 +706,37 @@ class Guard:
+         self._bump_statistic("actions", "quarantined")
+         append_state_event(self.state, "node_quarantined", node_id=node_id, node_name=node.get("name"), reason=reason)
+         self._save()
+-        log_event("node_quarantined", node_id=node_id, node_name=node.get("name"), reason=reason, quarantine_seconds=self.config.quarantine_seconds)
+-        if reason == "buffered_burst":
+-            self._recover_quarantined(node, time.time(), rotate=False, rotate_on_failure=True)
++        log_event(
++            "node_quarantined",
++            node_id=node_id,
++            node_name=node.get("name"),
++            reason=reason,
++            quarantine_seconds=self.config.quarantine_seconds,
++            quarantine_hold_seconds=self.config.quarantine_seconds * scale,
++            quarantine_source=source,
++            degrade_repeats=repeats if source == "passive" else 0,
++            recover_now=recover_now,
++        )
++        if recover_now:
++            if reason == "buffered_burst":
++                self._recover_quarantined(node, time.time(), rotate=False, rotate_on_failure=True)
++            elif self._should_rotate(node_id, reason):
++                self._recover_quarantined(node, time.time(), rotate=True)
+         elif self._should_rotate(node_id, reason):
+-            self._recover_quarantined(node, time.time(), rotate=True)
++            try:
++                rotation = self.api.rotate_node(node_id, str(node.get("exitIp") or ""))
++            except Exception as exc:
++                state["rotation_failures"] = int(state.get("rotation_failures", 0)) + 1
++                log_event("node_rotation_failed", node_id=node_id, node_name=node.get("name"), error_type=type(exc).__name__, trigger="passive_hold")
++            else:
++                state.update({
++                    "last_rotation_at": time.time(),
++                    "last_rotation_exit_ip": str(rotation.get("newExitIp") or ""),
++                    "rotation_failures": 0,
++                })
++                append_state_event(self.state, "node_rotated", node_id=node_id, node_name=node.get("name"), exit_ip=str(rotation.get("newExitIp") or ""))
++                self._save()
++                log_event("node_rotated", node_id=node_id, node_name=node.get("name"), exit_ip=str(rotation.get("newExitIp") or ""), trigger="passive_hold")
+ 
+     def _record_probe(self, node: dict[str, Any], result: dict[str, Any], classification: str, reason: str, now: float) -> None:
+         node_id = str(node["id"])
+@@ -714,6 +753,7 @@ class Guard:
+             "last_classification": classification,
+             "last_output_tps": round(output_tps, 3),
+             "last_output_tokens": output_tokens,
++            "last_reasoning_tokens": max(0, int(result.get("reasoningTokens") or result.get("reasoning_tokens") or 0)),
+             "last_first_token_ms": int(result.get("firstTokenMs") or 0),
+             "last_duration_ms": int(result.get("durationMs") or 0),
+         })
+@@ -735,6 +775,7 @@ class Guard:
+             reason=reason,
+             output_tps=round(output_tps, 3),
+             output_tokens=output_tokens,
++            reasoning_tokens=max(0, int(result.get("reasoningTokens") or result.get("reasoning_tokens") or 0)),
+             first_token_ms=int(result.get("firstTokenMs") or 0),
+             duration_ms=int(result.get("durationMs") or 0),
+             chunk_count=int(result.get("chunkCount") or 0),
+@@ -827,6 +868,7 @@ class Guard:
+             if rotate_on_failure and self._should_rotate(node_id, reason):
+                 self._recover_quarantined(node, time.time(), rotate=True)
+             return
++        after_passive = self._is_passive_quarantine(state)
+         updated = self.api.set_enabled(node_id, True)
+         if updated != 1:
+             log_event("restore_not_applied", node_id=node_id, node_name=node.get("name"), updated=updated)
+@@ -838,11 +880,29 @@ class Guard:
+             "quarantined_until": 0.0,
+             "disabled_by_guard": False,
+             "last_reason": "",
++            "quarantine_source": "",
+         })
+         node["enabled"] = True
+         self._bump_statistic("actions", "restored")
+         append_state_event(self.state, "node_restored", node_id=node_id, node_name=node.get("name"), reason="quality_probe_healthy")
+-        log_event("node_restored", node_id=node_id, node_name=node.get("name"), connectivity_status=connectivity_status)
++        log_event(
++            "node_restored",
++            node_id=node_id,
++            node_name=node.get("name"),
++            connectivity_status=connectivity_status,
++            reason="quality_probe_healthy",
++            after_passive_hold=after_passive,
++            expected_matched=bool(result.get("expectedMatched")),
++        )
++
++    @staticmethod
++    def _is_passive_quarantine(state: dict[str, Any]) -> bool:
++        source = str(state.get("quarantine_source") or "")
++        if source == "passive":
++            return True
++        if source == "active":
++            return False
++        return str(state.get("last_source") or "") == "passive"
+ 
+     def _probe_quarantined(self, node: dict[str, Any], now: float) -> None:
+         node_id = str(node["id"])
+@@ -850,11 +910,15 @@ class Guard:
+         if now < float(state.get("quarantined_until", 0.0)):
+             return
+         reason = str(state.get("last_reason") or "")
++        passive = self._is_passive_quarantine(state)
++        # Dual probe: user traffic isolates immediately; after the hold a
++        # QUALITY_OK probe must come back healthy before restore. Passive
++        # isolate already rotated, so only rotate again if the probe fails.
+         self._recover_quarantined(
+             node,
+             now,
+-            rotate=self._should_rotate(node_id, reason) and reason != "buffered_burst",
+-            rotate_on_failure=reason == "buffered_burst",
++            rotate=(not passive) and self._should_rotate(node_id, reason) and reason != "buffered_burst",
++            rotate_on_failure=passive or reason == "buffered_burst",
+         )
+ 
+     def _prepare_nodes(self, now: float) -> tuple[list[dict[str, Any]], list[dict[str, Any]], set[str]]:
+@@ -908,15 +972,16 @@ class Guard:
+                     updated = self.api.set_enabled(node_id, False)
+                     if updated == 1:
+                         node["enabled"] = False
+-                        state["quarantined_until"] = now + self.config.quarantine_seconds
+                         log_event("operator_reenable_requires_probe", node_id=node_id, node_name=node.get("name"))
+-                        reason = str(state.get("last_reason") or "")
+-                        self._recover_quarantined(
+-                            node,
+-                            now,
+-                            rotate=self._should_rotate(node_id, reason) and reason != "buffered_burst",
+-                            rotate_on_failure=reason == "buffered_burst",
+-                        )
++                        if now >= float(state.get("quarantined_until", 0.0)):
++                            reason = str(state.get("last_reason") or "")
++                            passive = self._is_passive_quarantine(state)
++                            self._recover_quarantined(
++                                node,
++                                now,
++                                rotate=(not passive) and self._should_rotate(node_id, reason) and reason != "buffered_burst",
++                                rotate_on_failure=passive or reason == "buffered_burst",
++                            )
+                     skip_ids.add(node_id)
+                     continue
+                 state.update({
+@@ -1012,6 +1077,7 @@ class Guard:
+         })
+         if classification == "healthy":
+             state["passive_soft_strikes"] = 0
++            state["passive_degrade_repeats"] = 0
+             return
+         if classification == "soft":
+             state["passive_soft_strikes"] = int(state.get("passive_soft_strikes", 0)) + 1
+@@ -1039,13 +1105,15 @@ class Guard:
+             duration_ms=int(audit_value.get("durationMs") or 0),
+             strikes=int(state.get("passive_soft_strikes", 0)),
+         )
+-        if classification == "hard":
+-            self._quarantine(all_nodes, node, reason, now)
+-            return
+-        if self.config.fail_closed:
+-            self._quarantine(all_nodes, node, reason, now)
+-            return
+-        self._probe_active(all_nodes, node, now, trigger="passive_confirmation")
++        log_event(
++            "passive_immediate_quarantine",
++            node_id=node_id,
++            node_name=node.get("name"),
++            classification=classification,
++            reason=reason,
++            output_tps=round(speed, 3),
++        )
++        self._quarantine(all_nodes, node, reason, now, recover_now=False)
+ 
+     def run_passive_cycle(self) -> None:
+         now = time.time()
+diff --git a/tools/egress-quality-guard/quality_guard_test.py b/tools/egress-quality-guard/quality_guard_test.py
+index 6c5c833..4daa289 100644
+--- a/tools/egress-quality-guard/quality_guard_test.py
++++ b/tools/egress-quality-guard/quality_guard_test.py
+@@ -3,6 +3,7 @@ import json
+ import stat
+ import sys
+ import tempfile
++import time
+ import unittest
+ from pathlib import Path
+ 
+@@ -36,15 +37,21 @@ def config(**overrides):
+ class ClassificationTests(unittest.TestCase):
+     def test_healthy_soft_and_hard_thresholds(self):
+         cfg = config()
+-        self.assertEqual(quality_guard.classify_result({"expectedMatched": True, "outputTokens": 100, "outputTokensPerSecond": 499}, cfg)[0], "healthy")
+-        self.assertEqual(quality_guard.classify_result({"expectedMatched": True, "outputTokens": 100, "outputTokensPerSecond": 500}, cfg)[0], "soft")
+-        self.assertEqual(quality_guard.classify_result({"expectedMatched": True, "outputTokens": 100, "outputTokensPerSecond": 1000}, cfg)[0], "hard")
++        self.assertEqual(quality_guard.classify_result({"expectedMatched": True, "outputTokens": 100, "reasoningTokens": 40, "outputTokensPerSecond": 499}, cfg)[0], "healthy")
++        self.assertEqual(quality_guard.classify_result({"expectedMatched": True, "outputTokens": 100, "reasoningTokens": 40, "outputTokensPerSecond": 500}, cfg)[0], "soft")
++        self.assertEqual(quality_guard.classify_result({"expectedMatched": True, "outputTokens": 100, "reasoningTokens": 40, "outputTokensPerSecond": 1000}, cfg)[0], "hard")
+ 
+-    def test_missing_marker_is_hard_and_short_marker_hit_is_healthy(self):
+-        cfg = config()
++    def test_missing_marker_is_hard_and_quality_ok_is_not_a_healthy_shortcut(self):
++        cfg = config(fail_closed=True, min_generation_ms=1000)
+         marker = {"expected_text": "QUALITY_OK", "match_mode": "last_line"}
+         self.assertEqual(quality_guard.classify_result({"expectedMatched": False, "outputTokens": 100, "outputTokensPerSecond": 10}, cfg, marker), ("hard", "expected_marker_missing"))
+-        self.assertEqual(quality_guard.classify_result({"expectedMatched": True, "outputTokens": 12, "outputTokensPerSecond": 8000}, cfg, marker), ("healthy", "within_threshold"))
++        self.assertEqual(quality_guard.classify_result({"expectedMatched": True, "outputTokens": 12, "outputTokensPerSecond": 8000}, cfg, marker), ("soft", "insufficient_output_tokens"))
++        self.assertEqual(quality_guard.classify_result({
++            "expectedMatched": True, "outputTokens": 128, "reasoningTokens": 40, "outputTokensPerSecond": 8000, "generationMs": 50,
++        }, cfg, marker), ("hard", "buffered_burst"))
++        self.assertEqual(quality_guard.classify_result({
++            "expectedMatched": True, "outputTokens": 128, "reasoningTokens": 40, "outputTokensPerSecond": 80, "generationMs": 1500,
++        }, cfg, marker), ("healthy", "within_threshold"))
+         self.assertEqual(quality_guard.classify_result({"expectedMatched": True, "outputTokens": 12, "outputTokensPerSecond": 10}, cfg, {"expected_text": ""}), ("soft", "insufficient_output_tokens"))
+ 
+     def test_passive_speed_matches_panel_and_includes_reasoning_tokens(self):
+@@ -57,6 +64,46 @@ class ClassificationTests(unittest.TestCase):
+         self.assertEqual((classification, reason, output), ("hard", "hard_tps", 1050))
+         self.assertEqual(speed, 10500)
+ 
++    def test_passive_missing_thinking_is_hard_even_at_normal_tps(self):
++        cfg = config(fail_closed=True, min_generation_ms=1000)
++        base = {
++            "provider": "grok_build", "streaming": True, "statusCode": 200,
++            "firstTokenMs": 2000, "durationMs": 4000, "outputTokens": 200,
++        }
++        self.assertEqual(
++            quality_guard.classify_audit({**base, "reasoningTokens": 0}, cfg)[:2],
++            ("hard", "missing_thinking"),
++        )
++        classification, reason, speed, _ = quality_guard.classify_audit({**base, "reasoningTokens": 80}, cfg)
++        self.assertEqual((classification, reason), ("healthy", "within_threshold"))
++        self.assertAlmostEqual(speed, 100.0)
++        short = {**base, "outputTokens": 50, "reasoningTokens": 0, "durationMs": 2500}
++        self.assertEqual(quality_guard.classify_audit(short, cfg)[0], "healthy")
++
++    def test_probe_missing_thinking_is_hard(self):
++        cfg = config()
++        self.assertEqual(
++            quality_guard.classify_result({
++                "expectedMatched": True, "outputTokens": 200, "outputTokensPerSecond": 80,
++                "generationMs": 2500, "reasoningTokens": 0,
++            }, cfg),
++            ("hard", "missing_thinking"),
++        )
++        self.assertEqual(
++            quality_guard.classify_result({
++                "expectedMatched": True, "outputTokens": 200, "outputTokensPerSecond": 80,
++                "generationMs": 2500, "reasoningTokens": 90,
++            }, cfg)[0],
++            "healthy",
++        )
++        self.assertEqual(
++            quality_guard.classify_result({
++                "expectedMatched": True, "outputTokens": 200, "outputTokensPerSecond": 80,
++                "generationMs": 2500,
++            }, cfg),
++            ("hard", "missing_thinking"),
++        )
++
+     def test_passive_ignores_short_and_failed_requests(self):
+         cfg = config()
+         short = {"provider": "grok_build", "streaming": True, "statusCode": 200, "firstTokenMs": 100, "durationMs": 110, "outputTokens": 20, "reasoningTokens": 0}
+@@ -227,8 +274,8 @@ class GuardTests(unittest.TestCase):
+                 lock_file=Path(directory) / "lock",
+                 node_ids=("1",),
+             )
+-            bad = {"expectedMatched": True, "outputTokens": 100, "outputTokensPerSecond": 1200}
+-            good = {"expectedMatched": True, "outputTokens": 100, "outputTokensPerSecond": 100}
++            bad = {"expectedMatched": True, "outputTokens": 100, "reasoningTokens": 40, "outputTokensPerSecond": 1200}
++            good = {"expectedMatched": True, "outputTokens": 100, "reasoningTokens": 40, "outputTokensPerSecond": 100}
+             api = FakeApi(self.nodes(), [bad, good])
+             guard = quality_guard.Guard(cfg, api)
+             guard.run_cycle()
+@@ -263,7 +310,7 @@ class GuardTests(unittest.TestCase):
+                 lock_file=Path(directory) / "lock",
+                 node_ids=("1", "2"),
+             )
+-            good = {"expectedMatched": True, "outputTokens": 100, "outputTokensPerSecond": 100}
++            good = {"expectedMatched": True, "outputTokens": 100, "reasoningTokens": 40, "outputTokensPerSecond": 100}
+             api = FakeApi(self.nodes(3), [good], fixed_fallback_ids={"1"})
+             guard = quality_guard.Guard(cfg, api)
+             guard.run_active_cycle()
+@@ -306,7 +353,7 @@ class GuardTests(unittest.TestCase):
+                     self.assert_persisted = bool(persisted["nodes"][node_id]["disabled_by_guard"])
+                     return super().set_enabled(node_id, enabled)
+ 
+-            bad = {"expectedMatched": True, "outputTokens": 100, "outputTokensPerSecond": 1200, "generationMs": 1500}
++            bad = {"expectedMatched": True, "outputTokens": 100, "reasoningTokens": 40, "outputTokensPerSecond": 1200, "generationMs": 1500}
+             api = ObservingApi(self.nodes(3), [bad])
+             guard = quality_guard.Guard(cfg, api)
+             guard.run_active_cycle()
+@@ -328,7 +375,7 @@ class GuardTests(unittest.TestCase):
+                     self.enabled_calls.append((node_id, enabled))
+                     raise RuntimeError("backend unavailable")
+ 
+-            bad = {"expectedMatched": True, "outputTokens": 100, "outputTokensPerSecond": 1200, "generationMs": 1500}
++            bad = {"expectedMatched": True, "outputTokens": 100, "reasoningTokens": 40, "outputTokensPerSecond": 1200, "generationMs": 1500}
+             api = FailingApi(self.nodes(3), [bad])
+             guard = quality_guard.Guard(cfg, api)
+             guard.run_active_cycle()
+@@ -363,7 +410,7 @@ class GuardTests(unittest.TestCase):
+             nodes = self.nodes(2)
+             nodes[0]["enabled"] = False
+             nodes[1]["enabled"] = False
+-            good = {"expectedMatched": True, "outputTokens": 100, "outputTokensPerSecond": 100}
++            good = {"expectedMatched": True, "outputTokens": 100, "reasoningTokens": 40, "outputTokensPerSecond": 100}
+             api = FakeApi(nodes, [good])
+             guard = quality_guard.Guard(cfg, api)
+             state = guard._state_for("2")
+@@ -381,7 +428,7 @@ class GuardTests(unittest.TestCase):
+                 node_ids=("1",),
+                 min_healthy_nodes=3,
+             )
+-            bad = {"expectedMatched": True, "outputTokens": 100, "outputTokensPerSecond": 1200}
++            bad = {"expectedMatched": True, "outputTokens": 100, "reasoningTokens": 40, "outputTokensPerSecond": 1200}
+             api = FakeApi(self.nodes(3), [bad])
+             guard = quality_guard.Guard(cfg, api)
+             guard.run_cycle()
+@@ -400,7 +447,7 @@ class GuardTests(unittest.TestCase):
+             )
+             good = {
+                 "expectedMatched": True,
+-                "outputTokens": 128,
++                "reasoningTokens": 40, "outputTokens": 128,
+                 "outputTokensPerSecond": 100,
+                 "generationMs": 1500,
+             }
+@@ -413,10 +460,10 @@ class GuardTests(unittest.TestCase):
+             guard = quality_guard.Guard(cfg, api)
+             guard.run_passive_cycle()
+             guard.run_passive_cycle()
+-            self.assertEqual(api.enabled_calls, [("1", False), ("1", True)])
++            self.assertEqual(api.enabled_calls, [("1", False)])
+             self.assertEqual(api.rotation_calls, [("1", "")])
+-            self.assertEqual(api.quality_calls, ["1"])
+-            self.assertFalse(guard.state["nodes"]["1"]["disabled_by_guard"])
++            self.assertEqual(api.quality_calls, [])
++            self.assertTrue(guard.state["nodes"]["1"]["disabled_by_guard"])
+ 
+     def test_fail_closed_requires_consecutive_probe_errors_then_rotates(self):
+         with tempfile.TemporaryDirectory() as directory:
+@@ -431,7 +478,7 @@ class GuardTests(unittest.TestCase):
+             )
+             good = {
+                 "expectedMatched": True,
+-                "outputTokens": 128,
++                "reasoningTokens": 40, "outputTokens": 128,
+                 "outputTokensPerSecond": 100,
+                 "generationMs": 1500,
+             }
+@@ -505,7 +552,7 @@ class GuardTests(unittest.TestCase):
+             )
+             good = {
+                 "expectedMatched": True,
+-                "outputTokens": 128,
++                "reasoningTokens": 40, "outputTokens": 128,
+                 "outputTokensPerSecond": 100,
+                 "generationMs": 1500,
+             }
+@@ -516,9 +563,10 @@ class GuardTests(unittest.TestCase):
+             guard = quality_guard.Guard(cfg, api)
+             guard.run_passive_cycle()
+             guard.run_passive_cycle()
+-            self.assertEqual(api.enabled_calls, [("1", False), ("1", True)])
+-            self.assertEqual(api.rotation_calls, [])
+-            self.assertEqual(api.quality_calls, ["1"])
++            self.assertEqual(api.enabled_calls, [("1", False)])
++            self.assertEqual(api.rotation_calls, [("1", "")])
++            self.assertEqual(api.quality_calls, [])
++            self.assertTrue(guard.state["nodes"]["1"]["disabled_by_guard"])
+ 
+     def test_fail_closed_keeps_node_isolated_when_rotated_ip_probe_is_ambiguous(self):
+         with tempfile.TemporaryDirectory() as directory:
+@@ -533,7 +581,7 @@ class GuardTests(unittest.TestCase):
+             )
+             ambiguous = {
+                 "expectedMatched": True,
+-                "outputTokens": 128,
++                "reasoningTokens": 40, "outputTokens": 128,
+                 "outputTokensPerSecond": 100,
+                 "generationMs": 50,
+             }
+@@ -555,7 +603,7 @@ class GuardTests(unittest.TestCase):
+             )
+             good = {
+                 "expectedMatched": True,
+-                "outputTokens": 128,
++                "reasoningTokens": 40, "outputTokens": 128,
+                 "outputTokensPerSecond": 100,
+                 "generationMs": 1500,
+             }
+@@ -574,7 +622,7 @@ class GuardTests(unittest.TestCase):
+             cfg = config(state_file=Path(directory) / "state.json", lock_file=Path(directory) / "lock", node_ids=("1",))
+             nodes = self.nodes()
+             nodes[0]["enabled"] = False
+-            api = FakeApi(nodes, [{"expectedMatched": True, "outputTokens": 100, "outputTokensPerSecond": 100}])
++            api = FakeApi(nodes, [{"expectedMatched": True, "outputTokens": 100, "reasoningTokens": 40, "outputTokensPerSecond": 100}])
+             api.connectivity_test = lambda _node_id: {"status": "unhealthy"}
+             guard = quality_guard.Guard(cfg, api)
+             state = guard._state_for("1")
+@@ -598,7 +646,7 @@ class GuardTests(unittest.TestCase):
+     def test_passive_hard_signal_quarantines_immediately_and_ignores_guard_key(self):
+         with tempfile.TemporaryDirectory() as directory:
+             cfg = config(state_file=Path(directory) / "state.json", lock_file=Path(directory) / "lock", mode="passive", node_ids=("2",))
+-            healthy = {"expectedMatched": True, "outputTokens": 100, "outputTokensPerSecond": 100}
++            healthy = {"expectedMatched": True, "outputTokens": 100, "reasoningTokens": 40, "outputTokensPerSecond": 100}
+             api = FakeApi(self.nodes(), [healthy], [
+                 {"items": [], "hasMore": False, "nextCursor": ""},
+                 {"items": [self.audit("guard", "1", 1200, quality_probe=True), self.audit("user", "2", 1200)], "hasMore": False, "nextCursor": ""},
+@@ -613,32 +661,31 @@ class GuardTests(unittest.TestCase):
+             self.assertEqual(guard.state["nodes"]["2"]["passive_soft_strikes"], 0)
+             self.assertEqual(guard.state["statistics"]["passive"]["total"], 1)
+             self.assertEqual(guard.state["statistics"]["passive"]["hard"], 1)
++            self.assertEqual(guard.state["nodes"]["2"]["quarantine_source"], "passive")
+             guard.state["nodes"]["2"]["quarantined_until"] = 0
+             guard.run_active_cycle()
+             self.assertEqual(api.quality_calls, ["2"])
+             self.assertEqual(api.enabled_calls, [("2", False), ("2", True)])
+             self.assertFalse(guard.state["nodes"]["2"]["disabled_by_guard"])
+ 
+-    def test_passive_soft_signal_still_requires_active_confirmation(self):
++    def test_passive_soft_signal_quarantines_immediately_without_probe(self):
+         with tempfile.TemporaryDirectory() as directory:
+             cfg = config(state_file=Path(directory) / "state.json", lock_file=Path(directory) / "lock", mode="passive")
+-            hard = {"expectedMatched": True, "outputTokens": 100, "outputTokensPerSecond": 1200}
+-            api = FakeApi(self.nodes(), [hard], [
++            api = FakeApi(self.nodes(), [], [
+                 {"items": [], "hasMore": False, "nextCursor": ""},
+                 {"items": [self.audit("user", "2", 600)], "hasMore": False, "nextCursor": ""},
+             ])
+             guard = quality_guard.Guard(cfg, api)
+             guard.run_passive_cycle()
+             guard.run_passive_cycle()
+-            self.assertEqual(api.quality_calls, ["2"])
++            self.assertEqual(api.quality_calls, [])
+             self.assertEqual(api.enabled_calls, [("2", False)])
+             self.assertTrue(guard.state["nodes"]["2"]["disabled_by_guard"])
+ 
+-    def test_passive_signals_quarantine_only_after_consecutive_active_soft_confirmations(self):
++    def test_passive_soft_signal_holds_until_quarantine_window(self):
+         with tempfile.TemporaryDirectory() as directory:
+             cfg = config(state_file=Path(directory) / "state.json", lock_file=Path(directory) / "lock", mode="passive")
+-            soft = {"expectedMatched": True, "outputTokens": 100, "outputTokensPerSecond": 600}
+-            api = FakeApi(self.nodes(), [soft, soft], [
++            api = FakeApi(self.nodes(), [], [
+                 {"items": [], "hasMore": False, "nextCursor": ""},
+                 {"items": [self.audit("user-1", "2", 600)], "hasMore": False, "nextCursor": ""},
+                 {"items": [self.audit("user-2", "2", 600)], "hasMore": False, "nextCursor": ""},
+@@ -646,12 +693,12 @@ class GuardTests(unittest.TestCase):
+             guard = quality_guard.Guard(cfg, api)
+             guard.run_passive_cycle()
+             guard.run_passive_cycle()
+-            self.assertEqual(api.enabled_calls, [])
+-            self.assertEqual(guard.state["nodes"]["2"]["active_soft_strikes"], 1)
+-            guard.run_passive_cycle()
+-            self.assertEqual(api.quality_calls, ["2", "2"])
+             self.assertEqual(api.enabled_calls, [("2", False)])
++            self.assertEqual(api.quality_calls, [])
+             self.assertTrue(guard.state["nodes"]["2"]["disabled_by_guard"])
++            guard.run_passive_cycle()
++            self.assertEqual(api.quality_calls, [])
++            self.assertEqual(api.enabled_calls, [("2", False)])
+ 
+     def test_multiple_passive_hard_signals_only_quarantine_once(self):
+         with tempfile.TemporaryDirectory() as directory:
+@@ -667,7 +714,100 @@ class GuardTests(unittest.TestCase):
+             self.assertEqual(api.enabled_calls, [("2", False)])
+             self.assertEqual(guard.state["nodes"]["2"]["passive_soft_strikes"], 0)
+ 
+-    def test_passive_confirmation_errors_do_not_quarantine(self):
++    def test_passive_hold_restores_only_after_healthy_probe(self):
++        with tempfile.TemporaryDirectory() as directory:
++            cfg = config(state_file=Path(directory) / "state.json", lock_file=Path(directory) / "lock", mode="passive")
++            good = {
++                "expectedMatched": True,
++                "reasoningTokens": 40, "outputTokens": 128,
++                "outputTokensPerSecond": 80,
++                "generationMs": 1500,
++            }
++            api = FakeApi(self.nodes(), [good], [
++                {"items": [], "hasMore": False, "nextCursor": ""},
++                {"items": [self.audit("user", "2", 2500)], "hasMore": False, "nextCursor": ""},
++            ])
++            guard = quality_guard.Guard(cfg, api)
++            guard.run_passive_cycle()
++            guard.run_passive_cycle()
++            self.assertEqual(api.enabled_calls, [("2", False)])
++            self.assertEqual(api.quality_calls, [])
++            self.assertTrue(guard.state["nodes"]["2"]["disabled_by_guard"])
++            self.assertEqual(guard.state["nodes"]["2"]["passive_degrade_repeats"], 1)
++            guard.state["nodes"]["2"]["quarantined_until"] = 0
++            guard.run_passive_cycle()
++            self.assertEqual(api.quality_calls, ["2"])
++            self.assertEqual(api.enabled_calls, [("2", False), ("2", True)])
++            self.assertFalse(guard.state["nodes"]["2"]["disabled_by_guard"])
++            self.assertEqual(guard.state["nodes"]["2"]["quarantine_source"], "")
++
++    def test_passive_hold_keeps_isolated_when_recovery_probe_is_unhealthy(self):
++        with tempfile.TemporaryDirectory() as directory:
++            cfg = config(
++                state_file=Path(directory) / "state.json",
++                lock_file=Path(directory) / "lock",
++                mode="passive",
++                fail_closed=True,
++            )
++            bad = {
++                "expectedMatched": True,
++                "reasoningTokens": 40, "outputTokens": 128,
++                "outputTokensPerSecond": 8000,
++                "generationMs": 50,
++            }
++            api = FakeApi(self.nodes(), [bad], [
++                {"items": [], "hasMore": False, "nextCursor": ""},
++                {"items": [self.audit("user", "2", 2500)], "hasMore": False, "nextCursor": ""},
++            ])
++            guard = quality_guard.Guard(cfg, api)
++            guard.run_passive_cycle()
++            guard.run_passive_cycle()
++            self.assertEqual(api.enabled_calls, [("2", False)])
++            guard.state["nodes"]["2"]["quarantined_until"] = 0
++            guard.run_passive_cycle()
++            self.assertEqual(api.quality_calls, ["2"])
++            self.assertEqual(api.enabled_calls, [("2", False)])
++            self.assertTrue(guard.state["nodes"]["2"]["disabled_by_guard"])
++            self.assertEqual(guard.state["nodes"]["2"]["last_reason"], "buffered_burst")
++
++    def test_repeat_passive_degrade_lengthens_hold(self):
++        with tempfile.TemporaryDirectory() as directory:
++            cfg = config(
++                state_file=Path(directory) / "state.json",
++                lock_file=Path(directory) / "lock",
++                mode="passive",
++                quarantine_seconds=30,
++            )
++            good = {
++                "expectedMatched": True,
++                "reasoningTokens": 40, "outputTokens": 128,
++                "outputTokensPerSecond": 80,
++                "generationMs": 1500,
++            }
++            api = FakeApi(self.nodes(), [good], [
++                {"items": [], "hasMore": False, "nextCursor": ""},
++                {"items": [self.audit("user-1", "2", 2500)], "hasMore": False, "nextCursor": ""},
++            ])
++            guard = quality_guard.Guard(cfg, api)
++            guard.run_passive_cycle()
++            guard.run_passive_cycle()
++            first_hold = guard.state["nodes"]["2"]["quarantined_until"] - time.time()
++            self.assertGreater(first_hold, 20)
++            self.assertLess(first_hold, 40)
++            guard.state["nodes"]["2"]["quarantined_until"] = 0
++            guard.run_passive_cycle()
++            self.assertEqual(api.quality_calls, ["2"])
++            self.assertFalse(guard.state["nodes"]["2"]["disabled_by_guard"])
++            api.audit_pages.append({"items": [self.audit("user-2", "2", 2500)], "hasMore": False, "nextCursor": ""})
++            before = time.time()
++            guard.run_passive_cycle()
++            self.assertTrue(guard.state["nodes"]["2"]["disabled_by_guard"])
++            self.assertEqual(guard.state["nodes"]["2"]["passive_degrade_repeats"], 2)
++            second_hold = guard.state["nodes"]["2"]["quarantined_until"] - before
++            self.assertGreaterEqual(second_hold, 55)
++            self.assertLess(second_hold, 70)
++
++    def test_passive_user_anomaly_quarantines_without_waiting_for_probe(self):
+         with tempfile.TemporaryDirectory() as directory:
+             cfg = config(
+                 state_file=Path(directory) / "state.json", lock_file=Path(directory) / "lock",
+@@ -680,8 +820,9 @@ class GuardTests(unittest.TestCase):
+             guard = quality_guard.Guard(cfg, api)
+             guard.run_passive_cycle()
+             guard.run_passive_cycle()
+-            self.assertEqual(api.enabled_calls, [])
+-            self.assertEqual(guard.state["nodes"]["2"]["error_strikes"], 1)
++            self.assertEqual(api.enabled_calls, [("2", False)])
++            self.assertEqual(api.quality_calls, [])
++            self.assertTrue(guard.state["nodes"]["2"]["disabled_by_guard"])
+ 
+     @staticmethod
+     def audit(audit_id, node_id, output_tps, quality_probe=False):
+-- 
+2.50.1 (Apple Git-155)
+

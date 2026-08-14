@@ -12,7 +12,7 @@
 
 主动模式通过管理员专用 API，优先选择明确绑定到目标出口节点的 Grok Build 账号；如果绑定账号不可调度，则借用任意健康 Build 账号，但仍强制实际请求走被测节点。被动模式读取新的成功流式审计，按面板同口径 `输出 Token / (总耗时 - 首字耗时)` 计算速度；输出 Token 故意包含 Reasoning Token。
 
-被动硬阈值（默认 1000 Token/s）立即隔离节点；软阈值（默认 500 Token/s）触发固定 Prompt 主动复测，连续命中后才隔离。连续探测错误同样可隔离。异常节点只会被禁用，不会被删除或解绑。
+被动硬阈值（默认 1000 Token/s）立即隔离节点。用户真实流量一旦被判为 soft / hard / buffered_burst / missing_thinking，立刻摘流并保持隔离至 `quarantine_seconds`（连炸加倍，封顶 8×）。同一轮不跑 QUALITY_OK。可轮换节点先换 IP。冷静期到后跑 QUALITY_OK 恢复探针：必须 marker 命中、有 thinking，且过窗口/TPS，才开回去。QUALITY_OK 探针本身也要求 thinking。连续探测错误同样可隔离。异常节点只会被禁用，不会被删除或解绑。
 
 恢复时先记录通用连通性探测用于诊断，再以真实模型探测为恢复依据。最低健康节点保护（默认至少保留 3 个）会阻止继续隔离。
 
@@ -31,6 +31,27 @@
 节点操作与质量检测共用单个可更新 Toast，加载、成功和失败互相覆盖，避免并发操作留下互相矛盾的红绿提示。隔离或正在轮换的节点禁止手动检测；质量检测失败使用独立、安全的错误码和文案。
 
 `QUALITY_GUARD_NODE_IDS` 为空时，sidecar 自动管理所有已启用且配置代理的 Build 节点，并继续跟踪由守护隔离的节点以便复测恢复。它会把所有已解析的代理 Build 节点 ID 写入状态文件，使旧版管理页面不会把自动发现误判为空名单。手工停用的节点仍显示在新版管理表中，但不会被主动探测。
+
+## 探针方案（Grok2API）
+
+质量守护页增加「探针方案」页签，与 CPA v1.0.9 同语义：
+
+- 内置 `quality-marker`：最后一行含 `QUALITY_OK`；缺失记为硬异常。QUALITY_OK 命中后仍走 token / 窗口 / TPS / thinking，不再当 healthy 捷径。
+- 内置 `throughput`：长 Prompt，沿用 Token/s 判定。
+- 自定义方案：Prompt、预期标记、`contains` / `last_line` / `regex`。
+- 方案写在 `profiles.json`（与 runtime-config 同目录）。状态 API 只回 `id` / `name` / `match_mode` / `has_expected`，不回 Prompt 或标记正文。
+- 未创建 `profiles.json` 时 sidecar 保持旧行为：bootstrap 的 `QUALITY_OK` + `contains`，标记缺失仍为软异常。
+- 手动或自动探测可带 `profileId`；省略则用当前方案。
+
+## 探针方案（CPA）
+
+CPA 插件 v1.0.9 从 GrokIQ 吸收了「可配置探针 + 预期输出」：
+
+- 内置 `throughput`：长 Prompt，沿用 Token/s + thinking 判定。
+- 内置 `quality-marker`：最后一行必须含 `QUALITY_OK`；缺失记为硬异常。短回复命中标记时不因虚高 TPS 或缺少 thinking 误杀。
+- 自定义方案：Prompt、预期标记、匹配方式（`contains` / `last_line` / `regex`）。
+- 策略里选择 `active_profile_id`；手动质量检测可覆盖 `profileId`。
+- 状态 API 返回方案目录，但不回传模型完整正文。
 
 ## 降智账号面板
 

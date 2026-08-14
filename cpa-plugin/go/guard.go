@@ -322,18 +322,21 @@ func probeConnectivity(proxyURL string) (exitIP string, latencyMs int64, err err
 }
 
 type qualityResult struct {
-	Classification string  `json:"classification"`
-	TPS            float64 `json:"tps"`
-	OutputTokens   int64   `json:"output_tokens"`
-	DurationMs     int64   `json:"duration_ms"`
-	FirstTokenMs   int64   `json:"first_token_ms"`
-	HasThinking    bool    `json:"has_thinking,omitempty"`
-	AuthID         string  `json:"auth_id,omitempty"`
-	AuthLabel      string  `json:"auth_label,omitempty"`
-	ExitIP         string  `json:"exit_ip,omitempty"`
-	Error          string  `json:"error,omitempty"`
-	ErrorKind      string  `json:"error_kind,omitempty"`
-	Model          string  `json:"model,omitempty"`
+	Classification   string  `json:"classification"`
+	TPS              float64 `json:"tps"`
+	OutputTokens     int64   `json:"output_tokens"`
+	DurationMs       int64   `json:"duration_ms"`
+	FirstTokenMs     int64   `json:"first_token_ms"`
+	HasThinking      bool    `json:"has_thinking,omitempty"`
+	ExpectedMatched  bool    `json:"expected_matched"`
+	ProfileID        string  `json:"profile_id,omitempty"`
+	ProfileName      string  `json:"profile_name,omitempty"`
+	AuthID           string  `json:"auth_id,omitempty"`
+	AuthLabel        string  `json:"auth_label,omitempty"`
+	ExitIP           string  `json:"exit_ip,omitempty"`
+	Error            string  `json:"error,omitempty"`
+	ErrorKind        string  `json:"error_kind,omitempty"`
+	Model            string  `json:"model,omitempty"`
 }
 
 func rotationAllowed(cfg pluginConfig, nodeID string) bool {
@@ -573,9 +576,14 @@ func authProbeLabel(auth authFile) string {
 	return auth.Index
 }
 
-func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
+func probeQuality(store *stateStore, node *nodeRecord, profileID string) qualityResult {
 	pol := store.policy()
-	res := qualityResult{Model: pol.Model}
+	profile := store.resolveProfile(profileID)
+	model := strings.TrimSpace(profile.Model)
+	if model == "" {
+		model = pol.Model
+	}
+	res := qualityResult{Model: model, ProfileID: profile.ID, ProfileName: profile.Name, ExpectedMatched: true}
 	if node == nil || node.ProxyURL == "" {
 		res.Classification = "error"
 		res.ErrorKind = "request_error"
@@ -609,17 +617,24 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 	}
 
 	maxTok := pol.MaxOutputTokensProbe
+	if profile.MaxOutputTokens > 0 {
+		maxTok = profile.MaxOutputTokens
+	}
 	if maxTok <= 0 {
 		maxTok = 256
 	}
+	temp := profile.Temperature
+	if temp == 0 && profile.ID == profileThroughput {
+		temp = 0.7
+	}
 	payload := map[string]any{
-		"model": pol.Model,
+		"model": model,
 		"messages": []map[string]string{
-			{"role": "user", "content": "Write a detailed technical explanation of how TCP slow start works, at least 12 sentences, plain text only."},
+			{"role": "user", "content": profile.Prompt},
 		},
 		"stream":      true,
 		"max_tokens":  maxTok,
-		"temperature": 0.7,
+		"temperature": temp,
 	}
 	body, _ := json.Marshal(payload)
 
@@ -696,6 +711,7 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 			usageOut     int64
 			usageReason  int64
 			hasThinking  bool
+			visibleText  strings.Builder
 		)
 		scanner := bufio.NewScanner(resp.Body)
 		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
@@ -742,6 +758,7 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 						firstTokenAt = time.Now()
 					}
 					contentLen += len([]rune(t))
+					appendCappedRunes(&visibleText, t, maxProbeContentRunes)
 				}
 				for _, key := range []string{"thinking_content", "reasoning_content", "thinking"} {
 					if t, ok := delta[key].(string); ok && t != "" {
@@ -788,18 +805,13 @@ func probeQuality(store *stateStore, node *nodeRecord) qualityResult {
 		res.AuthID = firstNonEmpty(auth.ID, auth.Index, auth.Name, auth.Email)
 		res.AuthLabel = authProbeLabel(auth)
 		res.TPS = computeTPS(outTokens, res.DurationMs, res.FirstTokenMs, pol.MinGenerationMs)
-		res.Classification = classifyQuality(res.TPS, outTokens, hasThinking, pol)
+		res.ExpectedMatched = matchExpected(visibleText.String(), profile.ExpectedText, profile.MatchMode)
+		res = classifyWithProfile(res, profile, pol)
 		if res.Classification == "unknown" && outTokens == 0 {
 			lastErr = "探测无输出"
 			res.ErrorKind = "no_output"
 			continue
 		}
-		if res.Classification == "hard" && pol.ThinkingGuard && !hasThinking {
-			res.Error = "响应缺少 thinking_content（降智）"
-		} else {
-			res.Error = ""
-		}
-		res.ErrorKind = ""
 		return res
 	}
 
@@ -881,7 +893,7 @@ func scheduleCrossVerifyProbe(store *stateStore, nodeID, name, event, reason str
 	})
 	go func(id string) {
 		defer endCrossVerify(id)
-		if _, err := runNodeQuality(store, id); err != nil {
+		if _, err := runNodeQuality(store, id, ""); err != nil {
 			log.Printf("cross-verify probe failed node=%s err=%v", id, err)
 		}
 	}(nodeID)
@@ -1135,7 +1147,7 @@ func quarantineNode(store *stateStore, nodeID, reason string, tps float64, class
 		// A newly rotated IP gets exactly one real-model confirmation before it
 		// can leave quarantine. A healthy result restores the node; anomalies keep
 		// it isolated for the normal recovery worker.
-		_, _ = runNodeQuality(store, updated.ID)
+		_, _ = runNodeQuality(store, updated.ID, "")
 	}
 }
 
@@ -1168,7 +1180,7 @@ func runNodeConnectivity(store *stateStore, id string) (map[string]any, error) {
 	return out, nil
 }
 
-func runNodeQuality(store *stateStore, id string) (map[string]any, error) {
+func runNodeQuality(store *stateStore, id, profileID string) (map[string]any, error) {
 	n, ok := store.getNode(id)
 	if !ok {
 		return nil, fmt.Errorf("节点不存在")
@@ -1176,30 +1188,38 @@ func runNodeQuality(store *stateStore, id string) (map[string]any, error) {
 	if n.DisabledByGuard && n.QuarantinedUntil > float64(time.Now().Unix()) {
 		// still allow manual quality test for recovery
 	}
-	res := probeQuality(store, n)
+	res := probeQuality(store, n, profileID)
 	if res.Classification == "error" && res.ErrorKind != "transport_error" {
 		res.Classification = "ignored"
 	}
 	applyObservation(store, id, "active", res)
+	reason := res.Error
+	if reason == "" && res.ErrorKind == reasonMarkerMissing {
+		reason = "响应缺少预期标记"
+	}
 	store.appendEvent(guardEvent{
 		Event:          "quality_probe_completed",
 		NodeID:         id,
 		NodeName:       n.Name,
 		Classification: res.Classification,
 		OutputTPS:      res.TPS,
-		Reason:         res.Error,
+		Reason:         reason,
 	})
 	return map[string]any{
-		"id":             id,
-		"classification": res.Classification,
-		"tps":            res.TPS,
-		"outputTokens":   res.OutputTokens,
-		"durationMs":     res.DurationMs,
-		"firstTokenMs":   res.FirstTokenMs,
-		"exitIp":         res.ExitIP,
-		"error":          res.Error,
-		"errorKind":      res.ErrorKind,
-		"model":          res.Model,
+		"id":              id,
+		"classification":  res.Classification,
+		"tps":             res.TPS,
+		"outputTokens":    res.OutputTokens,
+		"durationMs":      res.DurationMs,
+		"firstTokenMs":    res.FirstTokenMs,
+		"exitIp":          res.ExitIP,
+		"error":           res.Error,
+		"errorKind":       res.ErrorKind,
+		"model":           res.Model,
+		"profileId":       res.ProfileID,
+		"profileName":     res.ProfileName,
+		"expectedMatched": res.ExpectedMatched,
+		"hasThinking":     res.HasThinking,
 	}, nil
 }
 
@@ -1395,14 +1415,14 @@ func startGuardWorker(ctx context.Context, store *stateStore) {
 				now := float64(time.Now().Unix())
 				for _, n := range store.listNodes() {
 					if n.DisabledByGuard && n.QuarantinedUntil > 0 && now >= n.QuarantinedUntil {
-						_, _ = runNodeQuality(store, n.ID)
+						_, _ = runNodeQuality(store, n.ID, "")
 						continue
 					}
 					if pol.Mode == "active" || pol.Mode == "hybrid" {
 						// light active cadence per node via last probe
 						if n.Enabled && !n.DisabledByGuard && (n.LastProbeAt == 0 || now-n.LastProbeAt >= float64(pol.ActiveIntervalSec)) {
 							// don't stampede — one per tick
-							_, _ = runNodeQuality(store, n.ID)
+							_, _ = runNodeQuality(store, n.ID, "")
 							break
 						}
 					}

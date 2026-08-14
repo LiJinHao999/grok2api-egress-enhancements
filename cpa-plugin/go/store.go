@@ -40,6 +40,9 @@ type policyConfig struct {
 	// anomaly. Default true.
 	SoftCrossVerify      bool `json:"soft_cross_verify"`
 	MaxOutputTokensProbe int  `json:"max_output_tokens"`
+	// ActiveProfileID selects the built-in or custom probe recipe used by
+	// automatic and manual quality tests. Empty falls back to throughput.
+	ActiveProfileID string `json:"active_profile_id,omitempty"`
 	// PolicySchema tracks policy feature revisions. Bump when new defaults must be
 	// force-migrated once for existing state.json files.
 	PolicySchema int `json:"policy_schema,omitempty"`
@@ -135,6 +138,7 @@ type guardState struct {
 	Version    int                           `json:"version"`
 	Policy     policyConfig                  `json:"policy"`
 	Nodes      map[string]*nodeRecord        `json:"nodes"`
+	Profiles   map[string]*ProbeProfile      `json:"profiles"`
 	Events     []guardEvent                  `json:"events"`
 	Stats      statistics                    `json:"statistics"`
 	AuthStats  map[string]*authDegradeRecord `json:"auth_stats"`
@@ -173,6 +177,7 @@ func defaultPolicy() policyConfig {
 		ThinkingCrossVerify:        true,
 		SoftCrossVerify:            true,
 		MaxOutputTokensProbe:       384,
+		ActiveProfileID:            defaultProbeProfileID(),
 		PolicySchema:               3,
 	}
 }
@@ -224,6 +229,9 @@ func normalizePolicy(p *policyConfig, rawPolicy map[string]any) {
 	}
 	if p.MaxOutputTokensProbe <= 0 {
 		p.MaxOutputTokensProbe = def.MaxOutputTokensProbe
+	}
+	if strings.TrimSpace(p.ActiveProfileID) == "" {
+		p.ActiveProfileID = defaultProbeProfileID()
 	}
 	if p.ConsecutiveMissingThinking <= 0 {
 		p.ConsecutiveMissingThinking = def.ConsecutiveMissingThinking
@@ -280,13 +288,15 @@ func normalizePolicy(p *policyConfig, rawPolicy map[string]any) {
 func newStateStore(path string) *stateStore {
 	s := &stateStore{path: path, flushDelay: 2 * time.Second}
 	s.data = guardState{
-		Version: 1,
-		Policy:  defaultPolicy(),
-		Nodes:   map[string]*nodeRecord{},
-		Events:  nil,
-		Stats:   statistics{StartedAt: float64(time.Now().Unix())},
-		NextID:  1,
+		Version:  1,
+		Policy:   defaultPolicy(),
+		Nodes:    map[string]*nodeRecord{},
+		Profiles: map[string]*ProbeProfile{},
+		Events:   nil,
+		Stats:    statistics{StartedAt: float64(time.Now().Unix())},
+		NextID:   1,
 	}
+	seedBuiltinProfiles(&s.data)
 	_ = s.load()
 	return s
 }
@@ -297,6 +307,7 @@ func (s *stateStore) load() error {
 	raw, err := os.ReadFile(s.path)
 	if err != nil {
 		if os.IsNotExist(err) {
+			seedBuiltinProfiles(&s.data)
 			return s.persistLocked()
 		}
 		return err
@@ -311,9 +322,13 @@ func (s *stateStore) load() error {
 	if data.AuthStats == nil {
 		data.AuthStats = map[string]*authDegradeRecord{}
 	}
+	if data.Profiles == nil {
+		data.Profiles = map[string]*ProbeProfile{}
+	}
 	if data.NextID <= 0 {
 		data.NextID = 1
 	}
+	seedBuiltinProfiles(&data)
 	// Preserve raw policy keys so newly introduced bool defaults stay ON when an
 	// older state.json omitted them (plain bool zero value would look like false).
 	var rawRoot map[string]any
@@ -489,6 +504,12 @@ func (s *stateStore) updatePolicy(p policyConfig) error {
 	}
 	if !p.ThinkingGuard {
 		p.ThinkingCrossVerify = false
+	}
+	if strings.TrimSpace(p.ActiveProfileID) == "" {
+		p.ActiveProfileID = defaultProbeProfileID()
+	}
+	if _, ok := s.data.Profiles[p.ActiveProfileID]; !ok {
+		return fmt.Errorf("探针方案 %s 不存在", p.ActiveProfileID)
 	}
 	s.data.Policy = p
 	return s.persistLocked()
@@ -878,4 +899,142 @@ func publicNode(n *nodeRecord) map[string]any {
 		"createdAt":            n.CreatedAt,
 		"updatedAt":            n.UpdatedAt,
 	}
+}
+
+func seedBuiltinProfiles(data *guardState) {
+	if data.Profiles == nil {
+		data.Profiles = map[string]*ProbeProfile{}
+	}
+	for _, builtin := range builtinProfiles() {
+		cp := builtin
+		existing, ok := data.Profiles[cp.ID]
+		if !ok {
+			cp.UpdatedAt = nowUnix()
+			data.Profiles[cp.ID] = &cp
+			continue
+		}
+		if existing.BuiltIn {
+			existing.Name = cp.Name
+			existing.Prompt = cp.Prompt
+			existing.ExpectedText = cp.ExpectedText
+			existing.MatchMode = cp.MatchMode
+			existing.RequireThinking = cp.RequireThinking
+			if existing.Temperature == 0 && cp.Temperature != 0 {
+				existing.Temperature = cp.Temperature
+			}
+		}
+	}
+	if strings.TrimSpace(data.Policy.ActiveProfileID) == "" {
+		data.Policy.ActiveProfileID = defaultProbeProfileID()
+	}
+	if _, ok := data.Profiles[data.Policy.ActiveProfileID]; !ok {
+		data.Policy.ActiveProfileID = defaultProbeProfileID()
+	}
+}
+
+func (s *stateStore) listProfiles() []ProbeProfile {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]ProbeProfile, 0, len(s.data.Profiles))
+	for _, p := range s.data.Profiles {
+		if p == nil {
+			continue
+		}
+		out = append(out, *p)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].BuiltIn != out[j].BuiltIn {
+			return out[i].BuiltIn
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out
+}
+
+func (s *stateStore) resolveProfile(id string) ProbeProfile {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if id == "" {
+		id = s.data.Policy.ActiveProfileID
+	}
+	if p, ok := s.data.Profiles[id]; ok && p != nil {
+		return *p
+	}
+	if p, ok := s.data.Profiles[defaultProbeProfileID()]; ok && p != nil {
+		return *p
+	}
+	builtins := builtinProfiles()
+	return builtins[0]
+}
+
+func (s *stateStore) createProfile(in ProbeProfile) (ProbeProfile, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	in.BuiltIn = false
+	in.ID = ""
+	if err := validateProbeProfile(&in, true); err != nil {
+		return ProbeProfile{}, err
+	}
+	custom := 0
+	for _, p := range s.data.Profiles {
+		if p != nil && !p.BuiltIn {
+			custom++
+		}
+	}
+	if custom >= maxCustomProfiles {
+		return ProbeProfile{}, fmt.Errorf("自定义方案最多 %d 个", maxCustomProfiles)
+	}
+	s.data.NextID++
+	in.ID = fmt.Sprintf("p-%d", s.data.NextID)
+	in.UpdatedAt = nowUnix()
+	if s.data.Profiles == nil {
+		s.data.Profiles = map[string]*ProbeProfile{}
+	}
+	cp := in
+	s.data.Profiles[in.ID] = &cp
+	if err := s.persistLocked(); err != nil {
+		return ProbeProfile{}, err
+	}
+	return in, nil
+}
+
+func (s *stateStore) updateProfile(id string, in ProbeProfile) (ProbeProfile, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	existing, ok := s.data.Profiles[id]
+	if !ok || existing == nil {
+		return ProbeProfile{}, fmt.Errorf("方案不存在")
+	}
+	if existing.BuiltIn {
+		return ProbeProfile{}, fmt.Errorf("内置方案不能修改，请复制后另存")
+	}
+	in.ID = existing.ID
+	in.BuiltIn = false
+	if err := validateProbeProfile(&in, false); err != nil {
+		return ProbeProfile{}, err
+	}
+	in.UpdatedAt = nowUnix()
+	cp := in
+	s.data.Profiles[id] = &cp
+	if err := s.persistLocked(); err != nil {
+		return ProbeProfile{}, err
+	}
+	return in, nil
+}
+
+func (s *stateStore) deleteProfile(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	existing, ok := s.data.Profiles[id]
+	if !ok || existing == nil {
+		return fmt.Errorf("方案不存在")
+	}
+	if existing.BuiltIn {
+		return fmt.Errorf("内置方案不能删除")
+	}
+	if s.data.Policy.ActiveProfileID == id {
+		s.data.Policy.ActiveProfileID = defaultProbeProfileID()
+	}
+	delete(s.data.Profiles, id)
+	return s.persistLocked()
 }

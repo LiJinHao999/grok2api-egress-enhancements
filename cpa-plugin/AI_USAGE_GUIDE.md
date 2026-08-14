@@ -1,6 +1,6 @@
 # CPA 出口守护 AI 部署与运维指南
 
-本文用于让 AI 工具或运维人员从零部署、配置和维护 `grok2api-egress` v1.0.8。插件是纯 CPA 原生实现，只读写 CLIProxyAPI（下称 CPA）的 xAI auth 文件和 Usage 事件，不依赖 Grok2API 运行时。
+本文用于让 AI 工具或运维人员从零部署、配置和维护 `grok2api-egress` v1.0.9。插件是纯 CPA 原生实现，只读写 CLIProxyAPI（下称 CPA）的 xAI auth 文件和 Usage 事件，不依赖 Grok2API 运行时。
 
 如果部署包含 Mihomo、家宽 sticky 会话或 Resin 动态池，请先阅读[推荐出口部署方式](../docs/RECOMMENDED_DEPLOYMENT.md)，再回到本文执行 CPA 节点添加、账号重平衡和 Guard 策略配置。本文的“方案 A/B”是单节点接入细节，不替代上游分片与故障域规划。
 
@@ -620,7 +620,7 @@ auth 到代理的映射仍有短缓存，后台隔离复测最多受 worker 扫�
 ## 12. 给 AI 工具的推荐任务提示词
 
 ```text
-你正在部署 grok2api-egress-enhancements/cpa-plugin v1.0.8。
+你正在部署 grok2api-egress-enhancements/cpa-plugin v1.0.9。
 
 先阅读：
 1. cpa-plugin/README.md

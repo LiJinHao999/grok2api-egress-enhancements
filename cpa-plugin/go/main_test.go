@@ -730,8 +730,8 @@ state_file: %s
 store:
   schema-version: 1
   id: grok2api-egress
-  version: 1.0.8
-  release-tag: v1.0.8
+  version: 1.0.9
+  release-tag: v1.0.9
   repository: https://github.com/lij768423-svg/grok2api-egress-enhancements
   install:
     type: github-release
@@ -1016,5 +1016,88 @@ func TestDebouncedPersistCoalescesStats(t *testing.T) {
 	}
 	if st.Stats.Passive.Total != 20 {
 		t.Fatalf("passive total=%d want 20", st.Stats.Passive.Total)
+	}
+}
+
+func TestMatchExpectedModes(t *testing.T) {
+	text := "天空是蓝的，因为瑞利散射。\nQUALITY_OK\n"
+	if !matchExpected(text, "QUALITY_OK", matchLastLine) {
+		t.Fatal("last line QUALITY_OK should match")
+	}
+	if matchExpected("hello\nNOT_OK", "QUALITY_OK", matchLastLine) {
+		t.Fatal("wrong last line must not match")
+	}
+	if !matchExpected("prefix QUALITY_OK suffix", "QUALITY_OK", matchContains) {
+		t.Fatal("contains should match")
+	}
+	if !matchExpected("done\nstatus=QUALITY_OK", "QUALITY_OK", matchLastLine) {
+		t.Fatal("last line containing the marker should match")
+	}
+	if !matchExpected("alpha\nbeta QUALITY_OK", `QUALITY_OK$`, matchRegex) {
+		t.Fatal("regex should match")
+	}
+	if matchExpected("nope", "[", matchRegex) {
+		t.Fatal("invalid regex must not match")
+	}
+	if !matchExpected("anything", "", matchContains) {
+		t.Fatal("empty expected is always a match")
+	}
+}
+
+func TestClassifyWithProfileMarkerMissIsHard(t *testing.T) {
+	pol := defaultPolicy()
+	profile := ProbeProfile{ID: profileQualityMarker, ExpectedText: "QUALITY_OK", MatchMode: matchLastLine}
+	res := classifyWithProfile(qualityResult{TPS: 12, OutputTokens: 8, ExpectedMatched: false}, profile, pol)
+	if res.Classification != "hard" || res.ErrorKind != reasonMarkerMissing {
+		t.Fatalf("marker miss=%+v", res)
+	}
+	shortOK := classifyWithProfile(qualityResult{TPS: 8000, OutputTokens: 4, ExpectedMatched: true}, profile, pol)
+	if shortOK.Classification != "healthy" {
+		t.Fatalf("short marker hit should be healthy, got %q", shortOK.Classification)
+	}
+	longHard := classifyWithProfile(qualityResult{TPS: 2000, OutputTokens: pol.MinOutputTokens, ExpectedMatched: true}, profile, pol)
+	if longHard.Classification != "hard" {
+		t.Fatalf("long marker hit with hard TPS=%q", longHard.Classification)
+	}
+}
+
+func TestBuiltinProfilesSeededAndCustomCRUD(t *testing.T) {
+	store := newStateStore(filepath.Join(t.TempDir(), "state.json"))
+	items := store.listProfiles()
+	if len(items) < 2 {
+		t.Fatalf("builtins=%d, want >= 2", len(items))
+	}
+	got := store.resolveProfile("")
+	if got.ID != profileThroughput {
+		t.Fatalf("default profile=%s", got.ID)
+	}
+	created, err := store.createProfile(ProbeProfile{
+		Name: "自定义标记", Prompt: "只输出 FLAG_OK", ExpectedText: "FLAG_OK", MatchMode: matchLastLine,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.ID == "" || created.BuiltIn {
+		t.Fatalf("created=%+v", created)
+	}
+	pol := store.policy()
+	pol.ActiveProfileID = created.ID
+	if err := store.updatePolicy(pol); err != nil {
+		t.Fatal(err)
+	}
+	if store.resolveProfile("").ID != created.ID {
+		t.Fatal("active profile not resolved")
+	}
+	if _, err := store.updateProfile(profileQualityMarker, ProbeProfile{Name: "x", Prompt: "y"}); err == nil {
+		t.Fatal("built-in update must fail")
+	}
+	if err := store.deleteProfile(profileThroughput); err == nil {
+		t.Fatal("built-in delete must fail")
+	}
+	if err := store.deleteProfile(created.ID); err != nil {
+		t.Fatal(err)
+	}
+	if store.policy().ActiveProfileID != profileThroughput {
+		t.Fatalf("delete active should fall back, got %s", store.policy().ActiveProfileID)
 	}
 }

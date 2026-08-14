@@ -77,7 +77,7 @@ import (
 
 const (
 	pluginName          = "grok2api-egress"
-	pluginVersion       = "1.0.8"
+	pluginVersion       = "1.0.9"
 	resourcePath        = "/status"
 	managementAPIPath   = "/v0/management/grok2api-egress/api"
 	resourceContentType = "text/html; charset=utf-8"
@@ -475,10 +475,54 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 			if !p.ThinkingGuard {
 				p.ThinkingCrossVerify = false
 			}
+			if v, ok := raw["active_profile_id"].(string); ok {
+				p.ActiveProfileID = strings.TrimSpace(v)
+			}
+			if v, ok := raw["activeProfileId"].(string); ok {
+				p.ActiveProfileID = strings.TrimSpace(v)
+			}
 			if err := store.updatePolicy(p); err != nil {
 				return managementJSON(http.StatusBadRequest, errMsg("invalidPolicy", err.Error()))
 			}
 			return managementJSON(http.StatusOK, map[string]any{"data": store.policy(), "ok": true})
+		}
+
+	case path == "/profiles" || path == "/quality-guard/profiles":
+		if method == http.MethodGet {
+			items := store.listProfiles()
+			return managementJSON(http.StatusOK, map[string]any{"data": map[string]any{"items": items, "total": len(items)}, "items": items, "total": len(items)})
+		}
+		if method == http.MethodPost {
+			var in ProbeProfile
+			if err := json.Unmarshal(body, &in); err != nil {
+				return managementJSON(http.StatusBadRequest, errMsg("invalidBody", "方案数据无效"))
+			}
+			created, err := store.createProfile(in)
+			if err != nil {
+				return managementJSON(http.StatusBadRequest, errMsg("createFailed", err.Error()))
+			}
+			return managementJSON(http.StatusOK, map[string]any{"data": created})
+		}
+
+	case len(parts) == 2 && parts[0] == "profiles" && safeID(parts[1]),
+		len(parts) == 3 && parts[0] == "quality-guard" && parts[1] == "profiles" && safeID(parts[2]):
+		id := parts[len(parts)-1]
+		if method == http.MethodPut || method == http.MethodPatch {
+			var in ProbeProfile
+			if err := json.Unmarshal(body, &in); err != nil {
+				return managementJSON(http.StatusBadRequest, errMsg("invalidBody", "方案数据无效"))
+			}
+			updated, err := store.updateProfile(id, in)
+			if err != nil {
+				return managementJSON(http.StatusBadRequest, errMsg("updateFailed", err.Error()))
+			}
+			return managementJSON(http.StatusOK, map[string]any{"data": updated})
+		}
+		if method == http.MethodDelete {
+			if err := store.deleteProfile(id); err != nil {
+				return managementJSON(http.StatusBadRequest, errMsg("deleteFailed", err.Error()))
+			}
+			return managementJSON(http.StatusOK, map[string]any{"ok": true})
 		}
 
 	case path == "/auth-stats" || path == "/quality-guard/auth-stats":
@@ -714,7 +758,7 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 
 	case len(parts) == 3 && parts[0] == "nodes" && safeID(parts[1]) && (parts[2] == "quality-test" || parts[2] == "quality"):
 		if method == http.MethodPost {
-			r, err := runNodeQuality(store, parts[1])
+			r, err := runNodeQuality(store, parts[1], profileIDFrom(query, body))
 			if err != nil {
 				return managementJSON(http.StatusBadRequest, errMsg("qualityFailed", err.Error()))
 			}
@@ -722,7 +766,7 @@ func dispatchAPI(method, path string, query url.Values, body json.RawMessage) ([
 		}
 	case len(parts) == 4 && parts[0] == "quality-guard" && parts[1] == "nodes" && safeID(parts[2]) && parts[3] == "test":
 		if method == http.MethodPost {
-			r, err := runNodeQuality(store, parts[2])
+			r, err := runNodeQuality(store, parts[2], profileIDFrom(query, body))
 			if err != nil {
 				return managementJSON(http.StatusBadRequest, errMsg("qualityFailed", err.Error()))
 			}
@@ -768,12 +812,14 @@ func buildStatus() map[string]any {
 	pol := store.policy()
 	st := store.stats()
 	authStats := store.listAuthDegradeStats()
+	profiles := store.listProfiles()
 	return map[string]any{
 		"available":    true,
 		"updatedAt":    store.snapshot().UpdatedAt,
 		"config":       pol,
 		"editable":     true,
 		"nodes":        nodeMap,
+		"profiles":     profiles,
 		"statistics":   st,
 		"authStats":    authStats,
 		"recentEvents": store.events(),
@@ -783,6 +829,31 @@ func buildStatus() map[string]any {
 		"engine":       "cpa-native",
 		"hint":         "纯 CPA 出口守护：节点代理写在账号 proxy_url，被动 Token/s 审计 + 主动质量探测，不依赖 Grok2API。",
 	}
+}
+
+func profileIDFrom(query url.Values, body json.RawMessage) string {
+	if query != nil {
+		if v := strings.TrimSpace(query.Get("profileId")); v != "" {
+			return v
+		}
+		if v := strings.TrimSpace(query.Get("profile_id")); v != "" {
+			return v
+		}
+	}
+	if len(body) == 0 {
+		return ""
+	}
+	var raw map[string]any
+	if json.Unmarshal(body, &raw) != nil {
+		return ""
+	}
+	if v, ok := raw["profileId"].(string); ok {
+		return strings.TrimSpace(v)
+	}
+	if v, ok := raw["profile_id"].(string); ok {
+		return strings.TrimSpace(v)
+	}
+	return ""
 }
 
 func handleUsage(request []byte) ([]byte, error) {
