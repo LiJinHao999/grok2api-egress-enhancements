@@ -29,7 +29,7 @@
 - 把 CPA `xai-*.json` 账号的 `proxy_url` **粘性绑定**到 Node
 - 用 **被动 usage 观测 + 主动 quality probe** 判定 healthy / soft / hard / error；账号、额度、上游权限失败只记录为 ignored，不消耗出口错误次数
 - **隔离（quarantine）坏节点**，并 **migrate** 账号到健康通道
-- 选号交还 CPA session affinity，避免插件 round-robin 乱切账号；隔离时先 disable 受影响账号再迁出，选定账号与迁移竞态返回可重试的 `503 + Retry-After: 1`
+- 选号交还 CPA session affinity，避免插件 round-robin 乱切账号；隔离时先 disable 再迁出。选号/迁号竞态，以及 `host.auth.save` 后 runtime 尚未跟上的窗口，都由拦截器返回可重试的 `503 + Retry-After`
 - 可选调用受信任的内部换 IP Webhook；只有确认出口 IP 已变化并通过真实模型复测才恢复节点
 - 提供完整 **管理 UI**（节点 CRUD、批量、重平衡、质量测试、策略、事件）
 
@@ -379,9 +379,9 @@ CPA_LOADTEST_LOG_DIR=/var/log/cpa-loadtest \
 
 v1.0.5 起插件以 `Handled: true` 自己 round-robin 选号，本意是跳过隔离出口，但会绕过 CPA session affinity，同一会话每次请求换账号。v1.0.9 起 `handleSchedulerPick` 恒定 `Handled: false`，选号交还 host。隔离出口仍靠：
 
-- 迁号前先把受影响账号写成 `disabled`（CPA 丢弃 `candidate.Disabled`）
-- 再把账号绑到近期主动检测 healthy 且出口 IP 不同的节点；没有这类目标时降级迁到其他可调度且未判 soft/hard/error、出口 IP 也不同的节点；仍失败则回滚 disable
-- 选号与迁号竞态由 `handleRequestIntercept` 返回 `503 + Retry-After: 1`；选号后 metadata 缺少账号标识、同时存在隔离节点时同样 fail-closed。缓存 miss / 解析不到绑定也 fail-closed，不能把“查不到”当成直连。只有明确已知未托管（无 `proxy_url` 或未知代理）的账号才放行。OpenAI 兼容的 `SourceFormat`/`ToFormat` 不算非 xAI 证据
+- 迁号前先把受影响账号写成 `disabled`，再绑到近期主动检测 healthy 且出口 IP 不同的节点；没有这类目标时降级迁到其他可调度且未判 soft/hard/error、出口 IP 也不同的节点；仍失败则回滚 disable
+- CPA v7.2.113 的 `host.auth.save` 不会立刻把文件里的 `disabled` / `proxy_url` 写进 runtime Auth，要等文件 watcher。因此刚写完绑定的账号会在拦截器里再挡约 2 秒，避免请求打到空 `ProxyURL` 或仍粘在坏出口上
+- 选号与迁号竞态、以及上述 runtime 未就绪窗口，由 `handleRequestIntercept` 返回 `503 + Retry-After`；选号后 metadata 缺少账号标识、同时存在隔离节点时同样 fail-closed。缓存 miss / 解析不到绑定 / 代理 URL 匹配不到任何节点，在隔离期也 fail-closed。只有明确已知未托管（无 `proxy_url`）的账号才放行。OpenAI 兼容的 `SourceFormat`/`ToFormat` 不算非 xAI 证据
 
 主动质量探测不经过这段 hook：它只使用本节点已绑定账号，经节点代理直连上游，空节点不借号。
 

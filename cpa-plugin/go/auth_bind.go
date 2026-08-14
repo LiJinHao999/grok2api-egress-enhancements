@@ -248,6 +248,10 @@ func saveAuthFile(name string, obj map[string]any) error {
 		patchAuthListCacheAfterSave(name, obj)
 		// Rebuild proxy map from the patched list cache (no host round-trips).
 		invalidateAuthProxyCache()
+		// host.auth.save on CPA v7.2.113 rebuilds runtime Auth without
+		// copying disabled / proxy_url. Hold the request gate until the
+		// file watcher has had time to apply the file we just wrote.
+		markAuthRuntimeUnsettledFromSave(name, obj)
 	}
 	return err
 }
@@ -589,30 +593,9 @@ func listAuthsForNodeMode(node *nodeRecord, limit int, mode authListMode) ([]aut
 	return out, nil
 }
 
-func pickForeignAuthForNode(node *nodeRecord, foreign, foreignExpired []authFile) (authFile, bool) {
-	pool := foreign
-	if len(pool) == 0 {
-		pool = foreignExpired
-	}
-	if len(pool) == 0 {
-		return authFile{}, false
-	}
-	if node == nil || node.ID == "" || len(pool) == 1 {
-		return pool[0], true
-	}
-	sum := 0
-	for _, r := range node.ID {
-		sum = sum*31 + int(r)
-	}
-	if sum < 0 {
-		sum = -sum
-	}
-	return pool[sum%len(pool)], true
-}
-
 // nodeHasBoundRestoreFuel reports leftover tokens already on this proxy
-// (enabled or guard-disabled). Empty isolated nodes must not borrow a
-// foreign account just to decide whether a model probe is possible.
+// (enabled or guard-disabled, and not expired). Empty or expired-only
+// isolated nodes must not earn a model probe.
 func nodeHasBoundRestoreFuel(node *nodeRecord) bool {
 	if node == nil || node.ProxyURL == "" {
 		return false
@@ -626,7 +609,7 @@ func nodeHasBoundRestoreFuel(node *nodeRecord) bool {
 			continue
 		}
 		tok, _ := a.Raw["access_token"].(string)
-		if strings.TrimSpace(tok) == "" {
+		if strings.TrimSpace(tok) == "" || isAuthExpired(a) {
 			continue
 		}
 		if !a.Disabled || isGuardDisabledAuth(a) {

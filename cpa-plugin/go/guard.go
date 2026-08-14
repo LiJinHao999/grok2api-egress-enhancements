@@ -118,13 +118,19 @@ func indexAuthProxyKeys(out map[string]string, a authFile, proxy string) {
 	}
 }
 
+// authBindingLookup is the interceptor view of one selected credential.
+// Unmanaged is only empty/sentinel proxy. A proxy string that matches no
+// node is Known but not Unmanaged — during quarantine that must fail closed.
+type authBindingLookup struct {
+	NodeID    string
+	Known     bool
+	Unmanaged bool
+}
+
 // lookupAuthBinding resolves selected-auth keys against the in-memory proxy map.
-// known=true means we have seen this auth (managed node, empty proxy, or an
-// unknown proxy URL). known=false is a cache/list miss and must not be treated
-// as unmanaged during quarantine.
-func lookupAuthBinding(store *stateStore, authKeys ...string) (nodeID string, known bool) {
+func lookupAuthBinding(store *stateStore, authKeys ...string) authBindingLookup {
 	if store == nil {
-		return "", false
+		return authBindingLookup{}
 	}
 	cache := refreshAuthProxyCache()
 	var proxy string
@@ -141,23 +147,22 @@ func lookupAuthBinding(store *stateStore, authKeys ...string) (nodeID string, kn
 		}
 	}
 	if !found {
-		return "", false
+		return authBindingLookup{}
 	}
 	if proxy == "" || proxy == authProxyUnmanaged {
-		return "", true
+		return authBindingLookup{Known: true, Unmanaged: true}
 	}
 	if id := store.nodeIDByProxy(proxy); id != "" {
-		return id, true
+		return authBindingLookup{NodeID: id, Known: true}
 	}
-	return "", true
+	return authBindingLookup{Known: true}
 }
 
 // resolveNodeIDForAuth is on the request hot path. It consults the in-memory
 // proxy map (rebuilt from the auth-list cache on TTL miss). A miss yields ""
 // rather than issuing N host.auth.get calls for the selected id.
 func resolveNodeIDForAuth(store *stateStore, authKeys ...string) string {
-	id, _ := lookupAuthBinding(store, authKeys...)
-	return id
+	return lookupAuthBinding(store, authKeys...).NodeID
 }
 
 func classifyTPS(tps float64, soft, hard float64) string {
