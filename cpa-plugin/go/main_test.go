@@ -175,19 +175,25 @@ func TestProbeUnstableErrDetection(t *testing.T) {
 }
 
 
-func TestDefaultPolicyThinkingFeaturesOn(t *testing.T) {
+func TestDefaultPolicyDefaults(t *testing.T) {
 	pol := defaultPolicy()
 	if !pol.ThinkingGuard {
 		t.Fatal("default ThinkingGuard should be on")
 	}
-	if !pol.ThinkingCrossVerify {
-		t.Fatal("default ThinkingCrossVerify should be on")
+	if pol.ThinkingCrossVerify {
+		t.Fatal("default ThinkingCrossVerify should be off")
 	}
-	if !pol.SoftCrossVerify {
-		t.Fatal("default SoftCrossVerify should be on")
+	if pol.SoftCrossVerify {
+		t.Fatal("default SoftCrossVerify should be off")
 	}
 	if pol.ConsecutiveMissingThinking != 1 {
 		t.Fatalf("default consecutive missing thinking=%d, want 1", pol.ConsecutiveMissingThinking)
+	}
+	if pol.QuarantineSec != 3600 {
+		t.Fatalf("default quarantine seconds=%d, want 3600", pol.QuarantineSec)
+	}
+	if pol.PolicySchema != 4 {
+		t.Fatalf("default policy schema=%d, want 4", pol.PolicySchema)
 	}
 	if got := classifyQuality(100, 64, false, pol); got != "hard" {
 		t.Fatalf("missing thinking with guard=%q, want hard", got)
@@ -204,51 +210,71 @@ func TestNormalizePolicyFillsAbsentBoolDefaults(t *testing.T) {
 	if !p.ThinkingGuard {
 		t.Fatal("absent thinking_guard must default on")
 	}
-	if !p.ThinkingCrossVerify {
-		t.Fatal("schema migration must turn thinking_cross_verify on")
+	if p.ThinkingCrossVerify {
+		t.Fatal("schema migration must default thinking_cross_verify off")
 	}
-	if !p.SoftCrossVerify {
-		t.Fatal("absent soft_cross_verify must default on")
+	if p.SoftCrossVerify {
+		t.Fatal("absent soft_cross_verify must default off")
 	}
 	if p.ConsecutiveMissingThinking != 1 {
 		t.Fatalf("consecutive_missing_thinking=%d, want 1", p.ConsecutiveMissingThinking)
 	}
-	if p.PolicySchema != 3 {
-		t.Fatalf("policy_schema=%d, want 3", p.PolicySchema)
+	if p.PolicySchema != 4 {
+		t.Fatalf("policy_schema=%d, want 4", p.PolicySchema)
+	}
+	if p.QuarantineSec != 3600 {
+		t.Fatalf("migrated quarantine_seconds=%d, want 3600", p.QuarantineSec)
 	}
 
-	// Intermediate build: explicit thinking_cross_verify=false but schema still 0.
-	pMid := policyConfig{HardTPS: 1000, SoftTPS: 500, ThinkingGuard: true, ThinkingCrossVerify: false, ConsecutiveMissingThinking: 1}
-	normalizePolicy(&pMid, map[string]any{
-		"hard_tps":                     1000,
-		"soft_tps":                     500,
-		"thinking_guard":               true,
-		"thinking_cross_verify":        false,
-		"consecutive_missing_thinking": 1,
+	// Live leftover: schema 3 with both cross-verify flags still true.
+	pLive := policyConfig{HardTPS: 1000, SoftTPS: 500, ThinkingGuard: true, ThinkingCrossVerify: true, SoftCrossVerify: true, ConsecutiveMissingThinking: 1, QuarantineSec: 120, PolicySchema: 3}
+	normalizePolicy(&pLive, map[string]any{
+		"hard_tps":              1000,
+		"soft_tps":              500,
+		"thinking_guard":        true,
+		"thinking_cross_verify": true,
+		"soft_cross_verify":     true,
+		"quarantine_seconds":    120,
+		"policy_schema":         3,
 	})
-	if !pMid.ThinkingCrossVerify {
-		t.Fatal("schema<2 must migrate thinking_cross_verify to default on even if false was persisted")
+	if pLive.ThinkingCrossVerify || pLive.SoftCrossVerify {
+		t.Fatal("schema 3 leftover cross-verify flags must migrate off")
 	}
-	if !pMid.SoftCrossVerify {
-		t.Fatal("schema migration must turn soft_cross_verify on")
+	if pLive.QuarantineSec != 3600 {
+		t.Fatalf("schema 3 leftover quarantine 120s must migrate to 3600, got %d", pLive.QuarantineSec)
 	}
-	if pMid.PolicySchema != 3 {
-		t.Fatalf("migrated policy_schema=%d, want 3", pMid.PolicySchema)
+	if pLive.PolicySchema != 4 {
+		t.Fatalf("live leftover policy_schema=%d, want 4", pLive.PolicySchema)
 	}
 
-	// After redesign (schema 2), explicit false must stick.
-	p2 := policyConfig{HardTPS: 1000, SoftTPS: 500, ThinkingGuard: true, ThinkingCrossVerify: false, SoftCrossVerify: false, ConsecutiveMissingThinking: 2, PolicySchema: 3}
+	// Operator-chosen quarantine interval must survive the schema bump.
+	pCustom := policyConfig{HardTPS: 1000, SoftTPS: 500, ThinkingGuard: true, ThinkingCrossVerify: true, SoftCrossVerify: true, QuarantineSec: 300, PolicySchema: 3}
+	normalizePolicy(&pCustom, map[string]any{
+		"hard_tps":              1000,
+		"soft_tps":              500,
+		"thinking_guard":        true,
+		"thinking_cross_verify": true,
+		"soft_cross_verify":     true,
+		"quarantine_seconds":    300,
+		"policy_schema":         3,
+	})
+	if pCustom.QuarantineSec != 300 {
+		t.Fatalf("custom quarantine_seconds must stay 300, got %d", pCustom.QuarantineSec)
+	}
+
+	// After schema 4, explicit true must stick (operator re-enabled in panel).
+	p2 := policyConfig{HardTPS: 1000, SoftTPS: 500, ThinkingGuard: true, ThinkingCrossVerify: true, SoftCrossVerify: true, ConsecutiveMissingThinking: 2, PolicySchema: 4}
 	normalizePolicy(&p2, map[string]any{
 		"hard_tps":                     1000,
 		"soft_tps":                     500,
 		"thinking_guard":               true,
-		"thinking_cross_verify":        false,
-		"soft_cross_verify":            false,
+		"thinking_cross_verify":        true,
+		"soft_cross_verify":            true,
 		"consecutive_missing_thinking": 2,
-		"policy_schema":                3,
+		"policy_schema":                4,
 	})
-	if p2.ThinkingCrossVerify {
-		t.Fatal("explicit false after schema 2 must stay false")
+	if !p2.ThinkingCrossVerify || !p2.SoftCrossVerify {
+		t.Fatal("explicit true after schema 4 must stay true")
 	}
 
 	// Explicit thinking_guard=false stays false and forces cross-verify off.
@@ -472,16 +498,25 @@ func TestManualDisabledAuthIsNotRestored(t *testing.T) {
 	}
 }
 
-func TestSchedulerSkipsCoolingStatuses(t *testing.T) {
-	for _, status := range []string{"disabled", "unavailable", "error", "cooling", "pending", "refreshing", "future-state"} {
-		if schedulerCandidateAvailable(pluginapi.SchedulerAuthCandidate{Status: status}) {
-			t.Fatalf("status %q should not be selected", status)
+func TestLoadMigratesSchemaAndRecordsEvent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	raw := `{"version":1,"policy":{"mode":"hybrid","hard_tps":1000,"soft_tps":500,"thinking_guard":true,"thinking_cross_verify":true,"soft_cross_verify":true,"quarantine_seconds":120,"policy_schema":3},"nodes":{},"next_id":1}`
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := newStateStore(path)
+	pol := s.policy()
+	if pol.PolicySchema != 4 || pol.ThinkingCrossVerify || pol.SoftCrossVerify || pol.QuarantineSec != 3600 {
+		t.Fatalf("migrated policy=%+v", pol)
+	}
+	found := false
+	for _, ev := range s.events() {
+		if ev.Event == "policy_migrated" {
+			found = true
 		}
 	}
-	for _, status := range []string{"", "active", "ready"} {
-		if !schedulerCandidateAvailable(pluginapi.SchedulerAuthCandidate{Status: status}) {
-			t.Fatalf("status %q should be selectable", status)
-		}
+	if !found {
+		t.Fatal("schema upgrade must append policy_migrated")
 	}
 }
 
@@ -588,7 +623,7 @@ func TestMigrationFailsClosedAndVerifiesHostAuthSave(t *testing.T) {
 	}
 }
 
-func TestSchedulerSkipsQuarantinedNode(t *testing.T) {
+func TestSchedulerHandsSelectionBackToHost(t *testing.T) {
 	store = newStateStore(filepath.Join(t.TempDir(), "state.json"))
 	bad, err := store.createNode("bad", "http://127.0.0.1:7951", true, false, 0)
 	if err != nil {
@@ -624,8 +659,8 @@ func TestSchedulerSkipsQuarantinedNode(t *testing.T) {
 	if err := json.Unmarshal(env.Result, &response); err != nil {
 		t.Fatal(err)
 	}
-	if !response.Handled || response.AuthID != "auth-good" {
-		t.Fatalf("scheduler response=%+v", response)
+	if response.Handled || response.AuthID != "" {
+		t.Fatalf("scheduler must hand selection back to host, response=%+v", response)
 	}
 }
 

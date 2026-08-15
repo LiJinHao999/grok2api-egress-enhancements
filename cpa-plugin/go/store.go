@@ -34,10 +34,12 @@ type policyConfig struct {
 	// on the same egress are required before isolation / cross-verify. Default 1.
 	ConsecutiveMissingThinking int `json:"consecutive_missing_thinking"`
 	// ThinkingCrossVerify defers missing-thinking isolation until an active probe
-	// also lacks thinking. Default true. May delay isolation and spend probe tokens.
+	// also lacks thinking. Default false to minimize active probes; operators can
+	// re-enable confirmation in the panel.
 	ThinkingCrossVerify bool `json:"thinking_cross_verify"`
 	// SoftCrossVerify defers soft-TPS isolation until an active probe confirms the
-	// anomaly. Default true.
+	// anomaly. Default false: passive observations quarantine directly to minimize
+	// active probes; operators can re-enable confirmation in the panel.
 	SoftCrossVerify      bool `json:"soft_cross_verify"`
 	MaxOutputTokensProbe int  `json:"max_output_tokens"`
 	// ActiveProfileID selects the built-in or custom probe recipe used by
@@ -162,7 +164,7 @@ func defaultPolicy() policyConfig {
 		Mode:                       "hybrid",
 		ActiveIntervalSec:          1800,
 		PassivePollSec:             5,
-		QuarantineSec:              120,
+		QuarantineSec:              3600,
 		SoftTPS:                    500,
 		HardTPS:                    1000,
 		ConsecutiveSoft:            2,
@@ -174,11 +176,11 @@ func defaultPolicy() policyConfig {
 		DisableAuthOnHard:          true,
 		ThinkingGuard:              true,
 		ConsecutiveMissingThinking: 1,
-		ThinkingCrossVerify:        true,
-		SoftCrossVerify:            true,
+		ThinkingCrossVerify:        false,
+		SoftCrossVerify:            false,
 		MaxOutputTokensProbe:       384,
 		ActiveProfileID:            defaultProbeProfileID(),
-		PolicySchema:               3,
+		PolicySchema:               4,
 	}
 }
 
@@ -258,18 +260,26 @@ func normalizePolicy(p *policyConfig, rawPolicy map[string]any) {
 
 	// policy_schema migrations are one-shot product default upgrades.
 	// schema < 2: thinking redesign defaults
-	// schema < 3: soft cross-verify defaults to on
+	// schema < 3: soft cross-verify product default (now off)
+	// schema < 4: minimize active probes — both cross-verify flags off,
+	//             quarantine retest 120s -> 1h (only the old product default)
 	if p.PolicySchema < 2 {
 		if !has("consecutive_missing_thinking", "consecutiveMissingThinking") {
 			p.ConsecutiveMissingThinking = def.ConsecutiveMissingThinking
 		}
-		// Force ON once, even if an intermediate build persisted false.
 		p.ThinkingCrossVerify = def.ThinkingCrossVerify
 		p.SoftCrossVerify = def.SoftCrossVerify
+		if p.QuarantineSec == 120 {
+			p.QuarantineSec = def.QuarantineSec
+		}
 		p.PolicySchema = def.PolicySchema
 	} else if p.PolicySchema < def.PolicySchema {
-		// 2 -> 3: soft cross-verify product default flipped to on.
+		// Live 1.0.8 / current 1.0.9 files are schema 3 with both flags still true.
+		p.ThinkingCrossVerify = def.ThinkingCrossVerify
 		p.SoftCrossVerify = def.SoftCrossVerify
+		if p.QuarantineSec == 120 {
+			p.QuarantineSec = def.QuarantineSec
+		}
 		p.PolicySchema = def.PolicySchema
 	} else {
 		if !has("thinking_cross_verify", "thinkingCrossVerify") {
@@ -356,6 +366,17 @@ func (s *stateStore) load() error {
 	s.data = data
 	// Persist once when redesign migration ran so defaults become explicit keys.
 	if beforeSchema < defaultPolicy().PolicySchema {
+		s.data.Events = append(s.data.Events, guardEvent{
+			TS:    float64(time.Now().Unix()),
+			Event: "policy_migrated",
+			Reason: fmt.Sprintf(
+				"策略从 schema %d 升级到 %d：交叉验证改为产品默认关，隔离复测仅在仍为 120s 产品默认时改为 3600s",
+				beforeSchema, s.data.Policy.PolicySchema,
+			),
+		})
+		if len(s.data.Events) > 100 {
+			s.data.Events = s.data.Events[len(s.data.Events)-100:]
+		}
 		_ = s.persistLocked()
 	}
 	return nil

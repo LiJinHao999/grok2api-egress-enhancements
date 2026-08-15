@@ -340,7 +340,7 @@ python3 cpa-plugin/import_from_g2a.py \
 mode: hybrid
 active_interval_seconds: 1800
 passive_poll_seconds: 5
-quarantine_seconds: 120
+quarantine_seconds: 3600
 soft_tps: 500
 hard_tps: 1000
 consecutive_soft: 2
@@ -360,7 +360,7 @@ max_output_tokens: 384
 | `mode` | `passive`、`active`、`hybrid` | 生产推荐 `hybrid` |
 | `active_interval_seconds` | 健康节点主动质量探测间隔 | 默认 1800 秒，流量敏感可加长 |
 | `passive_poll_seconds` | 策略保留字段 | 当前 Usage 由 CPA 事件直接推送，不要把它理解成请求日志扫描间隔 |
-| `quarantine_seconds` | 隔离后等待自动复测的时间 | 已能强制换 IP 时 120 秒可作为起点 |
+| `quarantine_seconds` | 隔离后等待自动复测的时间 | 默认 3600 秒以减少主动复测；已能强制换 IP 时可自行调短 |
 | `soft_tps` | 可疑速度阈值 | 连续命中才隔离，先按实测分布调 |
 | `hard_tps` | 硬阈值 | 命中立即隔离；误报代价高时适当上调 |
 | `consecutive_soft` | soft 连续次数 | 默认 2，降低误杀 |
@@ -378,7 +378,7 @@ max_output_tokens: 384
 - `active`：只跑定时检测，不处理被动 Usage；
 - `hybrid`：普通请求实时发现异常，30 分钟主动兜底，推荐使用。
 
-默认后台 worker 每 30 秒扫描一次，所以“隔离 120 秒”表示到期后的下一个扫描周期触发复测，不保证精确到秒。
+默认后台 worker 每 30 秒扫描一次，所以“隔离 3600 秒”表示到期后的下一个扫描周期触发复测，不保证精确到秒。thinking / soft 交叉验证默认关闭，被动观测达到阈值后直接隔离；需要确认探测时在面板打开。
 
 ## 7. 隔离、迁号和恢复状态机
 
@@ -411,7 +411,7 @@ quarantined
 
 ### 7.1 CPA 的请求级边界
 
-CPA 插件可以在调度前跳过被隔离节点，也会在“账号刚被选中、同时节点开始隔离迁移”的极小竞态窗口返回 `503` 和 `Retry-After: 1`。但 CPA 的插件 ABI 不能透明重跑一个已经向客户端开始输出的流式请求，因此它不会伪造“中途无感重试”。正确行为是：当前请求尽快得到可重试结果，后续请求由 CPA 调度到已验证健康的出口。
+选号交还 CPA session affinity。隔离出口靠迁号前 disable；插件只会在“账号刚被选中、同时节点开始隔离迁移”的竞态窗口返回 `503` 和 `Retry-After: 1`。CPA 的插件 ABI 不能透明重跑一个已经向客户端开始输出的流式请求，因此它不会伪造“中途无感重试”。正确行为是：当前请求尽快得到可重试结果，后续请求由 CPA 调度到已验证健康的出口。
 
 ## 8. 隔离后强制住宅 IP 轮换并复测
 

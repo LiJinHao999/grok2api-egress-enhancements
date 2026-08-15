@@ -699,10 +699,10 @@
         ['隔离复测', cfg.quarantine_seconds + ' 秒'],
         ['软 / 硬阈值', cfg.soft_tps + ' / ' + cfg.hard_tps],
         ['连续软/错', cfg.consecutive_soft + ' / ' + cfg.consecutive_errors],
-        ['软阈值交叉验证', cfg.soft_cross_verify !== false ? '开' : '关'],
+        ['软阈值交叉验证', cfg.soft_cross_verify === true ? '开' : '关'],
         ['thinking 降智', thinkingOn ? '开' : '关'],
         ['连续缺 thinking', thinkingOn ? String(cfg.consecutive_missing_thinking || 1) : '-'],
-        ['thinking 交叉验证', thinkingOn && cfg.thinking_cross_verify !== false ? '开' : '关'],
+        ['thinking 交叉验证', thinkingOn && cfg.thinking_cross_verify === true ? '开' : '关'],
         ['最短生成窗口', (cfg.min_generation_ms || 1000) + ' ms'],
         ['最小判定 Token', cfg.min_output_tokens || 32],
         ['探测输出', (cfg.max_output_tokens || 384) + ' Token'],
@@ -744,9 +744,8 @@
       $('policy-min-healthy').value = cfg.min_healthy_nodes;
       $('policy-thinking-guard').checked = cfg.thinking_guard !== false;
       $('policy-missing-thinking-count').value = cfg.consecutive_missing_thinking || 1;
-      // defaults-on flags: absent/undefined => on
-      $('policy-thinking-cross-verify').checked = cfg.thinking_guard !== false && cfg.thinking_cross_verify !== false;
-      $('policy-soft-cross-verify').checked = cfg.soft_cross_verify !== false;
+      $('policy-thinking-cross-verify').checked = cfg.thinking_guard !== false && cfg.thinking_cross_verify === true;
+      $('policy-soft-cross-verify').checked = cfg.soft_cross_verify === true;
       $('policy-disable-auth').checked = cfg.disable_auth_on_hard !== false;
       fillProfileSelect($('policy-profile'), cfg.active_profile_id);
       syncPolicyFormDependencies();
@@ -1021,9 +1020,8 @@
       }
     }
     $('policy-thinking-guard').addEventListener('change', () => {
-      if ($('policy-thinking-guard').checked) {
-        // Re-enable with defaults-on cross-verify when user turns guard back on.
-        $('policy-thinking-cross-verify').checked = true;
+      if (!$('policy-thinking-guard').checked) {
+        $('policy-thinking-cross-verify').checked = false;
       }
       syncPolicyFormDependencies();
     });

@@ -29,7 +29,7 @@
 - 把 CPA `xai-*.json` 账号的 `proxy_url` **粘性绑定**到 Node
 - 用 **被动 usage 观测 + 主动 quality probe** 判定 healthy / soft / hard / error；账号、额度、上游权限失败只记录为 ignored，不消耗出口错误次数
 - **隔离（quarantine）坏节点**，并 **migrate** 账号到健康通道
-- 调度阶段跳过隔离/冷却账号；选定账号与迁移发生竞态时返回可重试的 `503 + Retry-After: 1`
+- 选号交还 CPA session affinity，避免插件 round-robin 乱切账号；隔离时先 disable 再迁出。选号与迁号竞态由拦截器返回可重试的 `503`
 - 可选调用受信任的内部换 IP Webhook；只有确认出口 IP 已变化并通过真实模型复测才恢复节点
 - 提供完整 **管理 UI**（节点 CRUD、批量、重平衡、质量测试、探针方案、策略、事件）
 - **可配置探针方案**：内置吞吐基线 + 预期标记（最后一行 `QUALITY_OK`），也可自建 Prompt / 包含 / 末行 / 正则匹配；标记缺失记为硬异常
@@ -89,6 +89,7 @@
 
 | 能力 | 说明 |
 |---|---|
+| Session affinity | 选号交还 CPA `SessionAffinitySelector`，同一会话不轮询切号 |
 | Rebalance | 把启用中的 xAI 账号均分到健康节点 |
 | Migrate on quarantine | 隔离后立刻把账号迁到其他健康节点 |
 | Disable on hard（可选） | 隔离后无健康通道可迁移或迁移失败时，兜底 disable 原节点账号 |
